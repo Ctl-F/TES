@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Zig Web TES</title>
+        <style>
+            body {
+                margin: 0;
+                background-color: #000;
+                color: #fff;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                height: 100vh;
+                overflow: hidden;
+            }
+            canvas {
+                border: 1px solid #555;
+            }
+        </style>
+    </head>
+    <body>
+        <canvas id="glCanvas" width="800" height="600"></canvas>
+        <script src="glue.js"></script>
+        <script>
+            // Start the application
+            debugger;
+            loadWasm("./bin/web-tes.wasm")
+                .then((instance) => {
+                    debugger;
+                    console.log("Wasm module started.");
+                })
+                .catch((err) => {
+                    debugger;
+                    console.error("Failed to load Wasm:", err);
+                });
+        </script>
+    </body>
+</html>

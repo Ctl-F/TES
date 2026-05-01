@@ -1,0 +1,418 @@
+Language: zig 0.15.2
+Platforms: Web (WebGL+WebAudio) + Native (SDL3+GLAD)
+Project:
+TES (Teris Entertainment System) — Technical Summary
+Core Philosophy
+Retro-inspired but not hardware-faithful; prioritizes determinism, performance, and clarity over strict emulation.
+Explicit control > implicit behavior (no hidden side effects like MMIO-triggered writes).
+Teaches discipline: minimal instruction set, manual responsibility for calling conventions and state.
+Deterministic execution model with fixed cycle budgeting.
+Extensible architecture (extensions + potential ISA profiles).
+Avoid unnecessary abstraction layers; expose hardware-like concepts cleanly.
+
+Virtual CPU: 1.17 Million Cycles Per Second (Fixed Frame FPS)
+FPS is configurable e.g. it assignes slices of a second to auto gpu+input sync.
+FPS can be set to 0 for headless mode and manual GPU+input sync.
+Core Game development is fixed frame (fixed 15/30/60/other fps)
+In headless mode a real-world timestamp can be obtained via syscall and dynamic frame (+ deltaTime) can be manually
+used.
+
+CPU Architecture
+Registers
+General Purpose (GP): R0–RF (16 registers, u4 originally; moving to u5 for expansion up to 32 total).
+Stack Registers:
+SP (stack pointer)
+SB (stack base)
+SH (stack high / limit)
+User-visible in addressing, not directly assignable (must use controlled ops like stackset, bump).
+Special Registers:
+IP (instruction pointer)
+JR (jump/link register)
+FCL/FCH (frame cycle counter, low/high 16)
+GCL/GCH (global cycle counter, low/high 16)
+Register Encoding
+Moving from u4 → u5:
+Enables ~32 registers total.
+Tradeoff: reduces immediate offset size.
+Instruction width: 32 bits
+8 bit opcode
+Remaining bits: registers + immediates.
+Control Flow Model
+Branching
+Single primitive: b (branch)
+No separate jmp / call:
+B writes return address to jr. Jr must be preserved if return is needed.
+JR (Jump Register)
+Only written by:
+b, bt, bf (branch variants)
+Must be manually preserved for function calls.
+Calling Convention (ABI)
+
+Standard pattern:
+
+push jr
+b func
+...
+func:
+  ...
+  pop jr
+  b jr
+JR can be freely clobbered inside functions if preserved.
+Tail Calls
+Equivalent cost:
+pop jr; b target
+pop jr; b jr
+No dedicated optimization needed.
+Alternative (unsafe but faster)
+mov rf, jr
+...
+b rf
+Avoids stack use, not recursion-safe.
+Design Intent
+No distinction between loops and functions at ISA level.
+Differences are purely structural patterns, not instruction semantics.
+Instruction Set Design
+General
+Minimal, composable primitives.
+No memory-to-memory mov:
+Cannot encode two full addresses in 32 bits.
+Avoid partial/crippled support.
+MOV Design
+Unified handler with comptime specialization:
+dst.* = src.*;
+Variants differ only in how src/dst are resolved.
+Addressing Modes
+[reg]
+[reg + const]
+[pageReg, offsetReg + const]
+
+Constraints:
+
+const must be compile-time resolvable.
+Expressions like a + b - c allowed if reducible at compile time.
+
+pageReg uses the lower byte for page selecting. OffsetReg uses the full 16 bit width
+
+Stack Addressing Rules
+[SP + n] → allowed (implicit page 0)
+[ra, SP + n] → disallowed (unsafe page ambiguity)
+Memory Model
+Layout
+Total: 256 pages × 64KB = ~16MB RAM
+Page 0:
+General use + stack region
+Page 255:
+MMIO (devices)
+Pages 1–254:
+General-purpose RAM
+Cartridge
+Addressing: 16-bit page index × 64KB
+Max size: ~4GB
+Pages can be mapped into RAM (read-only).
+Addressing Scheme
+Page selector + 16-bit offset
+Guarantees:
+Exactly one valid address per byte.
+No aliasing via offset overflow.
+Page Mapping
+Cartridge pages → RAM pages (read-only)
+Enables:
+Instant data swapping
+No copy required
+Page Templates (Key Feature)
+Identical layout across pages
+Swap data by changing page selector
+Enables:
+Instant level switching
+Pointer reuse across datasets
+Memory Operations
+memcopy / memmove
+Use:
+src page + offset
+dst page + offset
+length register
+No constant offsets (unlike mov)
+Justified due to block semantics.
+Execution Model
+Deterministic instruction stepping
+Cycle counter increments per instruction
+Frame timing derived from cycle counts
+No true parallelism (devices run between instructions conceptually)
+Syscalls
+Design
+Explicit invocation (syscall ID)
+ID must be compile-time constant
+Cannot use registers for syscall selection
+Encoding
+24 bits available:
+Proposed split: 12-bit category + 12-bit index
+Purpose
+Host interaction:
+Time
+File system
+Graphics sync
+Audio sync
+Extension Model
+Each extension gets a syscall category
+Missing category → fault
+Device Model (MMIO)
+General
+Located in page 255
+Divided into regions per device
+Memory is inert until sync syscall
+Protections
+Page-level:
+Read-only
+Read-write
+(Write-only likely unused)
+GPU
+Design Philosophy
+Buffered submission (not immediate mode)
+Explicit configuration required (no defaults)
+Basic Config Example
+gpuEnable = 1
+gpuResolution = 640x480
+gpuClearEnable = 0
+gpuLayerMask = 0x0001
+
+layer:
+  mode
+  width/height
+  pixelFmt
+  scale
+  sampling
+Workflow
+Write config buffers
+Call gpuSync
+Behavior
+GPU copies data on sync (implicit double buffer)
+CPU can immediately overwrite buffers after sync
+Error Handling
+Error code + message buffer in MMIO
+Non-zero error:
+GPU enters fault state
+Renders error image (or noise)
+Ignores further syncs until cleared
+Error Display
+Configurable bitmap in memory
+Defaults to noise if uninitialized
+Audio System
+Structure
+Up to 8 channels
+Each channel:
+Buffer pointer
+Descriptor (length, rate, volume, loop)
+Playback
+Loop or one-shot
+Cursor stored in descriptor (shared CPU/audio visibility)
+Streaming Strategy
+Ring buffer (e.g., 1 second split into halves)
+CPU updates buffer segments incrementally
+No special hardware streaming required
+Input System
+Controller state mapped in MMIO
+Read directly by CPU
+Timing & Randomness
+Global cycle counter (GCL/GCH)
+Frame cycle counter (FCL/FCH)
+Real-world timestamp syscall
+RNG strategy:
+Use timestamp lower bits as seed
+Extensions
+Types
+Hardware Extensions
+New syscalls
+New device features
+ISA Extensions (optional)
+Additional instructions
+Model
+Fully opt-in
+Declared at compile time
+Backwards compatible
+Evolution Strategy
+Popular extensions may become standard
+No forced feature bloat
+Design Tradeoffs
+Explicit over implicit
+No MMIO-triggered side effects
+Requires sync calls
+Simplicity over completeness
+No mem-to-mem move
+No dynamic syscall IDs
+Performance over purity
+No polling-based hardware
+Buffered submission instead
+Flexibility over enforcement
+Conventions suggested, not required
+Users responsible for correctness
+Notable Strengths
+Deterministic and predictable
+Extremely flexible memory model
+Powerful page templating system
+Clean separation of CPU vs devices
+Efficient for low-end hardware targets
+Potential Risks / Complexity Areas
+Manual JR management → user error
+Page-based addressing → subtle bugs if misused
+No safety rails → requires discipline
+Audio system complexity (still evolving)
+Overall State
+Architecture: well-defined and cohesive
+ISA: nearly complete
+Devices: conceptually complete
+Missing:
+Implementation
+Assembler
+Final audio spec polish
+
+Instruction Set (ISA)
+pub const InstructionCode = enum(u8) {
+    nop = 0x00,
+    mov = 0x01, // mov reg, reg
+    mov_c = 0x02, // mov reg, constant
+    mov_av = 0x03, // mov [address], reg
+    mov_ra = 0x04, // mov reg, [address]
+    mov_aev = 0x05, // mov [address + ext], reg
+    mov_rae = 0x06, // mov reg, [address + ext]
+    mov_hav = 0x07, // mov [address], (byte) reg
+    mov_hra = 0x08, // mov reg, (byte)[address]
+    mov_heav = 0x09, // mov reg, (byte)[address + ext]
+    mov_hrae = 0x0A, // mov [address + ext], (byte) reg
+    add = 0x0B, // add [dest], [src]
+    sub = 0x0C,
+    mul = 0x0D,
+    div = 0x0E, // div [quotient], [remainder], [dividend], [divisor]
+    shr = 0x0F,
+    shl = 0x10,
+    bin_and = 0x11,
+    bin_or = 0x12,
+    bin_xor = 0x13,
+    bin_not = 0x14,
+    log_and = 0x15,
+    log_or = 0x16,
+    log_not = 0x17,
+    neg = 0x18,
+    vadd2 = 0x19,
+    vsub2 = 0x1A,
+    vmul2 = 0x1B,
+    vshr2 = 0x1C,
+    vshl2 = 0x1D,
+    vand2 = 0x1E,
+    vor2 = 0x1F,
+    vxor2 = 0x20,
+    vnot2 = 0x21,
+    vneg2 = 0x22,
+    inc = 0x23,
+    dec = 0x24,
+    seteq = 0x25, // seteq [result], [a], [b]
+    setneq = 0x26,
+    setlt = 0x27,
+    setle = 0x28,
+    setgt = 0x29,
+    setge = 0x2A,
+    b = 0x2B,
+    bt = 0x2C,
+    bf = 0x2D,
+    push8 = 0x2E,
+    push16 = 0x2F,
+    pop8 = 0x30,
+    pop16 = 0x31,
+    bump_r = 0x32, // bump [register-amount]
+    bump_c = 0x33, // bump [const-amount]
+    mov_aevi = 0x34, // mov [address + ext], reg  -- increments offset byte
+    mov_raei = 0x35, // mov reg, [address + ext]
+    mov_heavi = 0x36, // mov reg, (byte)[address + ext]
+    mov_hraei = 0x37, // mov [address + ext], (byte) reg
+    mov_aevd = 0x38, // mov [address + ext], reg  -- decrements offset byte (by size of value)
+    mov_raed = 0x39, // mov reg, [address + ext]
+    mov_heavd = 0x3A, // mov reg, (byte)[address + ext]
+    mov_hraed = 0x3B, // mov [address + ext], (byte) reg
+    fma = 0x3C, // fma [a], [b], [c] --> (a = (a * b) + c) TODO: figure out if this is most useful variant of formula
+    stackset = 0x3D, // stackset [base], [len]
+    int = 0x3E, // int reg
+    syscall = 0x3F,
+    hlt = 0x40,
+
+    // coprossesor <--> main processor channels
+    yield_frame = 0x41,
+    resume_skip = 0x42,
+    resume_at = 0x43,
+    retry = 0x44,
+    sync_mov = 0x45,
+    sync_write = 0x46,
+    sync_hwrite = 0x47,
+    sync_read = 0x48,
+    sync_hread = 0x49,
+
+    extz = 0x4A,
+    exts = 0x4B,
+    truncz = 0x4C,
+    clamp = 0x4D,
+    swap = 0x4E,
+    bittest = 0x4F,
+    vseteq2 = 0x50,
+    vsetneq2 = 0x51,
+    vsetlt2 = 0x52,
+    vsetle2 = 0x53,
+    vsetgt2 = 0x54,
+    vsetge2 = 0x55,
+    vreduce2 = 0x56, // vreduce2 [dst], [vreg], [operation-literal]
+    vsplat2 = 0x57, // splat a 8-bit value into two channels
+    vldc2 = 0x58, // load 2 separate 8-bit values into two channels
+    // "unreachable" instruction. This isn't really recoverable in the same way an interrupt is
+    // so you should prefer interrupts when things can actually validly go wrong and are recoverable
+    // this is mostly to insert in places that should be logically unreachable, but for security purposes you add
+    // the trap to ensure that if something does go wrong the cpu doesn't start executing who-knows-what
+    trap = 0x59,
+    iadd = 0x5A,
+    isub = 0x5B,
+    imul = 0x5C,
+    idiv = 0x5D,
+    isetlt = 0x5E,
+    isetle = 0x5F,
+    isetgt = 0x60,
+    isetge = 0x61,
+    viadd2 = 0x62,
+    visub2 = 0x63,
+    vimul2 = 0x64,
+    visetlt = 0x65,
+    visetle = 0x66,
+    visetgt = 0x67,
+    visetge = 0x68,
+    mcpy = 0x69,
+    mset = 0x6A,
+    mmov = 0x6B,
+    select = 0x6C, // select ra, rb, rc, rd ==> { ra = (rd) ? rb : rc }
+    vselect2 = 0x6D, // select vresult, vreg0, vreg1, vregmask
+    vswap2 = 0x6E, // swaps channels of vector
+    sar = 0x6F, // saturating arithmetic roll right (a = (0x8000 & (b >> c))); (keeps signs correct)
+    vsar2 = 0x70,
+    abs = 0x71,
+    sign = 0x72,
+    min = 0x73,
+    max = 0x74,
+    vabs2 = 0x75,
+    vsign2 = 0x76,
+    vmin2 = 0x77,
+    vmax2 = 0x78,
+    rol = 0x79, // rotate left
+    ror = 0x7A,
+    vrol2 = 0x7B,
+    vror = 0x7C,
+};
+
+// TODO: Add
+
+
+Vector Instructions reinterpret a 16 bit register as a 2x8bit register and perform parallel (non-overlapping) math on the two channels
+
+Syscalls are for host interaction and must be a compile-time known constant
+interrupts are handled by a small co-processor that freezes the main processor and executes a handler associated with the interrupt
+code. This is for error handling and also debugging.  The co-processor has access to information about the main processor and
+can make modifications to the main-processor (via special instructions) for error correction/handling. It also has 3 "return" policies:
+retry
+resume (skip instruction having performed the work the bad instruction would have done)
+resume addr (resume at a different point in code abandoning the work that failed)
+
+setstack can only be called when the stack is empty (sp==sb) and will relocate the stack within page 0. The stack has a minimum size
+of (256*) bytes. *TBD

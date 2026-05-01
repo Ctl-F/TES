@@ -1,0 +1,103 @@
+# Zig Web & Native Abstraction Documentation
+
+This document explains how to interface with WebGL, JavaScript events, and how to create a unified abstraction for both SDL3 (Native) and Web backends.
+
+## 1. Interfacing with WebGL
+WebGL is essentially OpenGL ES 2.0/3.0 accessible via a JavaScript API. Since Wasm cannot directly call JS functions, you must:
+1.  **Define Extern Functions**: In Zig, declare `extern` functions for the GL operations you need (e.g., `extern fn glClear(mask: u32) void;`).
+2.  **JavaScript Implementation**: In `glue.js`, provide these functions in the `importObject.env`. These functions should call the corresponding methods on the `WebGLRenderingContext`.
+3.  **Handle Objects**: WebGL uses JS objects (Textures, Buffers, Programs). Since Wasm only understands numbers, you need a mapping system (an array or `Map` in JS) where Wasm uses an integer ID, and JS translates that ID to the actual WebGL object.
+
+Example JS Glue for GL:
+```javascript
+let gl; // Initialized from canvas.getContext('webgl2')
+const glObjects = [null]; // 0 is usually reserved/invalid
+
+// Import object for Wasm
+env: {
+    glCreateBuffer: () => {
+        const buffer = gl.createBuffer();
+        glObjects.push(buffer);
+        return glObjects.length - 1;
+    },
+    glBindBuffer: (target, id) => {
+        gl.bindBuffer(target, glObjects[id]);
+    },
+    // ... other GL functions
+}
+```
+
+## 2. JavaScript Events
+To handle input (keyboard, mouse) on the web:
+1.  **Listeners**: Add event listeners to the `window` or `canvas` in JS.
+2.  **Callback or Queue**: 
+    - **Callback**: Export a function from Zig (e.g., `export fn onKeyDown(key: i32) void`) and call it from the JS event listener.
+    - **Queue**: Maintain a buffer in Wasm memory. JS writes event data into this buffer, and the Zig main loop polls it.
+
+Example Callback:
+```javascript
+window.addEventListener('keydown', (e) => {
+    instance.exports.onKeyDown(e.keyCode);
+});
+```
+
+## 3. Creating a Unified Abstraction
+To support both SDL3 and Web, create a common interface in `tes_core`.
+
+### Strategy: The Backend Interface
+Define a struct or a set of functions that represent the "Engine" or "Platform" capabilities.
+
+```zig
+// src/tes_core/platform.zig
+pub const Platform = struct {
+    pub const Event = union(enum) {
+        key_down: i32,
+        quit: void,
+        // ...
+    };
+
+    // Abstract functions
+    pub const init = if (is_web) web.init else sdl.init;
+    pub const pollEvent = if (is_web) web.pollEvent else sdl.pollEvent;
+    pub const swapBuffers = if (is_web) web.swapBuffers else sdl.swapBuffers;
+};
+```
+
+### Key Differences to Abstract:
+- **Main Loop**: SDL3 uses a `while (running)` loop. Browsers require `requestAnimationFrame`.
+    - *Solution*: Export a `frame` function from Zig that the JS `requestAnimationFrame` calls. For native, call this same `frame` function inside your `while` loop.
+- **Entry Point**: Native uses `main`. Web uses an exported `wasm_main` and then yields control to the browser.
+- **Resource Loading**: SDL uses file I/O. Web uses `fetch`.
+    - *Solution*: Use an async-friendly abstraction for loading assets. On web, this might involve a callback when the `fetch` completes.
+
+## 4. Further Glue Needed
+- **Memory Management**: If you pass strings from Zig to JS, ensure you understand the Wasm memory layout and `TextDecoder`.
+- **Canvas Resizing**: Handle window resize events in JS and update the WebGL viewport and canvas dimensions.
+- **High DPI**: Account for `window.devicePixelRatio` on web to avoid blurry rendering on Retina/4K screens.
+
+## 5. Running the Web Version (Fixing CORS)
+Browsers block loading Wasm files via `file://` due to the Same-Origin Policy. To run the web version, you must use a local HTTP server.
+
+### Option A: Zig Build (Recommended)
+I have added a convenient step to your `build.zig`:
+```bash
+zig build run-web
+```
+This will build the project, start a Python-based server at `http://localhost:8000/`, and automatically launch Firefox.
+
+### Option B: Manual Python
+If you prefer running it manually from the project root:
+```bash
+python3 -m http.server --directory zig-out
+```
+Then open: `http://localhost:8000/`
+
+### Option C: Node.js (npx)
+```bash
+npx serve zig-out
+```
+
+### Option D: PHP
+```bash
+php -S localhost:8000 -t zig-out
+```
