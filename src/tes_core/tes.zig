@@ -1,6 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+pub const vm = @import("vm.zig");
+
 extern fn print(ptr: [*]const u8, len: usize) void;
 
 pub fn hello() void {

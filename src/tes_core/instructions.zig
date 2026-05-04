@@ -93,7 +93,7 @@ pub const InstructionCode = enum(u8) {
     vsetge2 = 0x55,
     vreduce2 = 0x56, // vreduce2 [dst], [vreg], [operation-literal]
     vsplat2 = 0x57, // splat a 8-bit value into two channels
-    vldc2 = 0x58, // load 2 separate 8-bit values into two channels
+    vldc2 = 0x58, // load 2 separate 8-bit values into two channels --> This actually doesn't need to be it's own instruction since the assembler can pack 2 constants into a single 16 bit word. It's here though so we'll implement it even though it's redundant
     // "unreachable" instruction. This isn't really recoverable in the same way an interrupt is
     // so you should prefer interrupts when things can actually validly go wrong and are recoverable
     // this is mostly to insert in places that should be logically unreachable, but for security purposes you add
@@ -110,10 +110,10 @@ pub const InstructionCode = enum(u8) {
     viadd2 = 0x62,
     visub2 = 0x63,
     vimul2 = 0x64,
-    visetlt = 0x65,
-    visetle = 0x66,
-    visetgt = 0x67,
-    visetge = 0x68,
+    visetlt2 = 0x65,
+    visetle2 = 0x66,
+    visetgt2 = 0x67,
+    visetge2 = 0x68,
     mcpy = 0x69,
     mset = 0x6A,
     mmov = 0x6B,
@@ -133,7 +133,7 @@ pub const InstructionCode = enum(u8) {
     rol = 0x79, // rotate left
     ror = 0x7A,
     vrol2 = 0x7B,
-    vror = 0x7C,
+    vror2 = 0x7C,
 };
 
 // TODO: Separate saturiting and wrapping variants
@@ -160,4 +160,5 @@ pub const InstructionDstAddrXSrc = packed struct(u32) { opcode: u8, dPSR: u5, dP
 pub const InstructionDstSrcAddr = packed struct(u32) { opcode: u8, dst: u5, sPOR: u5, offset: i9, reserved: u5 };
 pub const InstructionDstSrcAddrX = packed struct(u32) { opcode: u8, dst: u5, sPSR: u5, sPOR: u5, offset: i9 };
 pub const InstructionDst2Src2 = packed struct(u32) { opcode: u8, dst0: u5, dst1: u5, src0: u5, src1: u5, reserved: u4 };
+pub const InstructionDstSrc2 = packed struct(u32) { opcode: u8, dst: u5, src0: u5, src1: u5, reserved: u9 };
 pub const InstructionDstSrc3 = packed struct(u32) { opcode: u8, dst: u5, src0: u5, src1: u5, src2: u5, reserved: u4 };
