@@ -3,8 +3,8 @@ const tes_core = @import("tes_core");
 const builtin = @import("builtin");
 
 pub fn main() !void {
-    const vm: tes_core.vm.TESVM = undefined;
-    _ = vm;
+    var vm: tes_core.vm.TESVM = tes_core.vm.TESVM.empty();
+    try vm.exec(1);
 }
 
 // Exported for web

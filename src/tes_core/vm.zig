@@ -15,101 +15,199 @@ const InstructionDstSrc3 = instructions.InstructionDstSrc3;
 
 pub const RegisterID = enum(u5) {
     R0 = 0,
-    R1,
-    R2,
-    R3,
-    R4,
-    R5,
-    R6,
-    R7,
-    R8,
-    R9,
-    RA,
-    RB,
-    RC,
-    RD,
-    RE,
-    RF,
-    SH,
-    SB,
-    SP,
-    IP,
-    FCL,
-    FCH,
-    GCL,
-    GCH,
+    R1 = 1,
+    R2 = 2,
+    R3 = 3,
+    R4 = 4,
+    R5 = 5,
+    R6 = 6,
+    R7 = 7,
+    R8 = 8,
+    R9 = 9,
+    RA = 10,
+    RB = 11,
+    RC = 12,
+    RD = 13,
+    RE = 14,
+    RF = 15,
+
+    IP = 16, // and 17 (32 bit)
+    JR = 18, // and 19 (32 bit)
+    FCL = 20, // keep these on an even number so they're save to reinterpet as 32 bit also
+    FCH = 21, // keep low before high since we're targeting little-endian. Low part comes first
+    GCL = 22,
+    GCH = 23,
+
+    SH = 24,
+    SB = 25,
+    SP = 26,
     REGISTER_COUNT_ENTRY,
 };
 
 pub const RegisterType = u16;
 pub const RegisterIType = u16;
 pub const InterruptID = u16;
+pub const MaxRegisterID = 31;
+pub const MaxRegisterCount = 32;
+pub const DoubleRegisterType = @Int(.unsigned, @bitSizeOf(RegisterType) * 2);
 
 const PageSize = std.math.maxInt(RegisterType);
 
+const Registers = struct {
+    const BUFF_LEN = MaxRegisterCount * @sizeOf(RegisterType);
+    buffer: [BUFF_LEN]u8 align(@alignOf(DoubleRegisterType)) = [_]u8{0} ** BUFF_LEN,
+
+    pub inline fn registers(this: *@This()) []RegisterType {
+        return std.mem.bytesAsSlice(RegisterType, &this.buffer);
+    }
+
+    pub inline fn doubleRegisters(this: *@This()) []DoubleRegisterType {
+        return std.mem.bytesAsSlice(DoubleRegisterType, &this.buffer);
+    }
+};
+
+comptime {
+    const fcl: u5 = @intFromEnum(RegisterID.FCL);
+    const fch: u5 = @intFromEnum(RegisterID.FCH);
+    const gcl: u5 = @intFromEnum(RegisterID.GCL);
+    const gch: u5 = @intFromEnum(RegisterID.GCH);
+
+    if (!(fch == fcl + 1)) @compileError("Frame Counter Registers are not paired correctly");
+    if (!(gch == gcl + 1)) @compileError("Global Counter Registers are not paired correctly");
+
+    if (!(fcl & 1 == 0)) @compileError("Frame Counter Register is misaligned for reinterpretation as 32bit");
+    if (!(gcl & 1 == 0)) @compileError("Global Counter Register is misaligned for reinterpetation as 32bit");
+}
+
 pub const TESVM = struct {
-    registers: [@intFromEnum(RegisterID.REGISTER_COUNT_ENTRY)]RegisterType = [_]RegisterType{0} ** @intFromEnum(RegisterID.REGISTER_COUNT_ENTRY),
+    registers: Registers,
     mmu: MMU = .{},
-    instructionBuffer: []Instruction,
+    instructionBuffer: []const Instruction,
     halted: bool = false,
     // TODO: add interrupt table
 
-    pub fn tickClock(this: *@This(), cycles: u8) void {
-        var localCycle: u32 = (@as(u32, @intCast(this.registers[@intFromEnum(RegisterID.FCH)])) << 16) | this.registers[@intFromEnum(RegisterID.FCL)];
-        var globalCycle: u32 = (@as(u32, @intCast(this.registers[@intFromEnum(RegisterID.GCH)])) << 16) | this.registers[@intFromEnum(RegisterID.GCL)];
-
-        localCycle +%= cycles;
-        globalCycle +%= cycles;
-
-        this.registers[@intFromEnum(RegisterID.FCH)] = @truncate(localCycle >> 16);
-        this.registers[@intFromEnum(RegisterID.FCL)] = @truncate(localCycle);
-        this.registers[@intFromEnum(RegisterID.GCH)] = @truncate(globalCycle >> 16);
-        this.registers[@intFromEnum(RegisterID.GCL)] = @truncate(globalCycle);
+    pub fn empty() @This() {
+        return .{
+            .registers = .{},
+            .instructionBuffer = &.{Instruction{ .opcode = @intFromEnum(OpCode.hlt), .payload = 0 }},
+        };
     }
 
-    pub fn exec(this: *@This(), cycles: u32) !void {
+    inline fn doubleRegIndex(comptime id: RegisterID) u5 {
+        const raw: u5 = @intFromEnum(id);
+        if (raw & 1 != 0) @compileError("Misaligned Register Id points to non-32 bit enabled register being reinterpreted");
+        return raw / 2;
+    }
+
+    pub inline fn tickClock(this: *@This(), cycles: u8) void {
+        this.registers.doubleRegisters()[doubleRegIndex(.FCL)] +%= cycles;
+        this.registers.doubleRegisters()[doubleRegIndex(.GCL)] +%= cycles;
+    }
+
+    pub inline fn mergeRegs(this: *@This(), highReg: u5, lowReg: u5) u32 {
+        const high: u32 = this.registers.registers()[highReg];
+        const low: u32 = this.registers.registers()[lowReg];
+
+        return (high << 16) | low;
+    }
+
+    pub fn exec(this: *@This(), totalCycles: u32) !void {
         @setRuntimeSafety(false);
 
-        if (this.registers[@intFromEnum(RegisterID.IP)] >= this.instructionBuffer.len) {
+        var cycles = totalCycles;
+
+        if (this.registers.registers()[@intFromEnum(RegisterID.IP)] >= this.instructionBuffer.len) {
             @branchHint(.unlikely);
             return error.AbruptProgramEOF;
         }
-        var instruction = this.instructionBuffer[this.registers[@intFromEnum(RegisterID.IP)]];
-        DISPATCH: switch (instruction.opcode) {
-            .Hlt => {
+        var instruction = this.instructionBuffer[this.registers.registers()[@intFromEnum(RegisterID.IP)]];
+        DISPATCH: switch (@as(OpCode, @enumFromInt(instruction.opcode))) {
+            .hlt => {
                 this.halted = true;
                 return;
             },
-            .B => {
+            .b => {
+                const decoded: InstructionDstSrc = @bitCast(instruction);
+                const doubles = this.registers.doubleRegisters();
+
+                const newIP = this.mergeRegs(decoded.dst, decoded.src);
+                const IP = doubleRegIndex(.IP);
+                const JR = doubleRegIndex(.JR);
+
+                doubles[IP] += 1;
+                doubles[JR] = doubles[IP];
+                doubles[IP] = newIP;
+
+                this.tickClock(1);
+                cycles -= 1;
+                if (cycles == 0) {
+                    @branchHint(.unlikely);
+                    return;
+                }
+
+                if (doubles[IP] >= this.instructionBuffer.len) {
+                    @branchHint(.unlikely);
+                    return error.AbruptProgramEOF;
+                }
+
+                instruction = this.instructionBuffer[doubles[IP]];
+                continue :DISPATCH @as(OpCode, @enumFromInt(instruction.opcode));
+            },
+            inline .bt, .bf => |which| {
+                const decoded: InstructionDstSrc2 = @bitCast(instruction);
+                const doubles = this.registers.doubleRegisters();
+
+                const IP = doubleRegIndex(.IP);
+                const JR = doubleRegIndex(.JR);
+
+                const newIP = this.mergeRegs(decoded.dst, decoded.src0);
+                const condition = if (comptime which == .bt)
+                    this.registers.registers()[decoded.src1] != 0
+                else
+                    this.registers.registers()[decoded.src1] == 0;
+
+                doubles[IP] += 1;
+                if (condition) {
+                    doubles[JR] = doubles[IP];
+                    doubles[IP] = newIP;
+                }
+
+                this.tickClock(1);
+                cycles -= 1;
+                if (cycles == 0) {
+                    @branchHint(.unlikely);
+                    return;
+                }
+
+                if (doubles[IP] >= this.instructionBuffer.len) {
+                    @branchHint(.unlikely);
+                    return error.AbruptProgramEOF;
+                }
+
+                instruction = this.instructionBuffer[doubles[IP]];
+                continue :DISPATCH @as(OpCode, @enumFromInt(instruction.opcode));
+            },
+            .bn => {
                 const decoded: InstructionDst = @bitCast(instruction);
+                const doubles = this.registers.doubleRegisters();
 
-                this.registers[@intFromEnum(RegisterID.IP)] += 1;
+                const IP = doubleRegIndex(.IP);
+                const JR = doubleRegIndex(.JR);
 
-                this.registers[@intFromEnum(RegisterID.JR)] = this.registers[@intFromEnum(RegisterID.IP)];
-                this.registers[@intFromEnum(RegisterID.IP)] = this.registers[decoded.dst];
-                this.tickClock(1);
-                cycles -= 1;
-                if (cycles == 0) {
-                    @branchHint(.unlikely);
-                    return;
-                }
+                const offset: i14 = @bitCast(@as(u14, @truncate(decoded.payload)));
 
-                if (this.registers[@intFromEnum(RegisterID.IP)] >= this.instructionBuffer.len) {
+                const targetIP = @as(i64, @intCast(doubles[IP])) + offset;
+                if (targetIP < 0 or targetIP >= this.instructionBuffer.len) {
                     @branchHint(.unlikely);
                     return error.AbruptProgramEOF;
                 }
 
-                instruction = this.instructionBuffer[this.registers[@intFromEnum(RegisterID.IP)]];
-                continue :DISPATCH instruction.opcode;
-            },
-            .Bt => {
-                const decoded: InstructionDstSrc = @bitCast(instruction);
+                doubles[IP] += 1;
+                doubles[JR] = doubles[IP];
 
-                this.registers[@intFromEnum(RegisterID.IP)] += 1;
-                if (this.registers[decoded.src] != 0) {
-                    this.registers[@intFromEnum(RegisterID.JR)] = this.registers[@intFromEnum(RegisterID.IP)];
-                    this.registers[@intFromEnum(RegisterID.IP)] = this.registers[decoded.dst];
-                }
+                // should be safe since we verified that offset won't push IP out of range
+                // and also that targetIP isn't smaller than zero
+                doubles[IP] = @truncate(@as(u64, @bitCast(targetIP)));
 
                 this.tickClock(1);
                 cycles -= 1;
@@ -118,21 +216,34 @@ pub const TESVM = struct {
                     return;
                 }
 
-                if (this.registers[@intFromEnum(RegisterID.IP)] >= this.instructionBuffer.len) {
+                instruction = this.instructionBuffer[doubles[IP]];
+                continue :DISPATCH @as(OpCode, @enumFromInt(instruction.opcode));
+            },
+            inline .bnf, .bnt => |which| {
+                const decoded: InstructionDst = @bitCast(instruction);
+                const doubles = this.registers.doubleRegisters();
+
+                const IP = doubleRegIndex(.IP);
+                const JR = doubleRegIndex(.JR);
+
+                const offset: i14 = @bitCast(@as(u14, @truncate(decoded.payload)));
+
+                const targetIP = @as(i64, @intCast(doubles[IP])) + offset;
+                if (targetIP < 0 or targetIP >= this.instructionBuffer.len) {
                     @branchHint(.unlikely);
                     return error.AbruptProgramEOF;
                 }
 
-                instruction = this.instructionBuffer[this.registers[@intFromEnum(RegisterID.IP)]];
-                continue :DISPATCH instruction.opcode;
-            },
-            .Bf => {
-                const decoded: InstructionDstSrc = @bitCast(instruction);
+                const condition = if (comptime which == .bnt)
+                    this.registers.registers()[decoded.dst] != 0
+                else
+                    this.registers.registers()[decoded.dst] == 0;
 
-                this.registers[@intFromEnum(RegisterID.IP)] += 1;
-                if (this.registers[decoded.src] == 0) {
-                    this.registers[@intFromEnum(RegisterID.JR)] = this.registers[@intFromEnum(RegisterID.IP)];
-                    this.registers[@intFromEnum(RegisterID.IP)] = this.registers[decoded.dst];
+                doubles[IP] += 1;
+
+                if (condition) {
+                    doubles[JR] = doubles[IP];
+                    doubles[IP] = @truncate(@as(u64, @bitCast(targetIP)));
                 }
 
                 this.tickClock(1);
@@ -141,20 +252,18 @@ pub const TESVM = struct {
                     @branchHint(.unlikely);
                     return;
                 }
-                if (this.registers[@intFromEnum(RegisterID.IP)] >= this.instructionBuffer.len) {
-                    @branchHint(.unlikely);
-                    return error.AbruptProgramEOF;
-                }
-                instruction = this.instructionBuffer[this.registers[@intFromEnum(RegisterID.IP)]];
-                continue :DISPATCH instruction.opcode;
+
+                instruction = this.instructionBuffer[doubles[IP]];
+                continue :DISPATCH @as(OpCode, @enumFromInt(instruction.opcode));
             },
+
             inline else => |op| {
                 const consumed = InstructionTable[op].cycles;
                 InstructionTable[op].handler(this, instruction) catch {
                     // TODO: handle Interrupt
                 };
 
-                this.registers[@intFromEnum(RegisterID.IP)] += 1;
+                this.registers.registers()[@intFromEnum(RegisterID.IP)] += 1;
 
                 this.tickClock(consumed);
 
@@ -163,13 +272,13 @@ pub const TESVM = struct {
                     @branchHint(.unlikely);
                     return;
                 }
-                if (this.registers[@intFromEnum(RegisterID.IP)] >= this.instructionBuffer.len) {
+                if (this.registers.registers()[@intFromEnum(RegisterID.IP)] >= this.instructionBuffer.len) {
                     @branchHint(.unlikely);
                     return error.AbruptProgramEOF;
                 }
-                instruction = this.instructionBuffer[this.registers[@intFromEnum(RegisterID.IP)]];
+                instruction = this.instructionBuffer[this.registers.registers()[@intFromEnum(RegisterID.IP)]];
 
-                continue :DISPATCH instruction.opcode;
+                continue :DISPATCH @as(OpCode, @enumFromInt(instruction.opcode));
             },
         }
     }
@@ -200,10 +309,13 @@ const Interrupt = error{
     InvalidInstruction,
 };
 
-const InstructionHandler = fn (*TESVM, Instruction) Interrupt!void;
+const InstructionHandler = fn (*TESVM, Instruction) callconv(.@"inline") Interrupt!void;
 
-inline fn InvalidHandler(_: *TESVM, _: Instruction) Interrupt!void {
+pub inline fn InvalidHandler(_: *TESVM, _: Instruction) Interrupt!void {
     return Interrupt.InvalidInstruction;
+}
+pub inline fn NotInvalidButUnreachable(_: *TESVM, _: Instruction) Interrupt!void {
+    unreachable;
 }
 
 const InstructionInfo = struct {
@@ -221,14 +333,14 @@ fn MovFactory(comptime instrType: type, comptime width: enum { full, half }, com
         InstructionDstSrc => struct {
             pub inline fn do(vm: *TESVM, instr: Instruction) Interrupt!void {
                 const decoded: InstructionDstSrc = @bitCast(instr);
-                vm.registers[decoded.dst] = vm.registers[decoded.src];
+                vm.registers.registers()[decoded.dst] = vm.registers.registers()[decoded.src];
             }
         }.do,
         InstructionDstAddrSrc => struct {
             pub inline fn do(vm: *TESVM, instr: Instruction) Interrupt!void {
                 const decoded: InstructionDstAddrSrc = @bitCast(instr);
 
-                const base: isize = @intCast(vm.registers[decoded.dPOR]);
+                const base: isize = @intCast(vm.registers.registers()[decoded.dPOR]);
                 const offset: isize = @intCast(decoded.offset);
 
                 // no need to check pageID fault since page0 always exists
@@ -238,12 +350,12 @@ fn MovFactory(comptime instrType: type, comptime width: enum { full, half }, com
                     return Interrupt.PageFault;
                 }
 
-                std.mem.writeInt(moveType, vm.mmu.pages[0].buffer.?[@as(usize, @intCast(base + offset))..][0..@sizeOf(moveType)], vm.registers[decoded.src], .little);
+                std.mem.writeInt(moveType, vm.mmu.pages[0].buffer.?[@as(usize, @intCast(base + offset))..][0..@sizeOf(moveType)], vm.registers.registers()[decoded.src], .little);
 
                 if (comptime postOp == .inc) {
-                    vm.registers[decoded.dPOR] +%= @sizeOf(moveType);
+                    vm.registers.registers()[decoded.dPOR] +%= @sizeOf(moveType);
                 } else if (comptime postOp == .dec) {
-                    vm.registers[decoded.dPOR] -%= @sizeOf(moveType);
+                    vm.registers.registers()[decoded.dPOR] -%= @sizeOf(moveType);
                 }
             }
         }.do,
@@ -251,9 +363,9 @@ fn MovFactory(comptime instrType: type, comptime width: enum { full, half }, com
             pub inline fn do(vm: *TESVM, instr: Instruction) Interrupt!void {
                 const decoded: InstructionDstAddrXSrc = @bitCast(instr);
 
-                const base: isize = @intCast(vm.registers[decoded.dPOR]);
+                const base: isize = @intCast(vm.registers.registers()[decoded.dPOR]);
                 const offset: isize = @intCast(decoded.offset);
-                const pageID: u8 = @truncate(vm.registers[decoded.dPSR]);
+                const pageID: u8 = @truncate(vm.registers.registers()[decoded.dPSR]);
 
                 if (vm.mmu.pages[pageID].buffer == null) {
                     @branchHint(.unlikely);
@@ -262,17 +374,22 @@ fn MovFactory(comptime instrType: type, comptime width: enum { full, half }, com
                     return Interrupt.PageFault;
                 }
 
+                if (!vm.mmu.pages[pageID].permissions.write) {
+                    @branchHint(.unlikely);
+                    return Interrupt.PageFault;
+                }
+
                 if (base + offset < 0 or (base + offset + @sizeOf(moveType)) > PageSize) {
                     @branchHint(.unlikely);
                     return Interrupt.PageFault;
                 }
 
-                std.mem.writeInt(moveType, vm.mmu.pages[pageID].buffer.?[@as(usize, @intCast(base + offset))..][0..@sizeOf(moveType)], vm.registers[decoded.src], .little);
+                std.mem.writeInt(moveType, vm.mmu.pages[pageID].buffer.?[@as(usize, @intCast(base + offset))..][0..@sizeOf(moveType)], vm.registers.registers()[decoded.src], .little);
 
                 if (comptime postOp == .inc) {
-                    vm.registers[decoded.dPOR] +%= @sizeOf(moveType);
+                    vm.registers.registers()[decoded.dPOR] +%= @sizeOf(moveType);
                 } else if (comptime postOp == .dec) {
-                    vm.registers[decoded.dPOR] -%= @sizeOf(moveType);
+                    vm.registers.registers()[decoded.dPOR] -%= @sizeOf(moveType);
                 }
             }
         }.do,
@@ -280,7 +397,7 @@ fn MovFactory(comptime instrType: type, comptime width: enum { full, half }, com
             pub inline fn do(vm: *TESVM, instr: Instruction) Interrupt!void {
                 const decoded: InstructionDstSrcAddr = @bitCast(instr);
 
-                const base: isize = @intCast(vm.registers[decoded.sPOR]);
+                const base: isize = @intCast(vm.registers.registers()[decoded.sPOR]);
                 const offset: isize = @intCast(decoded.offset);
 
                 if (base + offset < 0 or (base + offset + @sizeOf(moveType)) > PageSize) {
@@ -288,12 +405,12 @@ fn MovFactory(comptime instrType: type, comptime width: enum { full, half }, com
                     return Interrupt.PageFault;
                 }
 
-                vm.registers[decoded.dst] = std.mem.readInt(moveType, vm.mmu.pages[0].buffer.?[@as(usize, @intCast(base + offset))..][0..@sizeOf(moveType)], .little);
+                vm.registers.registers()[decoded.dst] = std.mem.readInt(moveType, vm.mmu.pages[0].buffer.?[@as(usize, @intCast(base + offset))..][0..@sizeOf(moveType)], .little);
 
                 if (comptime postOp == .inc) {
-                    vm.registers[decoded.sPOR] +%= @sizeOf(moveType);
+                    vm.registers.registers()[decoded.sPOR] +%= @sizeOf(moveType);
                 } else if (comptime postOp == .dec) {
-                    vm.registers[decoded.sPOR] -%= @sizeOf(moveType);
+                    vm.registers.registers()[decoded.sPOR] -%= @sizeOf(moveType);
                 }
             }
         }.do,
@@ -301,11 +418,16 @@ fn MovFactory(comptime instrType: type, comptime width: enum { full, half }, com
             pub inline fn do(vm: *TESVM, instr: Instruction) Interrupt!void {
                 const decoded: InstructionDstSrcAddrX = @bitCast(instr);
 
-                const pageID: u8 = @truncate(vm.registers[decoded.sPSR]);
-                const base: isize = @intCast(vm.registers[decoded.sPOR]);
+                const pageID: u8 = @truncate(vm.registers.registers()[decoded.sPSR]);
+                const base: isize = @intCast(vm.registers.registers()[decoded.sPOR]);
                 const offset: isize = @intCast(decoded.offset);
 
                 if (vm.mmu.pages[pageID].buffer == null) {
+                    @branchHint(.unlikely);
+                    return Interrupt.PageFault;
+                }
+
+                if (!vm.mmu.pages[pageID].permissions.read) {
                     @branchHint(.unlikely);
                     return Interrupt.PageFault;
                 }
@@ -315,19 +437,19 @@ fn MovFactory(comptime instrType: type, comptime width: enum { full, half }, com
                     return Interrupt.PageFault;
                 }
 
-                vm.registers[decoded.dst] = std.mem.readInt(moveType, vm.mmu.pages[pageID].buffer.?[@as(usize, @intCast(base + offset))..][0..@sizeOf(moveType)], .little);
+                vm.registers.registers()[decoded.dst] = std.mem.readInt(moveType, vm.mmu.pages[pageID].buffer.?[@as(usize, @intCast(base + offset))..][0..@sizeOf(moveType)], .little);
 
                 if (comptime postOp == .inc) {
-                    vm.registers[decoded.sPOR] +%= @sizeOf(moveType);
+                    vm.registers.registers()[decoded.sPOR] +%= @sizeOf(moveType);
                 } else if (comptime postOp == .dec) {
-                    vm.registers[decoded.sPOR] -%= @sizeOf(moveType);
+                    vm.registers.registers()[decoded.sPOR] -%= @sizeOf(moveType);
                 }
             }
         }.do,
         InstructionDst => struct {
             pub inline fn do(vm: *TESVM, instr: Instruction) Interrupt!void {
                 const decoded: InstructionDst = @bitCast(instr);
-                vm.registers[decoded.dst] = @truncate(decoded.payload);
+                vm.registers.registers()[decoded.dst] = @truncate(decoded.payload);
             }
         }.do,
         else => unreachable,
@@ -340,9 +462,10 @@ const ScalarOp = enum {
     add,
     sub,
     mul,
+    div,
     shr,
     shl,
-    bin_add, // Assuming you meant bin_and
+    bin_and,
     bin_or,
     bin_xor,
     bin_not,
@@ -386,19 +509,19 @@ fn ScalarFactory(comptime op: ScalarOp) InstructionInfo {
         .add => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc = @bitCast(i);
-                vm.registers[de.dst] +%= vm.registers[de.src];
+                vm.registers.registers()[de.dst] +%= vm.registers.registers()[de.src];
             }
         }.do, 1 },
         .sub => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc = @bitCast(i);
-                vm.registers[de.dst] -%= vm.registers[de.src];
+                vm.registers.registers()[de.dst] -%= vm.registers.registers()[de.src];
             }
         }.do, 1 },
         .mul => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc = @bitCast(i);
-                vm.registers[de.dst] *%= vm.registers[de.src];
+                vm.registers.registers()[de.dst] *%= vm.registers.registers()[de.src];
             }
         }.do, 1 },
         .div => .{
@@ -411,10 +534,10 @@ fn ScalarFactory(comptime op: ScalarOp) InstructionInfo {
                     const d = de.src0;
                     const v = de.src1;
 
-                    if (vm.registers[v] == 0) return Interrupt.DivideByZero;
+                    if (vm.registers.registers()[v] == 0) return Interrupt.DivideByZero;
 
-                    vm.registers[q] = vm.registers[d] / vm.registers[v];
-                    vm.registers[r] = vm.registers[d] % vm.registers[v];
+                    vm.registers.registers()[q] = vm.registers.registers()[d] / vm.registers.registers()[v];
+                    vm.registers.registers()[r] = vm.registers.registers()[d] % vm.registers.registers()[v];
                 }
             }.do,
             8,
@@ -423,30 +546,30 @@ fn ScalarFactory(comptime op: ScalarOp) InstructionInfo {
         .shr => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc = @bitCast(i);
-                vm.registers[de.dst] >>= @truncate(vm.registers[de.src]);
+                vm.registers.registers()[de.dst] >>= @truncate(vm.registers.registers()[de.src]);
             }
         }.do, 1 },
         .shl => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc = @bitCast(i);
-                vm.registers[de.dst] <<= @truncate(vm.registers[de.src]);
+                vm.registers.registers()[de.dst] <<= @truncate(vm.registers.registers()[de.src]);
             }
         }.do, 1 },
         .sar => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc = @bitCast(i);
-                const val: i16 = @bitCast(vm.registers[de.dst]);
+                const val: i16 = @bitCast(vm.registers.registers()[de.dst]);
                 const shift: u4 = @truncate(vm.registerse[de.src]);
-                vm.registers[de.dst] = @bitCast(val >> shift);
+                vm.registers.registers()[de.dst] = @bitCast(val >> shift);
             }
         }.do, 1 },
 
         // --- Bitwise ---
-        .bin_add => .{
+        .bin_and => .{
             struct { // Treated as bitwise AND per common naming conventions
                 pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                     const de: InstructionDstSrc = @bitCast(i);
-                    vm.registers[de.dst] &= vm.registers[de.src];
+                    vm.registers.registers()[de.dst] &= vm.registers.registers()[de.src];
                 }
             }.do,
             1,
@@ -454,13 +577,13 @@ fn ScalarFactory(comptime op: ScalarOp) InstructionInfo {
         .bin_or => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc = @bitCast(i);
-                vm.registers[de.dst] |= vm.registers[de.src];
+                vm.registers.registers()[de.dst] |= vm.registers.registers()[de.src];
             }
         }.do, 1 },
         .bin_xor => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc = @bitCast(i);
-                vm.registers[de.dst] ^= vm.registers[de.src];
+                vm.registers.registers()[de.dst] ^= vm.registers.registers()[de.src];
             }
         }.do, 1 },
 
@@ -468,15 +591,15 @@ fn ScalarFactory(comptime op: ScalarOp) InstructionInfo {
         .log_and => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc = @bitCast(i);
-                const res = (vm.registers[de.dst] != 0) and (vm.registers[de.src] != 0);
-                vm.registers[de.dst] = if (res) 1 else 0;
+                const res = (vm.registers.registers()[de.dst] != 0) and (vm.registers.registers()[de.src] != 0);
+                vm.registers.registers()[de.dst] = if (res) 1 else 0;
             }
         }.do, 1 },
         .log_or => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc = @bitCast(i);
-                const res = (vm.registers[de.dst] != 0) or (vm.registers[de.src] != 0);
-                vm.registers[de.dst] = if (res) 1 else 0;
+                const res = (vm.registers.registers()[de.dst] != 0) or (vm.registers.registers()[de.src] != 0);
+                vm.registers.registers()[de.dst] = if (res) 1 else 0;
             }
         }.do, 1 },
 
@@ -484,44 +607,44 @@ fn ScalarFactory(comptime op: ScalarOp) InstructionInfo {
         .bin_not => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDst = @bitCast(i);
-                vm.registers[de.dst] = ~vm.registers[de.dst];
+                vm.registers.registers()[de.dst] = ~vm.registers.registers()[de.dst];
             }
         }.do, 1 },
         .log_not => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDst = @bitCast(i);
-                vm.registers[de.dst] = if (vm.registers[de.dst] == 0) 1 else 0;
+                vm.registers.registers()[de.dst] = if (vm.registers.registers()[de.dst] == 0) 1 else 0;
             }
         }.do, 1 },
         .neg => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDst = @bitCast(i);
-                vm.registers[de.dst] = -%vm.registers[de.dst];
+                vm.registers.registers()[de.dst] = -%vm.registers.registers()[de.dst];
             }
         }.do, 1 },
         .inc => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDst = @bitCast(i);
-                vm.registers[de.dst] +%= 1;
+                vm.registers.registers()[de.dst] +%= 1;
             }
         }.do, 1 },
         .dec => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDst = @bitCast(i);
-                vm.registers[de.dst] -%= 1;
+                vm.registers.registers()[de.dst] -%= 1;
             }
         }.do, 1 },
         // --- Rotates ---
         .rol => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc = @bitCast(i);
-                vm.registers[de.dst] = std.math.rotl(u16, vm.registers[de.dst], @truncate(vm.registers[de.src]));
+                vm.registers.registers()[de.dst] = std.math.rotl(u16, vm.registers.registers()[de.dst], @truncate(vm.registers.registers()[de.src]));
             }
         }.do, 1 },
         .ror => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc = @bitCast(i);
-                vm.registers[de.dst] = std.math.rotr(u16, vm.registers[de.dst], @truncate(vm.registers[de.src]));
+                vm.registers.registers()[de.dst] = std.math.rotr(u16, vm.registers.registers()[de.dst], @truncate(vm.registers.registers()[de.src]));
             }
         }.do, 1 },
 
@@ -529,27 +652,27 @@ fn ScalarFactory(comptime op: ScalarOp) InstructionInfo {
         .min => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc = @bitCast(i);
-                vm.registers[de.dst] = @min(vm.registers[de.dst], vm.registers[de.src]);
+                vm.registers.registers()[de.dst] = @min(vm.registers.registers()[de.dst], vm.registers.registers()[de.src]);
             }
         }.do, 1 },
         .max => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc = @bitCast(i);
-                vm.registers[de.dst] = @max(vm.registers[de.dst], vm.registers[de.src]);
+                vm.registers.registers()[de.dst] = @max(vm.registers.registers()[de.dst], vm.registers.registers()[de.src]);
             }
         }.do, 1 },
         .abs => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDst = @bitCast(i);
-                const val: i16 = @bitCast(vm.registers[de.dst]);
-                vm.registers[de.dst] = @bitCast(if (val < 0) -%val else val);
+                const val: i16 = @bitCast(vm.registers.registers()[de.dst]);
+                vm.registers.registers()[de.dst] = @bitCast(if (val < 0) -%val else val);
             }
         }.do, 1 },
         .sign => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDst = @bitCast(i);
-                const val: i16 = @bitCast(vm.registers[de.dst]);
-                vm.registers[de.dst] = if (val > 0) @as(u16, 1) else if (val < 0) @as(u16, 0xFFFF) else 0;
+                const val: i16 = @bitCast(vm.registers.registers()[de.dst]);
+                vm.registers.registers()[de.dst] = if (val > 0) @as(u16, 1) else if (val < 0) @as(u16, 0xFFFF) else 0;
             }
         }.do, 1 },
 
@@ -557,25 +680,25 @@ fn ScalarFactory(comptime op: ScalarOp) InstructionInfo {
         .iadd => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc = @bitCast(i);
-                const a: i16 = @bitCast(vm.registers[de.dst]);
-                const b: i16 = @bitCast(vm.registers[de.src]);
-                vm.registers[de.dst] = @bitCast(a +% b);
+                const a: i16 = @bitCast(vm.registers.registers()[de.dst]);
+                const b: i16 = @bitCast(vm.registers.registers()[de.src]);
+                vm.registers.registers()[de.dst] = @bitCast(a +% b);
             }
         }.do, 1 },
         .isub => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc = @bitCast(i);
-                const a: i16 = @bitCast(vm.registers[de.dst]);
-                const b: i16 = @bitCast(vm.registers[de.src]);
-                vm.registers[de.dst] = @bitCast(a -% b);
+                const a: i16 = @bitCast(vm.registers.registers()[de.dst]);
+                const b: i16 = @bitCast(vm.registers.registers()[de.src]);
+                vm.registers.registers()[de.dst] = @bitCast(a -% b);
             }
         }.do, 1 },
         .imul => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc = @bitCast(i);
-                const a: i16 = @bitCast(vm.registers[de.dst]);
-                const b: i16 = @bitCast(vm.registers[de.src]);
-                vm.registers[de.dst] = @bitCast(a *% b);
+                const a: i16 = @bitCast(vm.registers.registers()[de.dst]);
+                const b: i16 = @bitCast(vm.registers.registers()[de.src]);
+                vm.registers.registers()[de.dst] = @bitCast(a *% b);
             }
         }.do, 1 },
         .idiv => .{
@@ -585,8 +708,8 @@ fn ScalarFactory(comptime op: ScalarOp) InstructionInfo {
                     // div q, r, d, v ==> q = d / v : r = d % v
                     const q: u16 = de.dst0;
                     const r: u16 = de.dst1;
-                    const d: i16 = @bitCast(vm.registers[de.src0]);
-                    const v: i16 = @bitCast(vm.registers[de.src1]);
+                    const d: i16 = @bitCast(vm.registers.registers()[de.src0]);
+                    const v: i16 = @bitCast(vm.registers.registers()[de.src1]);
 
                     if (v == 0) {
                         @branchHint(.unlikely);
@@ -597,8 +720,8 @@ fn ScalarFactory(comptime op: ScalarOp) InstructionInfo {
                         return Interrupt.SignedDivisionOverflow;
                     }
 
-                    vm.registers[q] = @bitCast(@divTrunc(d, v));
-                    vm.registers[r] = @bitCast(@rem(d, v));
+                    vm.registers.registers()[q] = @bitCast(@divTrunc(d, v));
+                    vm.registers.registers()[r] = @bitCast(@rem(d, v));
                 }
             }.do,
             8,
@@ -608,7 +731,7 @@ fn ScalarFactory(comptime op: ScalarOp) InstructionInfo {
             struct { // Zero extend lower 8 bits
                 pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                     const de: InstructionDst = @bitCast(i);
-                    vm.registers[de.dst] = vm.registers[de.dst] & 0x00FF;
+                    vm.registers.registers()[de.dst] = vm.registers.registers()[de.dst] & 0x00FF;
                 }
             }.do,
             1,
@@ -617,8 +740,8 @@ fn ScalarFactory(comptime op: ScalarOp) InstructionInfo {
             struct { // Sign extend lower 8 bits
                 pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                     const de: InstructionDst = @bitCast(i);
-                    const low: i8 = @truncate(@as(u16, vm.registers[de.dst]));
-                    vm.registers[de.dst] = @bitCast(@as(i16, low));
+                    const low: i8 = @truncate(@as(u16, vm.registers.registers()[de.dst]));
+                    vm.registers.registers()[de.dst] = @bitCast(@as(i16, low));
                 }
             }.do,
             1,
@@ -627,7 +750,7 @@ fn ScalarFactory(comptime op: ScalarOp) InstructionInfo {
             struct { // Truncate to lower 8 bits
                 pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                     const de: InstructionDst = @bitCast(i);
-                    vm.registers[de.dst] = @as(u8, @truncate(vm.registers[de.dst]));
+                    vm.registers.registers()[de.dst] = @as(u8, @truncate(vm.registers.registers()[de.dst]));
                 }
             }.do,
             1,
@@ -636,7 +759,7 @@ fn ScalarFactory(comptime op: ScalarOp) InstructionInfo {
             struct { // Saturate 16-bit to 8-bit range (0-255)
                 pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                     const de: InstructionDst = @bitCast(i);
-                    vm.registers[de.dst] = @min(vm.registers[de.dst], 255);
+                    vm.registers.registers()[de.dst] = @min(vm.registers.registers()[de.dst], 255);
                 }
             }.do,
             1,
@@ -647,8 +770,8 @@ fn ScalarFactory(comptime op: ScalarOp) InstructionInfo {
             struct { // (A * B) + C
                 pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                     const de: InstructionDstSrc2 = @bitCast(i);
-                    const prod = vm.registers[de.src0] *% vm.registers[de.src1];
-                    vm.registers[de.dst] +%= prod;
+                    const prod = vm.registers.registers()[de.src0] *% vm.registers.registers()[de.src1];
+                    vm.registers.registers()[de.dst] +%= prod;
                 }
             }.do,
             1,
@@ -658,61 +781,61 @@ fn ScalarFactory(comptime op: ScalarOp) InstructionInfo {
         .seteq => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc2 = @bitCast(i);
-                vm.registers[de.dst] = if (vm.registers[de.src0] == vm.registers[de.src1]) 1 else 0;
+                vm.registers.registers()[de.dst] = if (vm.registers.registers()[de.src0] == vm.registers.registers()[de.src1]) 1 else 0;
             }
         }.do, 1 },
         .setneq => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc2 = @bitCast(i);
-                vm.registers[de.dst] = if (vm.registers[de.src0] != vm.registers[de.src1]) 1 else 0;
+                vm.registers.registers()[de.dst] = if (vm.registers.registers()[de.src0] != vm.registers.registers()[de.src1]) 1 else 0;
             }
         }.do, 1 },
         .setlt => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc2 = @bitCast(i);
-                vm.registers[de.dst] = if (vm.registers[de.src0] < vm.registers[de.src1]) 1 else 0;
+                vm.registers.registers()[de.dst] = if (vm.registers.registers()[de.src0] < vm.registers.registers()[de.src1]) 1 else 0;
             }
         }.do, 1 },
         .setle => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc2 = @bitCast(i);
-                vm.registers[de.dst] = if (vm.registers[de.src0] <= vm.registers[de.src1]) 1 else 0;
+                vm.registers.registers()[de.dst] = if (vm.registers.registers()[de.src0] <= vm.registers.registers()[de.src1]) 1 else 0;
             }
         }.do, 1 },
         .setgt => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc2 = @bitCast(i);
-                vm.registers[de.dst] = if (vm.registers[de.src0] > vm.registers[de.src1]) 1 else 0;
+                vm.registers.registers()[de.dst] = if (vm.registers.registers()[de.src0] > vm.registers.registers()[de.src1]) 1 else 0;
             }
         }.do, 1 },
         .setge => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc2 = @bitCast(i);
-                vm.registers[de.dst] = if (vm.registers[de.src0] >= vm.registers[de.src1]) 1 else 0;
+                vm.registers.registers()[de.dst] = if (vm.registers.registers()[de.src0] >= vm.registers.registers()[de.src1]) 1 else 0;
             }
         }.do, 1 },
         .isetlt => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc2 = @bitCast(i);
-                vm.registers[de.dst] = if (@as(i16, @bitCast(vm.registers[de.src0])) < @as(i16, @bitCast(vm.registers[de.src1]))) 1 else 0;
+                vm.registers.registers()[de.dst] = if (@as(i16, @bitCast(vm.registers.registers()[de.src0])) < @as(i16, @bitCast(vm.registers.registers()[de.src1]))) 1 else 0;
             }
         }.do, 1 },
         .isetle => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc2 = @bitCast(i);
-                vm.registers[de.dst] = if (@as(i16, @bitCast(vm.registers[de.src0])) <= @as(i16, @bitCast(vm.registers[de.src1]))) 1 else 0;
+                vm.registers.registers()[de.dst] = if (@as(i16, @bitCast(vm.registers.registers()[de.src0])) <= @as(i16, @bitCast(vm.registers.registers()[de.src1]))) 1 else 0;
             }
         }.do, 1 },
         .isetgt => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc2 = @bitCast(i);
-                vm.registers[de.dst] = if (@as(i16, @bitCast(vm.registers[de.src0])) > @as(i16, @bitCast(vm.registers[de.src1]))) 1 else 0;
+                vm.registers.registers()[de.dst] = if (@as(i16, @bitCast(vm.registers.registers()[de.src0])) > @as(i16, @bitCast(vm.registers.registers()[de.src1]))) 1 else 0;
             }
         }.do, 1 },
         .isetge => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc2 = @bitCast(i);
-                vm.registers[de.dst] = if (@as(i16, @bitCast(vm.registers[de.src0])) >= @as(i16, @bitCast(vm.registers[de.src1]))) 1 else 0;
+                vm.registers.registers()[de.dst] = if (@as(i16, @bitCast(vm.registers.registers()[de.src0])) >= @as(i16, @bitCast(vm.registers.registers()[de.src1]))) 1 else 0;
             }
         }.do, 1 },
     };
@@ -762,7 +885,7 @@ fn VectorFactory(comptime op: VectorOp) InstructionInfo {
         break :a struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDst = @bitCast(i);
-                vm.registers[de.dst] = @byteSwap(vm.registers[de.dst]);
+                vm.registers.registers()[de.dst] = @byteSwap(vm.registers.registers()[de.dst]);
             }
         }.do;
     } else if (comptime op == .vselect2) b: {
@@ -770,24 +893,24 @@ fn VectorFactory(comptime op: VectorOp) InstructionInfo {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc3 = @bitCast(i);
 
-                const va: @Vector(2, u8) = @bitCast(vm.registers[de.src0]);
-                const vb: @Vector(2, u8) = @bitCast(vm.registers[de.src1]);
+                const va: @Vector(2, u8) = @bitCast(vm.registers.registers()[de.src0]);
+                const vb: @Vector(2, u8) = @bitCast(vm.registers.registers()[de.src1]);
 
-                const mask = vm.registers[de.src2];
+                const mask = vm.registers.registers()[de.src2];
                 const vMask = @Vector(2, bool){ mask & 0x00FF != 0, mask & 0xFF00 != 0 };
 
                 const vr = @select(u8, vMask, va, vb);
 
-                vm.registers[de.dst] = @bitCast(vr);
+                vm.registers.registers()[de.dst] = @bitCast(vr);
             }
         }.do;
     } else if (comptime op == .vreduce2) struct {
         pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
             const de: InstructionDstSrc = @bitCast(i);
 
-            const va: @Vector(2, u8) = @bitCast(vm.registers[de.src]);
+            const va: @Vector(2, u8) = @bitCast(vm.registers.registers()[de.src]);
 
-            vm.registers[de.dst] = @intCast(switch (@as(instructions.ReduceCode, @enumFromInt(@as(u8, @truncate(de.payload))))) {
+            vm.registers.registers()[de.dst] = @intCast(switch (@as(instructions.ReduceCode, @enumFromInt(@as(u8, @truncate(de.payload))))) {
                 .Add => @reduce(.Add, va),
                 .Sub => @reduce(.Sub, va),
                 .Mul => @reduce(.Mul, va),
@@ -812,18 +935,18 @@ fn VectorFactory(comptime op: VectorOp) InstructionInfo {
         pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
             const de: InstructionDst = @bitCast(i);
             const immediate: u8 = @truncate(de.payload);
-            vm.registers[de.dst] = (@as(u16, @intCast(immediate)) << 8) | immediate;
+            vm.registers.registers()[de.dst] = (@as(u16, @intCast(immediate)) << 8) | immediate;
         }
     }.do else if (comptime op == .vldc2) struct {
         pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
             const de: InstructionDst = @bitCast(i);
-            vm.registers[de.dst] = @truncate(de.payload);
+            vm.registers.registers()[de.dst] = @truncate(de.payload);
         }
     }.do else if (comptime op == .vnot2 or op == .vneg2 or op == .vabs2 or op == .vsign2) struct {
         pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
             const de: InstructionDst = @bitCast(i);
-            const v: @Vector(2, u8) = @bitCast(vm.registers[de.dst]);
-            vm.registers[de.dst] = @bitCast(switch (op) {
+            const v: @Vector(2, u8) = @bitCast(vm.registers.registers()[de.dst]);
+            vm.registers.registers()[de.dst] = @bitCast(switch (op) {
                 .vnot2 => ~v,
                 .vneg2 => -%@as(@Vector(2, i8), @bitCast(v)),
                 .vabs2 => a: {
@@ -842,11 +965,11 @@ fn VectorFactory(comptime op: VectorOp) InstructionInfo {
     }.do else if (comptime op == .vshl2 or op == .vshr2 or op == .vsar2 or op == .vrol2 or op == .vror2) struct {
         pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
             const de: InstructionDstSrc = @bitCast(i);
-            const v: @Vector(2, u8) = @bitCast(vm.registers[de.dst]);
-            const amount: u3 = @truncate(vm.registers[de.src]); // Shift amount usually 0..7
+            const v: @Vector(2, u8) = @bitCast(vm.registers.registers()[de.dst]);
+            const amount: u3 = @truncate(vm.registers.registers()[de.src]); // Shift amount usually 0..7
             const s: @Vector(2, u3) = @splat(amount);
 
-            vm.registers[de.dst] = @bitCast(switch (op) {
+            vm.registers.registers()[de.dst] = @bitCast(switch (op) {
                 .vshl2 => v << s,
                 .vshr2 => v >> s,
                 .vsar2 => @as(@Vector(2, u8), @bitCast(@as(@Vector(2, i8), @bitCast(v)) >> s)),
@@ -981,9 +1104,9 @@ fn VectorFactory(comptime op: VectorOp) InstructionInfo {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc = @bitCast(i);
 
-                const a: @Vector(2, u8) = @bitCast(vm.registers[de.dst]);
-                const b: @Vector(2, u8) = @bitCast(vm.registers[de.src]);
-                vm.registers[de.dst] = @bitCast(whichFn(a, b));
+                const a: @Vector(2, u8) = @bitCast(vm.registers.registers()[de.dst]);
+                const b: @Vector(2, u8) = @bitCast(vm.registers.registers()[de.src]);
+                vm.registers.registers()[de.dst] = @bitCast(whichFn(a, b));
             }
         }.do;
     };
@@ -1036,6 +1159,15 @@ const InstructionTable = init: {
         if (!@hasField(OpCode, field.name)) continue;
         table[@intFromEnum(@field(OpCode, field.name))] = VectorFactory(@enumFromInt(field.value));
     }
+
+    // branching instructions are handled directly in the dispatch (b family, bn family, hlt)
+    table[@intFromEnum(OpCode.b)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+    table[@intFromEnum(OpCode.bt)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+    table[@intFromEnum(OpCode.bf)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+    table[@intFromEnum(OpCode.bn)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+    table[@intFromEnum(OpCode.bnt)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+    table[@intFromEnum(OpCode.bnf)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+    table[@intFromEnum(OpCode.hlt)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
 
     // TODO: add the rest
 

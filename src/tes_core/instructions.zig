@@ -45,7 +45,7 @@ pub const InstructionCode = enum(u8) {
     setle = 0x28,
     setgt = 0x29,
     setge = 0x2A,
-    b = 0x2B,
+    b = 0x2B, // now requires 2 registers
     bt = 0x2C,
     bf = 0x2D,
     push8 = 0x2E,
@@ -56,11 +56,11 @@ pub const InstructionCode = enum(u8) {
     bump_c = 0x33, // bump [const-amount]
     mov_aevi = 0x34, // mov [address + ext], reg  -- increments offset byte
     mov_raei = 0x35, // mov reg, [address + ext]
-    mov_heavi = 0x36, // mov reg, (byte)[address + ext]
+    mov_haevi = 0x36, // mov reg, (byte)[address + ext]
     mov_hraei = 0x37, // mov [address + ext], (byte) reg
     mov_aevd = 0x38, // mov [address + ext], reg  -- decrements offset byte (by size of value)
     mov_raed = 0x39, // mov reg, [address + ext]
-    mov_heavd = 0x3A, // mov reg, (byte)[address + ext]
+    mov_haevd = 0x3A, // mov reg, (byte)[address + ext]
     mov_hraed = 0x3B, // mov [address + ext], (byte) reg
     fma = 0x3C, // fma [a], [b], [c] --> (a = (a * b) + c) TODO: figure out if this is most useful variant of formula
     stackset = 0x3D, // stackset [base], [len]
@@ -134,6 +134,12 @@ pub const InstructionCode = enum(u8) {
     ror = 0x7A,
     vrol2 = 0x7B,
     vror2 = 0x7C,
+    lea = 0x7D, // lea [dst0], [dst1] + 32bit address (consumes 64 bits)
+    bn = 0x7E,
+    bnt = 0x7F,
+    bnf = 0x80,
+    push32 = 0x81,
+    pop32 = 0x82,
 };
 
 // TODO: Separate saturiting and wrapping variants

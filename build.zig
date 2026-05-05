@@ -5,13 +5,23 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const glad = b.addTranslateC(.{
+        .root_source_file = b.path("src/extern/src/glad.c"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    glad.addIncludePath(b.path("src/extern/include/"));
+
     // 1. native-tes: Native version of tes
     // Depends on SDL3 and GLAD
-    const native_tes = buildTES(b, "native-tes", target, optimize);
-    native_tes.linkSystemLibrary("sdl3");
-    native_tes.linkLibC();
-    native_tes.addCSourceFile(.{ .file = b.path("src/extern/src/glad.c") });
-    native_tes.addIncludePath(b.path("src/extern/include/"));
+    const native_tes = buildTES(b, "native-tes", glad.createModule(), target, optimize);
+    native_tes.root_module.linkSystemLibrary("sdl3", .{});
+
+    //native_tes.linkSystemLibrary("sdl3");
+    //native_tes.linkLibC();
+    //native_tes.addCSourceFile(.{ .file = b.path("src/extern/src/glad.c") });
+    //native_tes.addIncludePath(b.path("src/extern/include/"));
 
     b.installArtifact(native_tes);
 
@@ -21,7 +31,7 @@ pub fn build(b: *std.Build) void {
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
     });
-    const web_tes = buildTES(b, "web-tes", web_target, optimize);
+    const web_tes = buildTES(b, "web-tes", null, web_target, optimize);
 
     // Web-specific configuration:
     // entry = .disabled because we often use custom start logic or exported functions
@@ -119,7 +129,7 @@ pub fn build(b: *std.Build) void {
 }
 
 /// Helper to create a TES executable (native or web) with the tes_core module
-fn buildTES(b: *std.Build, name: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
+fn buildTES(b: *std.Build, name: []const u8, glad: ?*std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
     const tes_core = b.createModule(.{
         .root_source_file = b.path("src/tes_core/tes.zig"),
         .target = target,
@@ -134,9 +144,14 @@ fn buildTES(b: *std.Build, name: []const u8, target: std.Build.ResolvedTarget, o
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "tes_core", .module = tes_core },
+                //.{ .name = "glad", .module = glad },
             },
         }),
     });
+
+    if (glad) |gm| {
+        exe.root_module.addImport("glad", gm);
+    }
 
     return exe;
 }
