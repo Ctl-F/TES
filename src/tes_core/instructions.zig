@@ -140,6 +140,7 @@ pub const InstructionCode = enum(u8) {
     bnf = 0x80,
     push32 = 0x81,
     pop32 = 0x82,
+    ivs = 0x83,
 };
 
 // TODO: Separate saturiting and wrapping variants

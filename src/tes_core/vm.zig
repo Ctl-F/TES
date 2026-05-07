@@ -1,5 +1,6 @@
 const std = @import("std");
 const instructions = @import("instructions.zig");
+const meta = @import("meta.zig");
 
 const OpCode = instructions.InstructionCode;
 const Instruction = instructions.Instruction;
@@ -51,7 +52,7 @@ pub const MaxRegisterID = 31;
 pub const MaxRegisterCount = 32;
 pub const DoubleRegisterType = @Int(.unsigned, @bitSizeOf(RegisterType) * 2);
 
-const PageSize = std.math.maxInt(RegisterType);
+const PageSize = std.math.maxInt(RegisterType) + 1;
 
 const Registers = struct {
     const BUFF_LEN = MaxRegisterCount * @sizeOf(RegisterType);
@@ -64,6 +65,33 @@ const Registers = struct {
     pub inline fn doubleRegisters(this: *@This()) []DoubleRegisterType {
         return std.mem.bytesAsSlice(DoubleRegisterType, &this.buffer);
     }
+};
+
+pub const IVTableSizeBytes = 256 * @sizeOf(u32);
+
+const CoProcessorReturnPolicy = enum(u2) {
+    resume_retry = 0,
+    resume_skip = 1,
+    resume_at = 2,
+};
+
+// TODO: Move IP from indexable registers to non-indexable registers
+const NonIndexableRegisters = struct {
+    flags: packed struct(u16) {
+        halted: bool,
+        isCoProcessor: bool,
+        policy: CoProcessorReturnPolicy,
+        reserved: u4,
+        interruptCode: u8,
+    } = .{
+        .halted = false,
+        .reserved = 0,
+        .interruptCode = 0,
+        .isCoProcessor = false,
+        .policy = .resume_retry,
+    },
+    // base of the table and grows up
+    interruptVectorTable: u32 = 0,
 };
 
 comptime {
@@ -81,16 +109,69 @@ comptime {
 
 pub const TESVM = struct {
     registers: Registers,
+    nonidxRegisters: NonIndexableRegisters = .{},
     mmu: MMU = .{},
     instructionBuffer: []const Instruction,
-    halted: bool = false,
-    // TODO: add interrupt table
+    allocator: std.mem.Allocator, // realistically should only ever be the page allocator!!!
 
-    pub fn empty() @This() {
+    registerBackBuffer: Registers = .{},
+    nonidxRegisterBackBuffer: NonIndexableRegisters = .{},
+    page0BackBuffer: *[PageSize]u8,
+
+    /// Creates the default VM using the page allocator. I know this breaks zig api
+    /// slightly, and I'll provide an actual allocator receiving initializer function also
+    /// but the page allocator really is all that's necessary for this.
+    pub fn defaultWithPageAllocator() !@This() {
+        const allocator = std.heap.page_allocator;
+        var mmu = try MMU.init(allocator);
+        errdefer mmu.deinit();
+
+        const page0BackBuffer = try allocator.alloc(u8, PageSize);
+        errdefer allocator.free(page0BackBuffer);
+
         return .{
             .registers = .{},
             .instructionBuffer = &.{Instruction{ .opcode = @intFromEnum(OpCode.hlt), .payload = 0 }},
+            .mmu = mmu,
+            .page0BackBuffer = page0BackBuffer[0..PageSize],
         };
+    }
+
+    inline fn getPage0(this: *@This()) *[PageSize]u8 {
+        if (this.mmu.pages[0].buffer) |buf| {
+            return buf;
+        }
+        unreachable;
+    }
+
+    inline fn getPageMMIO(this: *@This()) *[PageSize]u8 {
+        if (this.mmu.pages[MMU.MMIOPage].buffer) |buf| {
+            return buf;
+        }
+        unreachable;
+    }
+
+    inline fn getIVTableSpan(this: *@This()) []u32 {
+        const IVT = this.nonidxRegisters.interruptVectorTable;
+        const page = (IVT & 0xFF0000) >> 16;
+        const base = IVT & 0xFFFF;
+        const top = base + IVTableSizeBytes;
+
+        var pageBuffer: *[PageSize]u8 = undefined;
+
+        if (!this.mmu.tryGetPage(page, &pageBuffer)) {
+            @panic("Misconfigured IVTable! Page requested does not exist");
+        }
+
+        return pageBuffer[base..top];
+    }
+
+    fn initIVTable(this: *@This()) void {
+        this.nonidxRegisters.interruptVectorTable = 0;
+
+        const pageBuffer = this.getIVTableSpan();
+
+        @memset(pageBuffer[this.nonidxRegisters.interruptVectorTable .. this.nonidxRegisters.interruptVectorTable + IVTableSizeBytes], 0);
     }
 
     inline fn doubleRegIndex(comptime id: RegisterID) u5 {
@@ -111,7 +192,7 @@ pub const TESVM = struct {
         return (high << 16) | low;
     }
 
-    pub fn exec(this: *@This(), totalCycles: u32) !void {
+    pub fn exec(this: *@This(), totalCycles: u32, comptime isCoProcessor: bool) !void {
         @setRuntimeSafety(false);
 
         var cycles = totalCycles;
@@ -120,6 +201,7 @@ pub const TESVM = struct {
             @branchHint(.unlikely);
             return error.AbruptProgramEOF;
         }
+
         var instruction = this.instructionBuffer[this.registers.registers()[@intFromEnum(RegisterID.IP)]];
         DISPATCH: switch (@as(OpCode, @enumFromInt(instruction.opcode))) {
             .hlt => {
@@ -258,12 +340,22 @@ pub const TESVM = struct {
             },
 
             inline else => |op| {
-                const consumed = InstructionTable[op].cycles;
-                InstructionTable[op].handler(this, instruction) catch {
-                    // TODO: handle Interrupt
-                };
+                if (comptime !isCoProcessor) {
+                    if (op == .resume_skip or op == .resume_at or op == .retry or op == .sync_mov or
+                        op == .sync_write or op == .sync_hwrite or op == .read or op == .sync_hread)
+                    {
+                        const code = InterruptToID(Interrupt.InvalidInstruction);
+                        this.fireInterrupt(code);
+                    }
+                }
 
-                this.registers.registers()[@intFromEnum(RegisterID.IP)] += 1;
+                this.registers.doubleRegisters()[doubleRegIndex(.IP)] += 1;
+
+                const consumed = InstructionTable[op].cycles;
+                InstructionTable[op].handler(this, instruction) catch |e| {
+                    const code = InterruptToID(e);
+                    this.fireInterrupt(code);
+                };
 
                 this.tickClock(consumed);
 
@@ -282,21 +374,189 @@ pub const TESVM = struct {
             },
         }
     }
+
+    fn fireInterrupt(this: *@This(), code: u8) void {
+        const interruptTable = this.getIVTableSpan();
+        const handlerAddress = interruptTable[code];
+
+        if (handlerAddress == 0) {
+            this.dumpContext();
+            @panic("Unhandled interrupt/fault has occurred.");
+        }
+
+        const mainToCoBoundryCross = !this.nonidxRegisters.flags.isCoProcessor;
+
+        // swap context to co-processor.
+        // this will swap the registers and page0
+        // TODO: add memory checks to ensure co-processor can't access pages 1..255 directly
+        if (mainToCoBoundryCross) {
+            this.swapContext();
+            defer this.swapContext();
+
+            const registers = this.registers.registers();
+            const mainCoreRegisters = this.registerBackBuffer.registers();
+
+            registers[@intFromEnum(RegisterID.GCL)] = mainCoreRegisters[@intFromEnum(RegisterID.GCL)];
+            registers[@intFromEnum(RegisterID.GCH)] = mainCoreRegisters[@intFromEnum(RegisterID.GCH)];
+
+            // recore change to global cycle counter
+            defer mainCoreRegisters[@intFromEnum(RegisterID.GCL)] = registers[@intFromEnum(RegisterID.GCL)];
+            defer mainCoreRegisters[@intFromEnum(RegisterID.GCH)] = registers[@intFromEnum(RegisterID.GCH)];
+
+            this.nonidxRegisters.flags.isCoProcessor = true;
+            this.nonidxRegisters.flags.interruptCode = code;
+
+            // initialize stack
+            const DefaultStackSize = 1024;
+            registers[@intFromEnum(RegisterID.SB)] = DefaultStackSize;
+            registers[@intFromEnum(RegisterID.SP)] = DefaultStackSize;
+            registers[@intFromEnum(RegisterID.SH)] = 0;
+        }
+
+        // call handler
+        this.registers.doubleRegisters()[doubleRegIndex(.IP)] = handlerAddress;
+        this.registers.doubleRegisters()[doubleRegIndex(.JR)] = handlerAddress;
+        // TODO: fix cycles handling here and have proper timing
+        this.exec(5000, true);
+
+        switch (this.nonidxRegisters.flags.policy) {
+            // TODO: resume here
+        }
+    }
+
+    fn dumpContext(this: *@This()) void {
+        // TODO: dump debug context to standard out
+        _ = this;
+    }
+
+    fn swapContext(this: *@This()) void {
+        const bb = this.mmu.pages[0].buffer.?;
+        this.mmu.pages[0].buffer = this.page0BackBuffer;
+        this.page0BackBuffer = bb;
+
+        const rr = this.registers;
+        const ri = this.nonidxRegisters;
+
+        this.registers = this.registerBackBuffer;
+        this.nonidxRegisters = this.nonidxRegisterBackBuffer;
+
+        this.registerBackBuffer = rr;
+        this.nonidxRegisterBackBuffer = ri;
+    }
 };
 
 pub const PagePermissions = packed struct(u8) {
     read: bool,
     write: bool,
-    reserved: u6 = undefined,
+    isMapped: bool = false,
+    reserved: u5 = undefined,
+
+    pub const ReadWrite = @This(){ .read = true, .write = true };
+    pub const ReadOnly = @This(){ .read = true, .write = false };
+    pub const WriteOnly = @This(){ .read = false, .write = true };
+    pub const Unavailable = @This(){ .read = false, .write = false };
 };
 
 pub const PageEntry = struct {
     permissions: PagePermissions,
-    buffer: ?*[0xFFFF]u8,
+    buffer: ?*[PageSize]u8,
 };
 
 pub const MMU = struct {
-    pages: [256]PageEntry = [_]PageEntry{.{ .buffer = null, .permissions = .{ .read = false, .write = false } }} ** 256,
+    pages: [256]PageEntry = [_]PageEntry{.{ .buffer = null, .permissions = PagePermissions.Unavailable }} ** 256,
+    allocator: std.mem.Allocator,
+
+    pub const MMIOPage: u8 = 255;
+
+    /// allocator is HIGHLY RECOMMENDED to be the page allocator
+    pub fn init(allocator: std.mem.Allocator) !@This() {
+        var this = @This(){
+            .allocator = allocator,
+        };
+
+        try this.requestPage(0, null);
+        errdefer this.freePage(0);
+
+        try this.requestPage(MMIOPage, null);
+        errdefer this.freePage(MMIOPage);
+
+        return this;
+    }
+
+    pub inline fn hasPage(this: *@This(), pageID: u8) bool {
+        return this.pages[pageID].buffer != null and (this.pages[pageID].permissions.read or this.pages[pageID].permissions.read);
+    }
+
+    pub inline fn getPage(this: *@This(), pageID: u8) ?*[PageSize]u8 {
+        return this.pages[pageID].buffer;
+    }
+
+    pub inline fn tryGetPage(this: *@This(), pageID: u8, bufferPtr: **[PageSize]u8) bool {
+        if (this.hasPage(pageID)) {
+            bufferPtr.* = this.pages[pageID].buffer.?;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn requestPage(this: *@This(), pageID: u8, permissions: ?PagePermissions) !void {
+        const perm = if (permissions) |p| p else PagePermissions.ReadWrite;
+
+        if (perm.isMapped) {
+            @panic("Mapped pages must not be requested through 'requestPage' use 'mapPage' instead.");
+        }
+
+        // allocate new page
+        if (this.pages[pageID].buffer == null) {
+            const pageBuffer = try this.allocator.alloc(u8, PageSize);
+            errdefer this.allocator.free(pageBuffer);
+
+            this.pages[pageID] = .{
+                .permissions = perm,
+                .buffer = pageBuffer[0..PageSize],
+            };
+
+            return;
+        }
+
+        // reallocate existing page (e.g. change permissions without changing data)
+        // this can't be done if a page is a mapped page (those must always be readonly)
+        // which is why we have the validation up top for if perm.isMapped. The VM itself should
+        // manage whether to map or request pages under a given syscall which is why the mmu treats
+        // it as unreachable.
+        this.pages[pageID].permissions = perm;
+    }
+
+    pub fn mapPage(this: *@This(), id: u8, buffer: *[PageSize]u8) !void {
+        if (this.pages[id].buffer != null) {
+            @panic("Mapping cannot overwrite an existing page. You must first free the page before mapping");
+        }
+
+        this.pages[id] = .{
+            .permissions = .{ .read = true, .write = false, .isMapped = true },
+            .buffer = buffer,
+        };
+    }
+
+    pub fn freePage(this: *@This(), id: u8) void {
+        deinitPage(this.allocator, &this.pages[id]);
+    }
+
+    inline fn deinitPage(allocator: std.mem.Allocator, page: *PageEntry) void {
+        if (page.buffer) |bufPtr| {
+            if (!page.permissions.isMapped) {
+                allocator.free(bufPtr);
+            }
+            page.buffer = null;
+            page.permissions = PagePermissions.Unavailable;
+        }
+    }
+
+    pub fn deinit(this: *@This()) void {
+        for (&this.pages) |*page| {
+            deinitPage(this.allocator, page);
+        }
+    }
 };
 
 const Interrupt = error{
@@ -307,7 +567,24 @@ const Interrupt = error{
     DivideByZero,
     SignedDivisionOverflow,
     InvalidInstruction,
+    UserInterrupt,
 };
+
+pub fn InterruptToID(e: Interrupt) u8 {
+    return switch (e) {
+        Interrupt.Unknown => 0,
+        Interrupt.StackUnderflow => 1,
+        Interrupt.StackOverflow => 2,
+        Interrupt.PageFault => 3,
+        Interrupt.DivideByZero => 4,
+        Interrupt.SignedDivisionOverflow => 5,
+        Interrupt.InvalidInstruction => 6,
+        // Add System Interrupts Here...
+        Interrupt.UserInterrupt => 128,
+        // user interrupts will use the InterruptCode in the flags register
+        // instead of a literal value from the error
+    };
+}
 
 const InstructionHandler = fn (*TESVM, Instruction) callconv(.@"inline") Interrupt!void;
 
@@ -458,51 +735,16 @@ fn MovFactory(comptime instrType: type, comptime width: enum { full, half }, com
     return .{ .handler = function, .cycles = 1 };
 }
 
-const ScalarOp = enum {
-    add,
-    sub,
-    mul,
-    div,
-    shr,
-    shl,
-    bin_and,
-    bin_or,
-    bin_xor,
-    bin_not,
-    log_and,
-    log_or,
-    log_not,
-    neg,
-    inc,
-    dec,
-    rol,
-    ror,
-    sar,
-    min,
-    max,
-    abs,
-    sign,
-    iadd,
-    isub,
-    imul,
-    idiv,
-    extz,
-    exts,
-    truncz,
-    clamp,
-    fma,
+const ScalarOp = meta.Subset(OpCode, &.{
+    .add,     .sub,    .mul,     .div,     .shr,     .shl,
+    .bin_and, .bin_or, .bin_xor, .bin_not, .log_and, .log_or,
+    .log_not, .neg,    .inc,     .dec,     .rol,     .ror,
+    .sar,     .min,    .max,     .abs,     .sign,    .iadd,
+    .isub,    .imul,   .idiv,    .extz,    .exts,    .truncz,
+    .clamp,   .fma,    .seteq,   .setneq,  .setlt,   .setle,
+    .setgt,   .setge,  .isetlt,  .isetle,  .isetgt,  .isetge,
+});
 
-    seteq,
-    setneq,
-    setlt,
-    setle,
-    setgt,
-    setge,
-    isetlt,
-    isetle,
-    isetgt,
-    isetge,
-};
 fn ScalarFactory(comptime op: ScalarOp) InstructionInfo {
     const function, const cost = switch (op) {
         // --- Binary Math ---
@@ -843,43 +1085,16 @@ fn ScalarFactory(comptime op: ScalarOp) InstructionInfo {
     return InstructionInfo{ .handler = function, .cycles = cost };
 }
 
-const VectorOp = enum {
-    vadd2,
-    vsub2,
-    vmul2,
-    vshr2,
-    vshl2,
-    vand2,
-    vor2,
-    vxor2,
-    vnot2,
-    vneg2,
-    vseteq2,
-    vsetne2,
-    vsetlt2,
-    vsetle2,
-    vsetgt2,
-    vsetge2,
-    vreduce2,
-    vsplat2,
-    vldc2,
-    viadd2,
-    visub2,
-    vimul2,
-    visetlt2,
-    visetle2,
-    visetgt2,
-    visetge2,
-    vselect2,
-    vswap2,
-    vsar2,
-    vabs2,
-    vsign2,
-    vmin2,
-    vmax2,
-    vrol2,
-    vror2,
-};
+const VectorOp = meta.Subset(OpCode, &.{
+    .vadd2,    .vsub2,    .vmul2,    .vshr2,    .vshl2,
+    .vand2,    .vor2,     .vxor2,    .vnot2,    .vneg2,
+    .vseteq2,  .vsetne2,  .vsetlt2,  .vsetle2,  .vsetgt2,
+    .vsetge2,  .vreduce2, .vsplat2,  .vldc2,    .viadd2,
+    .visub2,   .vimul2,   .visetlt2, .visetle2, .visetgt2,
+    .visetge2, .vselect2, .vswap2,   .vsar2,    .vabs2,
+    .vsign2,   .vmin2,    .vmax2,    .vrol2,    .vror2,
+});
+
 fn VectorFactory(comptime op: VectorOp) InstructionInfo {
     const handler = if (comptime op == .vswap2) a: {
         break :a struct {
