@@ -27,23 +27,23 @@ pub fn build(b: *std.Build) void {
 
     // 2. web-tes: Web version of tes (Wasm)
     // Targets wasm32-freestanding for web deployment
-    const web_target = b.resolveTargetQuery(.{
-        .cpu_arch = .wasm32,
-        .os_tag = .freestanding,
-    });
-    const web_tes = buildTES(b, "web-tes", null, web_target, optimize);
+    //const web_target = b.resolveTargetQuery(.{
+    //    .cpu_arch = .wasm32,
+    //    .os_tag = .freestanding,
+    //});
+    //const web_tes = buildTES(b, "web-tes", null, web_target, optimize);
 
     // Web-specific configuration:
     // entry = .disabled because we often use custom start logic or exported functions
     // rdynamic = true to ensure symbols are exported to JS
-    web_tes.entry = .disabled;
-    web_tes.rdynamic = true;
+    //web_tes.entry = .disabled;
+    //web_tes.rdynamic = true;
 
     // Install web assets
-    b.getInstallStep().dependOn(&b.addInstallFile(b.path("src/web/index.html"), "index.html").step);
-    b.getInstallStep().dependOn(&b.addInstallFile(b.path("src/web/glue.js"), "glue.js").step);
+    //b.getInstallStep().dependOn(&b.addInstallFile(b.path("src/web/index.html"), "index.html").step);
+    //b.getInstallStep().dependOn(&b.addInstallFile(b.path("src/web/glue.js"), "glue.js").step);
 
-    b.installArtifact(web_tes);
+    //b.installArtifact(web_tes);
 
     // 3. native-xBEEF: Native version of xBEEF
     const native_xBEEF = b.addExecutable(.{

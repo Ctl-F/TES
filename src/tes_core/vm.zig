@@ -141,7 +141,7 @@ pub const TESVM = struct {
 
     pub fn deinit(this: *@This()) void {
         this.mmu.deinit();
-        this.allocator.free(this.page0BackBuffer);
+        this.allocator.free(@as([]u8, this.page0BackBuffer[0..PageSize]));
     }
 
     inline fn getPage0(this: *@This()) PageBuffer {
@@ -192,6 +192,11 @@ pub const TESVM = struct {
         const raw: u5 = @intFromEnum(id);
         if (raw & 1 != 0) @compileError("Misaligned Register Id points to non-32 bit enabled register being reinterpreted");
         return raw / 2;
+    }
+
+    inline fn wideRegIndex(id: u5) u5 {
+        if (id & 1 != 0) @panic("Misaligned RegisterID points to non-32 bit register.");
+        return id / 2;
     }
 
     pub inline fn tickClock(this: *@This(), cycles: u8) void {
@@ -611,7 +616,7 @@ pub const TESVM = struct {
 
     fn dumpMMIOInfo(mmioPage: *PageEntry) void {
         std.debug.print(
-            \\\ MMIO-Page: {?}
+            \\\ MMIO-Page: {any}
             \\\ Permissions[R/W/M]: {}/{}/{}
             \\\ Further MMInfo not available
             \\\
@@ -747,7 +752,7 @@ pub const MMU = struct {
     inline fn deinitPage(allocator: std.mem.Allocator, page: *PageEntry) void {
         if (page.buffer) |bufPtr| {
             if (!page.permissions.isMapped) {
-                allocator.free(bufPtr[0..PageSize]);
+                allocator.free(@as([]u8, bufPtr[0..PageSize]));
             }
             page.buffer = null;
             page.permissions = PagePermissions.Unavailable;
@@ -769,6 +774,8 @@ const Interrupt = error{
     DivideByZero,
     SignedDivisionOverflow,
     InvalidInstruction,
+    InvalidStackRelocation,
+    MisalignedStackRelocation,
     UserInterrupt,
 };
 
@@ -781,6 +788,8 @@ pub fn InterruptToID(e: Interrupt) u8 {
         Interrupt.DivideByZero => 4,
         Interrupt.SignedDivisionOverflow => 5,
         Interrupt.InvalidInstruction => 6,
+        Interrupt.InvalidStackRelocation => 7,
+        Interrupt.MisalignedStackRelocation => 8,
         // Add System Interrupts Here...
         Interrupt.UserInterrupt => 128,
         // user interrupts will use the InterruptCode in the flags register
@@ -1003,7 +1012,7 @@ fn ScalarFactory(comptime op: ScalarOp) InstructionInfo {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc = @bitCast(i);
                 const val: i16 = @bitCast(vm.registers.registers()[de.dst]);
-                const shift: u4 = @truncate(vm.registerse[de.src]);
+                const shift: u4 = @truncate(vm.registers.registers()[de.src]);
                 vm.registers.registers()[de.dst] = @bitCast(val >> shift);
             }
         }.do, 1 },
@@ -1082,13 +1091,13 @@ fn ScalarFactory(comptime op: ScalarOp) InstructionInfo {
         .rol => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc = @bitCast(i);
-                vm.registers.registers()[de.dst] = std.math.rotl(u16, vm.registers.registers()[de.dst], @truncate(vm.registers.registers()[de.src]));
+                vm.registers.registers()[de.dst] = std.math.rotl(u16, vm.registers.registers()[de.dst], vm.registers.registers()[de.src]);
             }
         }.do, 1 },
         .ror => .{ struct {
             pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
                 const de: InstructionDstSrc = @bitCast(i);
-                vm.registers.registers()[de.dst] = std.math.rotr(u16, vm.registers.registers()[de.dst], @truncate(vm.registers.registers()[de.src]));
+                vm.registers.registers()[de.dst] = std.math.rotr(u16, vm.registers.registers()[de.dst], vm.registers.registers()[de.src]);
             }
         }.do, 1 },
 
@@ -1330,7 +1339,7 @@ fn VectorFactory(comptime op: VectorOp) InstructionInfo {
 
             vm.registers.registers()[de.dst] = @intCast(switch (@as(instructions.ReduceCode, @enumFromInt(@as(u8, @truncate(de.payload))))) {
                 .Add => @reduce(.Add, va),
-                .Sub => @reduce(.Sub, va),
+                .Sub => va[0] - va[1],
                 .Mul => @reduce(.Mul, va),
                 .BitAnd => @reduce(.And, va),
                 .BitOr => @reduce(.Or, va),
@@ -1340,12 +1349,12 @@ fn VectorFactory(comptime op: VectorOp) InstructionInfo {
                 .And => a: {
                     const bool0 = va[0] != 0;
                     const bool1 = va[1] != 0;
-                    break :a if (bool0 and bool1) 1 else 0;
+                    break :a if (bool0 and bool1) @as(u8, 1) else @as(u8, 0);
                 },
                 .Or => a: {
                     const bool0 = va[0] != 0;
                     const bool1 = va[1] != 0;
-                    break :a if (bool0 or bool1) 1 else 0;
+                    break :a if (bool0 or bool1) @as(u8, 1) else @as(u8, 0);
                 },
             });
         }
@@ -1373,8 +1382,9 @@ fn VectorFactory(comptime op: VectorOp) InstructionInfo {
                 },
                 .vsign2 => a: {
                     const sv: @Vector(2, i8) = @bitCast(v);
-                    const pos = @as(@Vector(2, i8), @bitCast(sv > @as(@Vector(2, i8), @splat(@as(i8, 0)))));
-                    const neg = @as(@Vector(2, i8), @bitCast(sv < @as(@Vector(2, i8), @splat(@as(i8, 0)))));
+                    const zv2: @Vector(2, i8) = @splat(0);
+                    const pos = vb2vi8(sv > zv2);
+                    const neg = vb2vi8(sv < zv2);
                     break :a @as(@Vector(2, u8), @bitCast(pos -% neg));
                 },
                 else => unreachable,
@@ -1391,8 +1401,8 @@ fn VectorFactory(comptime op: VectorOp) InstructionInfo {
                 .vshl2 => v << s,
                 .vshr2 => v >> s,
                 .vsar2 => @as(@Vector(2, u8), @bitCast(@as(@Vector(2, i8), @bitCast(v)) >> s)),
-                .vrol2 => std.math.rotl(@Vector(2, u8), v, s),
-                .vror2 => std.math.rotr(@Vector(2, u8), v, s),
+                .vrol2 => std.math.rotl(@Vector(2, u8), v, s[0]),
+                .vror2 => std.math.rotr(@Vector(2, u8), v, s[0]),
                 else => unreachable,
             });
         }
@@ -1464,54 +1474,54 @@ fn VectorFactory(comptime op: VectorOp) InstructionInfo {
             // Comparisons (Unsigned)
             .vseteq2 => struct {
                 pub fn f(a: @Vector(2, u8), b: @Vector(2, u8)) @Vector(2, u8) {
-                    return @bitCast(a == b);
+                    return vb2vu8(a == b);
                 }
             }.f,
             .vsetneq2 => struct {
                 pub fn f(a: @Vector(2, u8), b: @Vector(2, u8)) @Vector(2, u8) {
-                    return @bitCast(a != b);
+                    return vb2vu8(a != b);
                 }
             }.f,
             .vsetlt2 => struct {
                 pub fn f(a: @Vector(2, u8), b: @Vector(2, u8)) @Vector(2, u8) {
-                    return @bitCast(a < b);
+                    return vb2vu8(a < b);
                 }
             }.f,
             .vsetle2 => struct {
                 pub fn f(a: @Vector(2, u8), b: @Vector(2, u8)) @Vector(2, u8) {
-                    return @bitCast(a <= b);
+                    return vb2vu8(a <= b);
                 }
             }.f,
             .vsetgt2 => struct {
                 pub fn f(a: @Vector(2, u8), b: @Vector(2, u8)) @Vector(2, u8) {
-                    return @bitCast(a > b);
+                    return vb2vu8(a > b);
                 }
             }.f,
             .vsetge2 => struct {
                 pub fn f(a: @Vector(2, u8), b: @Vector(2, u8)) @Vector(2, u8) {
-                    return @bitCast(a >= b);
+                    return vb2vu8(a >= b);
                 }
             }.f,
 
             // Comparisons (Signed)
             .visetlt2 => struct {
                 pub fn f(a: @Vector(2, u8), b: @Vector(2, u8)) @Vector(2, u8) {
-                    return @bitCast(@as(@Vector(2, i8), @bitCast(a)) < @as(@Vector(2, i8), @bitCast(b)));
+                    return vb2vu8(@as(@Vector(2, i8), @bitCast(a)) < @as(@Vector(2, i8), @bitCast(b)));
                 }
             }.f,
             .visetle2 => struct {
                 pub fn f(a: @Vector(2, u8), b: @Vector(2, u8)) @Vector(2, u8) {
-                    return @bitCast(@as(@Vector(2, i8), @bitCast(a)) <= @as(@Vector(2, i8), @bitCast(b)));
+                    return vb2vu8(@as(@Vector(2, i8), @bitCast(a)) <= @as(@Vector(2, i8), @bitCast(b)));
                 }
             }.f,
             .visetgt2 => struct {
                 pub fn f(a: @Vector(2, u8), b: @Vector(2, u8)) @Vector(2, u8) {
-                    return @bitCast(@as(@Vector(2, i8), @bitCast(a)) > @as(@Vector(2, i8), @bitCast(b)));
+                    return vb2vu8(@as(@Vector(2, i8), @bitCast(a)) > @as(@Vector(2, i8), @bitCast(b)));
                 }
             }.f,
             .visetge2 => struct {
                 pub fn f(a: @Vector(2, u8), b: @Vector(2, u8)) @Vector(2, u8) {
-                    return @bitCast(@as(@Vector(2, i8), @bitCast(a)) >= @as(@Vector(2, i8), @bitCast(b)));
+                    return vb2vu8(@as(@Vector(2, i8), @bitCast(a)) >= @as(@Vector(2, i8), @bitCast(b)));
                 }
             }.f,
 
@@ -1532,6 +1542,270 @@ fn VectorFactory(comptime op: VectorOp) InstructionInfo {
         .cycles = 1,
         .handler = handler,
     };
+}
+
+inline fn vb2vu8(vb: @Vector(2, bool)) @Vector(2, u8) {
+    const bools: [2]bool = @bitCast(vb);
+    const u8s: [2]u8 = .{
+        if (bools[0]) 1 else 0,
+        if (bools[1]) 1 else 0,
+    };
+    return @bitCast(u8s);
+}
+
+inline fn vb2vi8(vb: @Vector(2, bool)) @Vector(2, i8) {
+    const bools: [2]bool = @bitCast(vb);
+    const i8s: [2]i8 = .{
+        if (bools[0]) 1 else 0,
+        if (bools[1]) 1 else 0,
+    };
+    return @bitCast(i8s);
+}
+
+pub const MinimumStackSize = 256;
+
+const StackOp = meta.Subset(OpCode, &.{
+    .push8,  .pop8,  .push16, .pop16, .bump_r, .bump_c, .stackset,
+    .push32, .pop32,
+});
+
+fn StackFactory(comptime op: StackOp) InstructionInfo {
+    comptime {
+        const SP = @intFromEnum(RegisterID.SP);
+        const SB = @intFromEnum(RegisterID.SB);
+        const SH = @intFromEnum(RegisterID.SH);
+
+        return switch (op) {
+            .stackset => InstructionInfo{
+                .handler = struct {
+                    pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
+                        const de: InstructionDstSrc = @bitCast(i);
+
+                        const registers = vm.registers.registers();
+
+                        if (registers[SP] != registers[SB]) {
+                            // cannot use stackset when the stack is not empty.
+                            @branchHint(.unlikely);
+                            return Interrupt.InvalidStackRelocation;
+                        }
+
+                        const baseAddress = registers[de.dst];
+                        const len = registers[de.src];
+
+                        if (baseAddress % @sizeOf(u32) != 0) {
+                            @branchHint(.unlikely);
+                            return Interrupt.MisalignedStackRelocation;
+                        }
+
+                        if (len < MinimumStackSize) {
+                            @branchHint(.unlikely);
+                            return Interrupt.InvalidStackRelocation;
+                        }
+
+                        // if baseAddress < len then baseAddress-len will be a negative number and therefore (since stack grows down)
+                        // SH will become larger than SB which is invalid.
+                        if (len > baseAddress) {
+                            @branchHint(.unlikely);
+                            return Interrupt.InvalidStackRelocation;
+                        }
+
+                        registers[SB] = baseAddress;
+                        registers[SP] = baseAddress;
+                        registers[SH] = baseAddress - len;
+                    }
+                }.do,
+                .cycles = 1,
+            },
+            .bump_r => InstructionInfo{
+                .handler = struct {
+                    pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
+                        const de: InstructionDst = @bitCast(i);
+                        const registers = vm.registers.registers();
+
+                        const amount: i16 = @bitCast(registers[de.dst]);
+
+                        const sp = registers[SP];
+                        const sb = registers[SB];
+                        const sh = registers[SH];
+
+                        const wideSP: i32 = @intCast(sp);
+                        const wideSB: i32 = @intCast(sb);
+                        const wideSH: i32 = @intCast(sh);
+
+                        const nextSP = wideSP + amount;
+
+                        if (nextSP < wideSH) {
+                            @branchHint(.unlikely);
+                            return Interrupt.StackOverflow;
+                        }
+
+                        if (nextSP > wideSB) {
+                            @branchHint(.unlikely);
+                            return Interrupt.StackUnderflow;
+                        }
+
+                        registers[SP] = @intCast(nextSP);
+                    }
+                }.do,
+                .cycles = 1,
+            },
+            .bump_c => InstructionInfo{
+                .handler = struct {
+                    pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
+                        const de: InstructionDst = @bitCast(i);
+                        const registers = vm.registers.registers();
+
+                        const amount: i16 = @bitCast(@as(u16, @truncate(de.payload)));
+
+                        const sp = registers[SP];
+                        const sb = registers[SB];
+                        const sh = registers[SH];
+
+                        const wideSP: i32 = @intCast(sp);
+                        const wideSB: i32 = @intCast(sb);
+                        const wideSH: i32 = @intCast(sh);
+
+                        const nextSP = wideSP + amount;
+
+                        if (nextSP < wideSH) {
+                            @branchHint(.unlikely);
+                            return Interrupt.StackOverflow;
+                        }
+
+                        if (nextSP > wideSB) {
+                            @branchHint(.unlikely);
+                            return Interrupt.StackUnderflow;
+                        }
+
+                        registers[SP] = @intCast(nextSP);
+                    }
+                }.do,
+                .cycles = 1,
+            },
+            inline .push8, .push16 => InstructionInfo{
+                .handler = struct {
+                    pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
+                        const vTy = if (comptime op == .push8)
+                            u8
+                        else
+                            u16;
+
+                        const size = @sizeOf(vTy);
+
+                        const de: InstructionDst = @bitCast(i);
+                        const registers = vm.registers.registers();
+                        const sp = registers[SP];
+                        const sh = registers[SH];
+
+                        if (size > sp or sp - size < sh) {
+                            @branchHint(.unlikely);
+                            return Interrupt.StackOverflow;
+                        }
+
+                        registers[SP] -= size;
+
+                        const value: vTy = @truncate(registers[de.dst]);
+                        const page0 = vm.getPage0();
+
+                        const address = @as([*]u8, @ptrCast(&page0[registers[SP]]));
+                        std.mem.writeInt(vTy, address[0..size], value, .little);
+                    }
+                }.do,
+                .cycles = 1,
+            },
+            inline .pop8, .pop16 => InstructionInfo{
+                .handler = struct {
+                    pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
+                        const vTy = if (comptime op == .push8)
+                            u8
+                        else
+                            u16;
+
+                        const size = @sizeOf(vTy);
+
+                        const de: InstructionDst = @bitCast(i);
+                        const registers = vm.registers.registers();
+                        const sp = registers[SP];
+                        const sb = registers[SB];
+
+                        if (sp + size > sb) {
+                            @branchHint(.unlikely);
+                            return Interrupt.StackUnderflow;
+                        }
+                        const page0 = vm.getPage0();
+                        const address = @as([*]u8, @ptrCast(&page0[registers[SP]]));
+                        const value: vTy = std.mem.readInt(vTy, address[0..size], .little);
+
+                        registers[SP] += size;
+                        registers[de.dst] = value;
+                    }
+                }.do,
+                .cycles = 1,
+            },
+            .push32 => InstructionInfo{
+                .handler = struct {
+                    pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
+                        const vTy = u32;
+
+                        const size = @sizeOf(vTy);
+
+                        const de: InstructionDst = @bitCast(i);
+                        const registers = vm.registers.registers();
+                        const sp = registers[SP];
+                        const sh = registers[SH];
+
+                        if (size > sp or sp - size < sh) {
+                            @branchHint(.unlikely);
+                            return Interrupt.StackOverflow;
+                        }
+
+                        registers[SP] -= size;
+
+                        if (de.dst != @intFromEnum(RegisterID.JR)) {
+                            @panic("register provided is not a valid 32 bit register for pushing");
+                        }
+
+                        const value: vTy = vm.registers.doubleRegisters()[TESVM.wideRegIndex(de.dst)];
+                        const page0 = vm.getPage0();
+
+                        const address = @as([*]u8, @ptrCast(&page0[registers[SP]]));
+                        std.mem.writeInt(vTy, address[0..size], value, .little);
+                    }
+                }.do,
+                .cycles = 1,
+            },
+            .pop32 => InstructionInfo{
+                .handler = struct {
+                    pub inline fn do(vm: *TESVM, i: Instruction) Interrupt!void {
+                        const vTy = u32;
+
+                        const size = @sizeOf(vTy);
+
+                        const de: InstructionDst = @bitCast(i);
+                        const registers = vm.registers.registers();
+                        const sp = registers[SP];
+                        const sb = registers[SB];
+
+                        if (de.dst != @intFromEnum(RegisterID.JR)) {
+                            @panic("register provided is not a valid 32 bit register for popping");
+                        }
+
+                        if (sp + size > sb) {
+                            @branchHint(.unlikely);
+                            return Interrupt.StackUnderflow;
+                        }
+                        const page0 = vm.getPage0();
+                        const address = @as([*]u8, @ptrCast(&page0[registers[SP]]));
+                        const value: vTy = std.mem.readInt(vTy, address[0..size], .little);
+
+                        registers[SP] += size;
+                        vm.registers.doubleRegisters()[TESVM.wideRegIndex(de.dst)] = value;
+                    }
+                }.do,
+                .cycles = 1,
+            },
+        };
+    }
 }
 
 const InstructionTable = init: {
@@ -1587,6 +1861,17 @@ const InstructionTable = init: {
     table[@intFromEnum(OpCode.bnf)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
     table[@intFromEnum(OpCode.hlt)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
     table[@intFromEnum(OpCode.lea)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+
+    // stack instructions
+    table[@intFromEnum(OpCode.bump_c)] = StackFactory(.bump_c);
+    table[@intFromEnum(OpCode.bump_r)] = StackFactory(.bump_r);
+    table[@intFromEnum(OpCode.push8)] = StackFactory(.push8);
+    table[@intFromEnum(OpCode.push16)] = StackFactory(.push16);
+    table[@intFromEnum(OpCode.push32)] = StackFactory(.push32);
+    table[@intFromEnum(OpCode.pop8)] = StackFactory(.pop8);
+    table[@intFromEnum(OpCode.pop16)] = StackFactory(.pop16);
+    table[@intFromEnum(OpCode.pop32)] = StackFactory(.pop32);
+    table[@intFromEnum(OpCode.stackset)] = StackFactory(.stackset);
 
     // TODO: add the rest
 
