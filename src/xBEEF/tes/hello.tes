@@ -1,0 +1,18 @@
+#include "stddef.tes"
+
+[Data(0:0x1000)]
+hello_str: "Hello, World!\n\0"
+hello_end:
+
+[Program]
+_start:
+    ; Load address of hello_str into r1 (hi) and r2 (lo)
+    lea r0, r1, hello_str
+    lea ra, r2, hello_end
+    sub r2, r1
+
+    ; Syscall 0 is write (pool=0, event=0)
+    syscall $cat_Sys, $SerialWrite;
+
+    ; Terminate
+    hlt

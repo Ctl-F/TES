@@ -1,0 +1,218 @@
+#include "stddef.tes"
+#include "stdgfx.tes"
+#include "stdio.tes"
+
+#define SCREEN_WIDTH 240
+#define SCREEN_HEIGHT 135
+
+#define STACK_SIZE 0x0FFF
+
+
+[Data(0:0x1000)]
+pbConfig: .GFXPixelBufferConfig .{ $GFX_MODE_PIXEL_BUFFER, $SCREEN_WIDTH, $SCREEN_HEIGHT, $GFX_FORMAT_RGB32 }
+
+[Data(1:0x0000)]
+pbData: .u8[${SCREEN_WIDTH * SCREEN_HEIGHT * 2}] 0
+
+[Data(0:0xF000)]
+stackHead: .u8[$STACK_SIZE] 0
+
+
+[Program]
+_start:
+    mov ra, stackHead;
+    mov rb, $STACK_SIZE;
+    stackset ra, rb;
+
+
+    bn initGfx;
+
+loop:
+    bn readInput;
+
+    bn step;
+
+    bn loop;
+
+
+ExitStart:
+    hlt;
+
+
+step: @{
+    @bind RetAddr : jr;
+    @bind MMPage : ra;
+    @bind MMPtr : rb;
+    @bind ColCh : r0;
+
+    push RetAddr;
+
+    mov MMPage, 255;
+    mov MMPtr, $GFX_BufferOffset;
+
+
+    pop RetAddr;
+    b RetAddr;
+}
+
+
+
+readInput:
+    push jr;
+
+    mov ra, 255;
+    mov rb, $IO_BufferOffset;
+
+    inc r6;
+    mov (byte)rc, [ra, (IOHeader.closeSignal)rb]
+    bnt rc, ExitStart;
+
+    pop jr;
+    b jr;
+
+initGfx:
+    push jr;
+
+    ; get header address
+    mov ra, 255;
+    mov rb, $GFX_BufferOffset
+
+    ; enable gfx
+    mov rd, 1
+    mov [ra, (GFXHeader.enable)rb], rd;
+
+    ; set screen size with scale of 1
+    mov [ra, (GFXHeader.screenScale)rb], rd;
+
+    // width and height
+    mov rd, $SCREEN_WIDTH;
+    mov [ra, (GFXHeader.screenWidth)rb], rd;
+
+    mov rd, $SCREEN_HEIGHT;
+    mov [ra, (GFXHeader.screenHeight)rb], rd;
+
+    mov rd, 1;
+    mov [ra, (GFXHeader.screenScale)rb], rd;
+
+    ; enable clear color
+    mov [ra, (GFXHeader.clearEnable)rb], rd;
+
+    mov rd, 255;
+    mov [ra, (GFXHeader.clearColor.r)rb], rd;
+
+    mov rd, 128;
+    mov [ra, (GFXHeader.clearColor.b)rb], rd;
+
+
+    // set layers (none for now)
+    xor rd, rd;
+    mov [ra, (GFXHeader.layerReg)rb], rd;
+
+
+
+    bn clearGFXLayerConfig;
+
+    syscall $cat_GFX, $GFXSync
+
+    pop jr;
+    b jr;
+
+; ra, rb -> base gfxHeader Address
+clearGFXLayerConfig:
+    push jr;
+
+    bump $nSizeOf(GFXLayerConfig);
+
+    ; page for our gfxLayerconfig is zero since
+    ; it's on the stack
+    xor re, re;
+    ; sp is pointing at our allocated GFXLayerConfig instance
+    mov rf, sp;
+
+    ; reuse re since it's at zero and we just want to
+    ; clear out our instance anyway
+    mov [(GFXLayerConfig.configHigh)rf], re;
+    mov [(GFXLayerConfig.configLow)rf], re;
+    mov [(GFXLayerConfig.dataHigh)rf], re;
+    mov [(GFXLayerConfig.dataLow)rf], re;
+
+    mov r0, 15;
+    xor r1, r1;
+clearGFX_sLoop:
+    seteq r2, r0, r1;
+    bnt r2, clearGFX_eLoop;
+
+    ; rf and re are already pointing to the instance we
+    ; want to reuse
+    ; ra and rb are already pointing at base address of the
+    ; header (not because it's safe but because we control
+    ; the entire flow and we only come from initGfx we will
+    ; trust it for simplicity)
+    ; now we only need to set rc to the index. We could use rc
+    ; directly for this, but for now we'll just copy to rc
+    mov rc, r0;
+    bn setGFXLayerConfig;
+
+    dec r0;
+    bn clearGFX_sLoop;
+clearGFX_eLoop:
+
+    bump $sizeOf(GFXLayerConfig);
+
+    pop jr;
+    b jr;
+
+; ra, rb -> base gfxHeader Address
+; rc -> index
+; re, rf -> *GFXStruct source
+; this function is showcasing our fancy new
+; lable binding and scope mechanism
+setGFXLayerConfig: @{
+    @bind ReturnAddr : jr;
+    push ReturnAddr;
+
+    @bind HeaderPage : ra;
+    @bind HeaderPtr : rb;
+    @bind LayerIndex : rc;
+    @bind SrcPage : re;
+    @bind SrcPtr : rf;
+
+    @bind LayersPtr : r0;
+
+    push r0;
+    push r1;
+    push r2;
+
+    mov LayersPtr, HeaderPtr;
+
+    // calculate offset of the .layers field
+    CalcLayersPtrFromHeader@{
+        @bind offsetOfLayers : r1;
+
+        mov offsetOfLayers, $offsetOf(GFXHeader, layers);
+        add LayersPtr, offsetOfLayers;
+    }
+
+
+    @bind sizePerObj : r1;
+    mov sizePerObj, $sizeOf(GFXLayerConfig);
+
+    // calculate further offset for the index
+    CalcLayersObjAtLayerIndex@{
+        mov r2, sizePerObj;
+        mul r2, LayerIndex;
+        add LayersPtr, r2;
+    }
+
+
+    ; r0 now points to GFXHeader.layers[rc]
+    ; memcpy (GFXLayerConfig)GFXHeader.layers[rc], (GFXLayerConfig)[re, rf], sizeof(GFXLayerConfig)
+    mcpy HeaderPage, LayersPtr, SrcPage, SrcPtr, sizePerObj;
+
+    pop r2;
+    pop r1;
+    pop r0;
+
+    pop ReturnAddr;
+    b ReturnAddr;
+}

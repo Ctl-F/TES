@@ -2,8 +2,8 @@ const std = @import("std");
 const instructions = @import("instructions.zig");
 const meta = @import("meta.zig");
 
-const OpCode = instructions.InstructionCode;
-const Instruction = instructions.Instruction;
+pub const OpCode = instructions.InstructionCode;
+pub const Instruction = instructions.Instruction;
 const InstructionDst = instructions.InstructionDst;
 const InstructionDstSrc = instructions.InstructionDstSrc;
 const InstructionDstAddrSrc = instructions.InstructionDstAddrSrc;
@@ -108,21 +108,108 @@ comptime {
     if (!(gcl & 1 == 0)) @compileError("Global Counter Register is misaligned for reinterpetation as 32bit");
 }
 
+pub const PoolID = u9;
+pub const EventID = u15;
+pub const EventResult = union(enum) {
+    ok,
+    okWithResult: struct { toRA: ?u16, toRB: ?u16, toRC: ?u16, toRD: ?u16, toRE: ?u16, toRF: ?u16 },
+    fail: struct { panic: bool, code: u8, message: ?[]const u8 },
+};
+
+pub const EventInstruction = packed struct(u32) {
+    opcode: u8,
+    poolID: PoolID,
+    eventID: EventID,
+};
+
+pub const Extension = struct {
+    enabled: bool,
+    handler: *const fn (vm: *TESVM, evCode: EventID) EventResult,
+    crashDump: *const fn (vm: *TESVM) void,
+    getFriendlyName: *const fn () []const u8,
+
+    pub fn trigger(this: *@This(), vm: *TESVM, i: EventInstruction) Interrupt!void {
+        const code = i.eventID;
+        const pool = i.poolID;
+
+        if (!this.enabled) {
+            this.crash(vm, code, null);
+        }
+
+        const result = this.handler(vm, code);
+
+        switch (result) {
+            .ok => {},
+            .okWithResult => |res| {
+                const registers = vm.registers.registers();
+                if (res.toRA) |a| {
+                    registers[@intFromEnum(RegisterID.RA)] = a;
+                }
+                if (res.toRB) |b| {
+                    registers[@intFromEnum(RegisterID.RB)] = b;
+                }
+                if (res.toRC) |c| {
+                    registers[@intFromEnum(RegisterID.RC)] = c;
+                }
+                if (res.toRD) |d| {
+                    registers[@intFromEnum(RegisterID.RD)] = d;
+                }
+                if (res.toRE) |e| {
+                    registers[@intFromEnum(RegisterID.RE)] = e;
+                }
+                if (res.toRF) |f| {
+                    registers[@intFromEnum(RegisterID.RF)] = f;
+                }
+            },
+            .fail => |res| {
+                if (res.panic) {
+                    this.crash(vm, code, res.message);
+                }
+
+                // result error code
+                vm.nonidxRegisters.flags.interruptCode = res.code;
+
+                // called code and pool so that actual error identification can happen
+                vm.registers.registers()[@intFromEnum(RegisterID.RF)] = code;
+                vm.registers.registers()[@intFromEnum(RegisterID.RE)] = pool;
+
+                return Interrupt.ExtensionInterrupt;
+            },
+        }
+    }
+
+    fn crash(this: *@This(), vm: *TESVM, code: EventID, message: ?[]const u8) noreturn {
+        std.debug.print("Extension fired but was not enabled:\n - {s}\n - {}\n\n", .{
+            this.getFriendlyName(),
+            code,
+        });
+        if (message) |msg| {
+            std.debug.print("Message provided: {s}\n", .{msg});
+        }
+        vm.dumpContext();
+        @trap();
+    }
+};
+
 pub const TESVM = struct {
     registers: Registers,
     nonidxRegisters: NonIndexableRegisters = .{},
     mmu: MMU,
     instructionBuffer: []const Instruction,
     allocator: std.mem.Allocator, // realistically should only ever be the page allocator!!!
+    io: std.Io,
+
+    frameHook: *const fn (*@This()) anyerror!void,
 
     registerBackBuffer: Registers = .{},
     nonidxRegisterBackBuffer: NonIndexableRegisters = .{},
     page0BackBuffer: PageBuffer,
+    extensions: std.AutoHashMap(PoolID, Extension),
 
     /// Creates the default VM using the page allocator. I know this breaks zig api
     /// slightly, and I'll provide an actual allocator receiving initializer function also
     /// but the page allocator really is all that's necessary for this.
-    pub fn defaultWithPageAllocator() !@This() {
+    pub fn defaultWithPageAllocator(io: std.Io, hook: *const fn (*@This()) anyerror!void) !@This() {
         const allocator = std.heap.page_allocator;
         var mmu = try MMU.init(allocator);
         errdefer mmu.deinit();
@@ -134,8 +221,11 @@ pub const TESVM = struct {
             .registers = .{},
             .instructionBuffer = &.{Instruction{ .opcode = @intFromEnum(OpCode.hlt), .payload = 0 }},
             .mmu = mmu,
+            .io = io,
+            .frameHook = hook,
             .page0BackBuffer = page0BackBuffer[0..PageSize],
             .allocator = allocator,
+            .extensions = std.AutoHashMap(PoolID, Extension).init(allocator),
         };
     }
 
@@ -144,14 +234,22 @@ pub const TESVM = struct {
         this.allocator.free(@as([]u8, this.page0BackBuffer[0..PageSize]));
     }
 
-    inline fn getPage0(this: *@This()) PageBuffer {
+    pub inline fn getPage0(this: *@This()) PageBuffer {
         if (this.mmu.pages[0].buffer) |buf| {
             return buf;
         }
         unreachable;
     }
 
-    inline fn getPageMMIO(this: *@This()) PageBuffer {
+    pub inline fn getPage(this: *@This(), page: u8) ?PageBuffer {
+        return (this.mmu.pages[page].buffer);
+    }
+
+    pub inline fn getPageEntry(this: *@This(), page: u8) PageEntry {
+        return this.mmu.pages[page];
+    }
+
+    pub inline fn getPageMMIO(this: *@This()) PageBuffer {
         if (this.mmu.pages[MMU.MMIOPage].buffer) |buf| {
             return buf;
         }
@@ -211,6 +309,70 @@ pub const TESVM = struct {
         return (high << 16) | low;
     }
 
+    pub fn runCoProcessor(this: *@This()) !void {
+        try this.runImpl(true);
+    }
+
+    pub fn run(this: *@This()) !void {
+        try this.runImpl(false);
+    }
+
+    fn runImpl(this: *@This(), comptime isCoPro: bool) !void {
+        const ClockSpeed = 1_170_000;
+        const FPS = 30;
+        const CyclesPerFrame = ClockSpeed / FPS;
+        const NsPerCycle = std.time.ns_per_s / ClockSpeed;
+
+        var lastTime = std.Io.Timestamp.now(this.io, .awake);
+        var ns_accum: i96 = 0;
+        var cyclesInFrame: u32 = 0;
+
+        const RFCL = doubleRegIndex(.FCL);
+        const RGCL = doubleRegIndex(.GCL);
+
+        while (!this.nonidxRegisters.flags.halted) {
+            const currentTime = std.Io.Timestamp.now(this.io, .awake);
+            const elapsed = lastTime.durationTo(currentTime);
+            lastTime = currentTime;
+
+            ns_accum += elapsed.nanoseconds;
+
+            if (ns_accum >= NsPerCycle) {
+                const cyclesToRun = @as(u32, @intCast(@divFloor(ns_accum, NsPerCycle)));
+                ns_accum = @rem(ns_accum, NsPerCycle);
+
+                const wideRegs = this.registers.doubleRegisters();
+                const preClock = wideRegs[RGCL];
+
+                this.exec(cyclesToRun, isCoPro) catch |e| {
+                    if (e == error.AbruptProgramEOF) {
+                        std.debug.print("IP {}/{} instructions\n", .{
+                            this.registers.doubleRegisters()[doubleRegIndex(.IP)],
+                            this.instructionBuffer.len,
+                        });
+                    }
+                    return e;
+                };
+
+                const postClock = wideRegs[RGCL];
+                const consumed = postClock -% preClock;
+
+                cyclesInFrame += consumed;
+
+                while (cyclesInFrame >= CyclesPerFrame) {
+                    try this.frameHook(this);
+
+                    cyclesInFrame -= CyclesPerFrame;
+                    wideRegs[RFCL] = cyclesInFrame;
+                }
+            }
+
+            if (ns_accum < NsPerCycle) {
+                try std.Thread.yield();
+            }
+        }
+    }
+
     pub fn exec(this: *@This(), totalCycles: u32, comptime isCoProcessor: bool) !void {
         @setRuntimeSafety(false);
         @setEvalBranchQuota(12000);
@@ -225,6 +387,25 @@ pub const TESVM = struct {
         var instruction = this.instructionBuffer[this.registers.registers()[@intFromEnum(RegisterID.IP)]];
         DISPATCH: switch (@as(OpCode, @enumFromInt(instruction.opcode))) {
             .hlt => {
+                this.nonidxRegisters.flags.halted = true;
+                return;
+            },
+            .resume_skip => {
+                if (comptime !isCoProcessor) {
+                    const code = InterruptToID(Interrupt.InvalidInstruction);
+                    this.fireInterrupt(code);
+                }
+                this.nonidxRegisters.flags.policy = .resume_skip;
+                this.nonidxRegisters.flags.halted = true;
+                return;
+            },
+            .resume_at => {
+                this.nonidxRegisters.flags.policy = .resume_at;
+                this.nonidxRegisters.flags.halted = true;
+                return;
+            },
+            .retry => {
+                this.nonidxRegisters.flags.policy = .resume_retry;
                 this.nonidxRegisters.flags.halted = true;
                 return;
             },
@@ -379,7 +560,7 @@ pub const TESVM = struct {
                 }
 
                 const decoded: InstructionDstSrc = @bitCast(instruction);
-                const address: u32 = @bitCast(this.instructionBuffer[wideRegisters[doubleRegIndex(.IP) + 1]]);
+                const address: u32 = @bitCast(this.instructionBuffer[wideRegisters[doubleRegIndex(.IP)] + 1]);
 
                 wideRegisters[doubleRegIndex(.IP)] += 2;
 
@@ -404,11 +585,12 @@ pub const TESVM = struct {
             },
             inline else => |op| {
                 if (comptime !isCoProcessor) {
-                    if (op == .resume_skip or op == .resume_at or op == .retry or op == .sync_mov or
+                    if (op == .sync_mov or
                         op == .sync_write or op == .sync_hwrite or op == .sync_read or op == .sync_hread)
                     {
                         const code = InterruptToID(Interrupt.InvalidInstruction);
                         this.fireInterrupt(code);
+                        return;
                     }
                 }
 
@@ -421,8 +603,13 @@ pub const TESVM = struct {
 
                 const consumed = InstructionTable[@intFromEnum(op)].cycles;
                 InstructionTable[@intFromEnum(op)].handler(this, instruction) catch |e| {
-                    const code = InterruptToID(e);
+                    const code = if (e == Interrupt.UserInterrupt)
+                        this.nonidxRegisters.flags.interruptCode
+                    else
+                        InterruptToID(e);
+
                     this.fireInterrupt(code);
+                    // I'm not sure if this should continue or not...
                 };
 
                 this.tickClock(consumed);
@@ -444,6 +631,17 @@ pub const TESVM = struct {
     }
 
     fn fireInterrupt(this: *@This(), code: u8) void {
+        if (comptime @import("builtin").mode == .Debug) {
+            const _ip = this.registers.doubleRegisters()[doubleRegIndex(.IP)];
+
+            std.debug.print("Interrupt {} fired at:\n IP: {}/{}\n Op: {}\n", .{
+                code,
+                _ip,
+                this.instructionBuffer.len,
+                @as(OpCode, @enumFromInt(this.instructionBuffer[_ip - this.nonidxRegisterBackBuffer.previousInstructionLength].opcode)),
+            });
+        }
+
         const interruptTable = this.getIVTableSpan();
         const handlerAddress = interruptTable[code];
 
@@ -502,7 +700,14 @@ pub const TESVM = struct {
 
         // TODO: fix cycles handling here and have proper timing
         while (!this.nonidxRegisters.flags.halted) {
-            this.exec(5000, true) catch @panic("Unrecoverable fault happend in co-processor");
+            // this.exec(5000, true) catch {
+            //     this.dumpContext();
+            //     @panic("Unrecoverable fault happend in co-processor");
+            // };
+            this.runCoProcessor() catch {
+                this.dumpContext();
+                @panic("Unrecoverable fault happened in co-processor");
+            };
         }
 
         switch (this.nonidxRegisters.flags.policy) {
@@ -533,7 +738,7 @@ pub const TESVM = struct {
         }
     }
 
-    fn dumpContext(this: *@This()) void {
+    pub fn dumpContext(this: *@This()) void {
         const totalPagesAllocated, const totalMemAllocated = blk: {
             var tpa: usize = 0;
             var tma: usize = 0;
@@ -549,43 +754,58 @@ pub const TESVM = struct {
         };
 
         std.debug.print(
-            \\\MainCore: [{} Pages, {} Bytes]
-            \\\Instruction Count: {}
-            \\\
+            \\MainCore: [{} Pages, {} Bytes]
+            \\Instruction Count: {}
+            \\
         , .{
             totalPagesAllocated,        totalMemAllocated,
             this.instructionBuffer.len,
         });
-        dumpIndexableRegisters(&this.registers);
-        dumpNonIndexableRegisters(&this.nonidxRegisters);
-        std.debug.print("Secondary-Core:\n", .{});
-        dumpIndexableRegisters(&this.registerBackBuffer);
-        dumpNonIndexableRegisters(&this.nonidxRegisterBackBuffer);
+
+        if (this.nonidxRegisters.flags.isCoProcessor) {
+            dumpIndexableRegisters(&this.registerBackBuffer);
+            dumpNonIndexableRegisters(&this.nonidxRegisterBackBuffer);
+            std.debug.print("Secondary-Core:\n", .{});
+            dumpIndexableRegisters(&this.registers);
+            dumpNonIndexableRegisters(&this.nonidxRegisters);
+        } else {
+            dumpIndexableRegisters(&this.registers);
+            dumpNonIndexableRegisters(&this.nonidxRegisters);
+            std.debug.print("Secondary-Core:\n", .{});
+            dumpIndexableRegisters(&this.registerBackBuffer);
+            dumpNonIndexableRegisters(&this.nonidxRegisterBackBuffer);
+        }
+
         dumpMMIOInfo(&this.mmu.pages[MMU.MMIOPage]);
+        this.dumpExtensionContext();
     }
 
     fn dumpIndexableRegisters(regs: *Registers) void {
         const registers = regs.registers();
         std.debug.print(
-            \\\General Registers:\n
-            \\\ R0: {X:0<16} R1: {X:0<16} R2: {X:0<16} R3: {X:0<16}
-            \\\ R4: {X:0<16} R5: {X:0<16} R6: {X:0<16} R7: {X:0<16}
-            \\\ R8: {X:0<16} R9: {X:0<16} RA: {X:0<16} RB: {X:0<16}
-            \\\ RC: {X:0<16} RD: {X:0<16} RE: {X:0<16} RF: {X:0<16}
-            \\\
+            \\General Registers:
+            \\ R0: {X:0>4} R1: {X:0>4} R2: {X:0>4} R3: {X:0>4}
+            \\ R4: {X:0>4} R5: {X:0>4} R6: {X:0>4} R7: {X:0>4}
+            \\ R8: {X:0>4} R9: {X:0>4} RA: {X:0>4} RB: {X:0>4}
+            \\ RC: {X:0>4} RD: {X:0>4} RE: {X:0>4} RF: {X:0>4}
+            \\
+            \\Global Cycles Executed: {}
+            \\Frame Cycles Executed: {}
+            \\
         , .{
-            registers[0],  registers[1],  registers[2],  registers[3],
-            registers[4],  registers[5],  registers[6],  registers[7],
-            registers[8],  registers[9],  registers[10], registers[11],
-            registers[12], registers[13], registers[14], registers[15],
+            registers[0],                                 registers[1],                                 registers[2],  registers[3],
+            registers[4],                                 registers[5],                                 registers[6],  registers[7],
+            registers[8],                                 registers[9],                                 registers[10], registers[11],
+            registers[12],                                registers[13],                                registers[14], registers[15],
+            regs.doubleRegisters()[doubleRegIndex(.GCL)], regs.doubleRegisters()[doubleRegIndex(.FCL)],
         });
 
         const stackUsed = registers[@intFromEnum(RegisterID.SB)] - registers[@intFromEnum(RegisterID.SP)];
         const stackSize = registers[@intFromEnum(RegisterID.SB)] - registers[@intFromEnum(RegisterID.SH)];
         std.debug.print(
-            \\\ Stack ({} / {} bytes)
-            \\\ SH: {X:0<16} SP: {X:0<16} SB: {X:0<16}
-            \\\
+            \\ Stack ({} / {} bytes)
+            \\ SH: {X:0>4} SP: {X:0>4} SB: {X:0>4}
+            \\
         , .{
             stackUsed,
             stackSize,
@@ -597,13 +817,13 @@ pub const TESVM = struct {
 
     fn dumpNonIndexableRegisters(registers: *NonIndexableRegisters) void {
         std.debug.print(
-            \\\ Flags:
-            \\\   Halt: {}
-            \\\   Interrupt-Code: {}
-            \\\   CoProcessor, Policy: {}, {}
-            \\\ IVT: {x:0<16}
-            \\\ Last-Instruction-Size: {}
-            \\\
+            \\ Flags:
+            \\   Halt: {}
+            \\   Interrupt-Code: {}
+            \\   CoProcessor, Policy: {}, {}
+            \\ IVT: {x:0>4}
+            \\ Last-Instruction-Size: {}
+            \\
         , .{
             registers.flags.halted,
             registers.flags.interruptCode,
@@ -616,16 +836,23 @@ pub const TESVM = struct {
 
     fn dumpMMIOInfo(mmioPage: *PageEntry) void {
         std.debug.print(
-            \\\ MMIO-Page: {any}
-            \\\ Permissions[R/W/M]: {}/{}/{}
-            \\\ Further MMInfo not available
-            \\\
+            \\ MMIO-Page: {any}
+            \\ Permissions[R/W/M]: {}/{}/{}
+            \\
         , .{
-            mmioPage.buffer,
+            if (mmioPage.buffer) |buf| @as(?usize, @intFromPtr(buf)) else null,
             mmioPage.permissions.read,
             mmioPage.permissions.write,
             mmioPage.permissions.isMapped,
         });
+    }
+
+    fn dumpExtensionContext(this: *@This()) void {
+        var iter = this.extensions.iterator();
+
+        while (iter.next()) |entry| {
+            entry.value_ptr.crashDump(this);
+        }
     }
 
     fn swapContext(this: *@This()) void {
@@ -677,11 +904,15 @@ pub const MMU = struct {
             .allocator = allocator,
         };
 
-        try this.requestPage(0, null);
+        const page0 = try this.requestPage(0, null);
         errdefer this.freePage(0);
 
-        try this.requestPage(MMIOPage, null);
+        @memset(page0, 0);
+
+        const mmioPage = try this.requestPage(MMIOPage, null);
         errdefer this.freePage(MMIOPage);
+
+        @memset(mmioPage, 0);
 
         return this;
     }
@@ -706,7 +937,7 @@ pub const MMU = struct {
         return try this.allocator.alignedAlloc(u8, PageAlign, PageSize);
     }
 
-    pub fn requestPage(this: *@This(), pageID: u8, permissions: ?PagePermissions) !void {
+    pub fn requestPage(this: *@This(), pageID: u8, permissions: ?PagePermissions) !PageBuffer {
         const perm = if (permissions) |p| p else PagePermissions.ReadWrite;
 
         if (perm.isMapped) {
@@ -723,7 +954,7 @@ pub const MMU = struct {
                 .buffer = pageBuffer[0..PageSize],
             };
 
-            return;
+            return this.pages[pageID].buffer.?;
         }
 
         // reallocate existing page (e.g. change permissions without changing data)
@@ -732,6 +963,7 @@ pub const MMU = struct {
         // manage whether to map or request pages under a given syscall which is why the mmu treats
         // it as unreachable.
         this.pages[pageID].permissions = perm;
+        return this.pages[pageID].buffer.?;
     }
 
     pub fn mapPage(this: *@This(), id: u8, buffer: PageBuffer) !void {
@@ -776,6 +1008,7 @@ const Interrupt = error{
     InvalidInstruction,
     InvalidStackRelocation,
     MisalignedStackRelocation,
+    ExtensionInterrupt,
     UserInterrupt,
 };
 
@@ -790,6 +1023,7 @@ pub fn InterruptToID(e: Interrupt) u8 {
         Interrupt.InvalidInstruction => 6,
         Interrupt.InvalidStackRelocation => 7,
         Interrupt.MisalignedStackRelocation => 8,
+        Interrupt.ExtensionInterrupt => 64,
         // Add System Interrupts Here...
         Interrupt.UserInterrupt => 128,
         // user interrupts will use the InterruptCode in the flags register
@@ -1861,6 +2095,9 @@ const InstructionTable = init: {
     table[@intFromEnum(OpCode.bnf)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
     table[@intFromEnum(OpCode.hlt)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
     table[@intFromEnum(OpCode.lea)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+    table[@intFromEnum(OpCode.resume_at)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+    table[@intFromEnum(OpCode.resume_skip)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+    table[@intFromEnum(OpCode.retry)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
 
     // stack instructions
     table[@intFromEnum(OpCode.bump_c)] = StackFactory(.bump_c);
@@ -1873,14 +2110,229 @@ const InstructionTable = init: {
     table[@intFromEnum(OpCode.pop32)] = StackFactory(.pop32);
     table[@intFromEnum(OpCode.stackset)] = StackFactory(.stackset);
 
-    // TODO: add the rest
+    table[@intFromEnum(OpCode.select)] = InstructionInfo{ .handler = implSelect, .cycles = 1 };
+    table[@intFromEnum(OpCode.int)] = InstructionInfo{ .handler = implInt, .cycles = 1 };
+    table[@intFromEnum(OpCode.syscall)] = InstructionInfo{ .handler = implSyscall, .cycles = 1 };
+    table[@intFromEnum(OpCode.swap)] = InstructionInfo{ .handler = implSwap, .cycles = 1 };
+    table[@intFromEnum(OpCode.trap)] = InstructionInfo{ .handler = implTrap, .cycles = 1 };
+    table[@intFromEnum(OpCode.ivs)] = InstructionInfo{ .handler = implIVS, .cycles = 1 };
+    table[@intFromEnum(OpCode.bittest)] = InstructionInfo{ .handler = implBittest, .cycles = 1 };
+    table[@intFromEnum(OpCode.mcpy)] = InstructionInfo{ .handler = implMcpy, .cycles = 10 };
+    table[@intFromEnum(OpCode.mset)] = InstructionInfo{ .handler = implMset, .cycles = 10 };
+    table[@intFromEnum(OpCode.mmov)] = InstructionInfo{ .handler = implMmov, .cycles = 12 };
+
+    //TODO: implement these later
+    table[@intFromEnum(OpCode.yield_frame)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+    table[@intFromEnum(OpCode.sync_mov)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+    table[@intFromEnum(OpCode.sync_read)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+    table[@intFromEnum(OpCode.sync_hread)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+    table[@intFromEnum(OpCode.sync_write)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+    table[@intFromEnum(OpCode.sync_hwrite)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
 
     // validation
+    var missing: usize = 0;
     for (@typeInfo(OpCode).@"enum".fields) |field| {
         if (table[field.value].handler == InvalidHandler) {
             @compileLog("Instruction " ++ field.name ++ " is missing a handler");
+            missing += 1;
         }
+    }
+    if (missing > 0) {
+        const message = std.fmt.comptimePrint("Missing {}/{} implementations", .{
+            missing,
+            @typeInfo(OpCode).@"enum".fields.len,
+        });
+        @compileLog(message);
     }
 
     break :init table;
 };
+
+// msc codes
+
+pub inline fn implSelect(vm: *TESVM, i: Instruction) Interrupt!void {
+    // select [dst] [srcA] [srcB] [cond]
+    const de: InstructionDstSrc3 = @bitCast(i);
+    const registers = vm.registers.registers();
+
+    registers[de.dst] = if (registers[de.src2] != 0) registers[de.src0] else registers[de.src1];
+}
+
+pub inline fn implInt(vm: *TESVM, i: Instruction) Interrupt!void {
+    // int r
+    const de: InstructionDst = @bitCast(i);
+    const code: u8 = @truncate(vm.registers.registers()[de.dst]);
+    vm.nonidxRegisters.flags.interruptCode = code;
+    return Interrupt.UserInterrupt;
+}
+
+pub inline fn implSyscall(vm: *TESVM, i: Instruction) Interrupt!void {
+    const de: EventInstruction = @bitCast(i);
+
+    const ext = vm.extensions.getPtr(de.poolID);
+
+    if (ext) |e| {
+        try e.trigger(vm, de);
+    }
+}
+
+pub inline fn implSwap(vm: *TESVM, i: Instruction) Interrupt!void {
+    const de: InstructionDstSrc = @bitCast(i);
+    const registers = vm.registers.registers();
+
+    const tmp = registers[de.dst];
+    registers[de.dst] = registers[de.src];
+    registers[de.src] = tmp;
+}
+
+pub inline fn implTrap(vm: *TESVM, _: Instruction) Interrupt!void {
+    vm.dumpContext();
+    @panic("User Trap has fired!");
+}
+
+pub inline fn implIVS(vm: *TESVM, i: Instruction) Interrupt!void {
+    const de: InstructionDst2Src2 = @bitCast(i);
+    const registers = vm.registers.registers();
+
+    const table = vm.getIVTableSpan();
+    const offset: u8 = @truncate(registers[de.src1]);
+    const addr = table[offset];
+
+    registers[de.dst0] = @truncate(addr >> 16);
+    registers[de.dst1] = @truncate(addr);
+}
+
+pub inline fn implBittest(vm: *TESVM, i: Instruction) Interrupt!void {
+    const de: InstructionDstSrc2 = @bitCast(i);
+
+    const registers = vm.registers.registers();
+    const shift: u4 = @truncate(registers[de.src1]);
+    const result = (registers[de.src0] & (@as(u16, 1) << shift)) != 0;
+
+    registers[de.dst] = if (result) 1 else 0;
+}
+
+pub inline fn implMcpy(vm: *TESVM, i: Instruction) Interrupt!void {
+    // mcpy dstPsr, dstPor, srcPsr, srcPor, len (reg u4)
+    const de: InstructionDst2Src2 = @bitCast(i);
+    const registers = vm.registers.registers();
+
+    const dPsr: u8 = @truncate(registers[de.dst0]);
+    const dPor = registers[de.dst1];
+
+    const sPsr: u8 = @truncate(registers[de.src0]);
+    const sPor: u8 = @truncate(registers[de.src1]);
+
+    const len = registers[de.reserved];
+
+    if (len == 0) return;
+
+    const destinationPage = vm.getPageEntry(dPsr);
+    const sourcePage = vm.getPageEntry(sPsr);
+
+    if (destinationPage.buffer == null or !destinationPage.permissions.write) {
+        @branchHint(.unlikely);
+        return Interrupt.PageFault;
+    }
+
+    if (sourcePage.buffer == null or !sourcePage.permissions.read) {
+        @branchHint(.unlikely);
+        return Interrupt.PageFault;
+    }
+
+    if (@as(usize, dPor) + len > PageSize) {
+        @branchHint(.unlikely);
+        return Interrupt.PageFault;
+    }
+
+    if (@as(usize, sPor) + len > PageSize) {
+        @branchHint(.unlikely);
+        return Interrupt.PageFault;
+    }
+
+    const dBuff = destinationPage.buffer.?;
+    const sBuff = sourcePage.buffer.?;
+
+    const dEof = dPor + len;
+    const sEof = sPor + len;
+
+    @memcpy(dBuff[dPor..dEof], sBuff[sPor..sEof]);
+}
+
+pub inline fn implMset(vm: *TESVM, i: Instruction) Interrupt!void {
+    // memset [dPsr], [dpor], dLen, regValue(u8)
+    const de: InstructionDst2Src2 = @bitCast(i);
+    const registers = vm.registers.registers();
+
+    const dPsr: u8 = @truncate(registers[de.dst0]);
+    const dPor = registers[de.dst1];
+
+    const len = registers[de.src0];
+
+    if (len == 0) return;
+
+    const val: u8 = @truncate(registers[de.src1]);
+
+    const destinationPage = vm.getPageEntry(dPsr);
+    if (destinationPage.buffer == null or !destinationPage.permissions.write) {
+        @branchHint(.unlikely);
+        return Interrupt.PageFault;
+    }
+
+    if (@as(usize, dPor) + len > PageSize) {
+        @branchHint(.unlikely);
+        return Interrupt.PageFault;
+    }
+
+    const dBuff = destinationPage.buffer.?;
+    const dEof = dPor + len;
+
+    @memset(dBuff[dPor..dEof], val);
+}
+
+pub inline fn implMmov(vm: *TESVM, i: Instruction) Interrupt!void {
+    // mmov dstPsr, dstPor, srcPsr, srcPor, len (reg u4)
+    const de: InstructionDst2Src2 = @bitCast(i);
+    const registers = vm.registers.registers();
+
+    const dPsr: u8 = @truncate(registers[de.dst0]);
+    const dPor = registers[de.dst1];
+
+    const sPsr: u8 = @truncate(registers[de.src0]);
+    const sPor: u8 = @truncate(registers[de.src1]);
+
+    const len = registers[de.reserved];
+
+    if (len == 0) return;
+
+    const destinationPage = vm.getPageEntry(dPsr);
+    const sourcePage = vm.getPageEntry(sPsr);
+
+    if (destinationPage.buffer == null or !destinationPage.permissions.write) {
+        @branchHint(.unlikely);
+        return Interrupt.PageFault;
+    }
+
+    if (sourcePage.buffer == null or !sourcePage.permissions.read) {
+        @branchHint(.unlikely);
+        return Interrupt.PageFault;
+    }
+
+    if (@as(usize, dPor) + len > PageSize) {
+        @branchHint(.unlikely);
+        return Interrupt.PageFault;
+    }
+
+    if (@as(usize, sPor) + len > PageSize) {
+        @branchHint(.unlikely);
+        return Interrupt.PageFault;
+    }
+
+    const dBuff = destinationPage.buffer.?;
+    const sBuff = sourcePage.buffer.?;
+
+    const dEof = dPor + len;
+    const sEof = sPor + len;
+
+    @memmove(dBuff[dPor..dEof], sBuff[sPor..sEof]);
+}

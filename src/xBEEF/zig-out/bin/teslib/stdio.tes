@@ -1,0 +1,12 @@
+#once
+[Meta]
+
+#define IO_BufferOffset 4096
+#define cat_IO 2
+
+#define IOSync 1
+#define IOPoll 2
+
+struct IOHeader {
+    closeSignal: u8;
+}

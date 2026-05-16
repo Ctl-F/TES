@@ -46,15 +46,15 @@ pub fn build(b: *std.Build) void {
     //b.installArtifact(web_tes);
 
     // 3. native-xBEEF: Native version of xBEEF
-    const native_xBEEF = b.addExecutable(.{
-        .name = "native-xBEEF",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/xBEEF/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    b.installArtifact(native_xBEEF);
+    // const native_xBEEF = b.addExecutable(.{
+    //     .name = "native-xBEEF",
+    //     .root_module = b.createModule(.{
+    //         .root_source_file = b.path("src/xBEEF/main.zig"),
+    //         .target = target,
+    //         .optimize = optimize,
+    //     }),
+    // });
+    // b.installArtifact(native_xBEEF);
 
     // --- Steps ---
 
@@ -68,13 +68,13 @@ pub fn build(b: *std.Build) void {
     run_tes_step.dependOn(&run_tes_cmd.step);
 
     // Run step for native-xBEEF
-    const run_xBEEF_cmd = b.addRunArtifact(native_xBEEF);
-    run_xBEEF_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_xBEEF_cmd.addArgs(args);
-    }
-    const run_xBEEF_step = b.step("run-xBEEF", "Run native-xBEEF");
-    run_xBEEF_step.dependOn(&run_xBEEF_cmd.step);
+    // const run_xBEEF_cmd = b.addRunArtifact(native_xBEEF);
+    // run_xBEEF_cmd.step.dependOn(b.getInstallStep());
+    // if (b.args) |args| {
+    //     run_xBEEF_cmd.addArgs(args);
+    // }
+    // const run_xBEEF_step = b.step("run-xBEEF", "Run native-xBEEF");
+    // run_xBEEF_step.dependOn(&run_xBEEF_cmd.step);
 
     // Serve step for web version (server only)
     const serve_cmd = b.addSystemCommand(&.{ "python3", "-m", "http.server", "8000", "--directory", "zig-out" });
@@ -114,11 +114,11 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_native_tes_tests.step);
 
     // 3. Tests for native-xBEEF
-    const native_xBEEF_tests = b.addTest(.{
-        .root_module = native_xBEEF.root_module,
-    });
-    const run_native_xBEEF_tests = b.addRunArtifact(native_xBEEF_tests);
-    test_step.dependOn(&run_native_xBEEF_tests.step);
+    // const native_xBEEF_tests = b.addTest(.{
+    //     .root_module = native_xBEEF.root_module,
+    // });
+    // const run_native_xBEEF_tests = b.addRunArtifact(native_xBEEF_tests);
+    // test_step.dependOn(&run_native_xBEEF_tests.step);
 
     // 4. Tests for web-tes
     // Since web-tes is wasm32-freestanding, running tests on the host target
@@ -150,7 +150,7 @@ fn buildTES(b: *std.Build, name: []const u8, glad: ?*std.Build.Module, target: s
     });
 
     if (glad) |gm| {
-        exe.root_module.addImport("glad", gm);
+        exe.root_module.addImport("native", gm);
     }
 
     return exe;

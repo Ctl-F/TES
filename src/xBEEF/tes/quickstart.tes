@@ -1,0 +1,262 @@
+// ============================================================================
+// TES Assembly — Quick-Start Guide
+// ============================================================================
+//
+// TES (Terere Execution System) assembly is compiled by the TES Assembler
+// (tas) into Terere Binary Format (.tbf) files.
+//
+// Assemble a file:
+//   tas input.tes -o output.tbf
+//   tas input.tes --debug          // include debug symbols
+//   tas input.tes --dump-symbols   // print symbol table and exit
+//   tas input.tes --dump-tokens    // print token stream and exit
+//   tas -I ./include input.tes     // add an include search directory
+//   tas -D VERSION=2 input.tes     // define a preprocessor macro
+//
+// ============================================================================
+// FILE STRUCTURE
+// ============================================================================
+//
+// A .tes file is made up of optional sections in any order.
+// Every assembled binary must define a label named _start somewhere.
+// The assembler automatically prepends:
+//   [0]  bn _start   // jump to _start
+//   [1]  hlt         // safety halt (never reached in normal execution)
+//
+// Sections:
+//   [Meta]           — struct type definitions
+//   [Data]           — static data declarations
+//   [Data(page:off)] — data on a specific memory page at a byte offset
+//   [Program]        — instructions
+//
+// All section types are optional and may appear multiple times.
+// #include "file.tes" inlines another file's contents at that point.
+
+// ============================================================================
+// COMMENTS
+// ============================================================================
+//
+// Line comments:   // this is a comment
+//                  ; this is also a comment  (traditional assembly style)
+// Block comments:  /* this spans
+//                     multiple lines */
+
+// ============================================================================
+// PREPROCESSOR
+// ============================================================================
+//
+// #include "path/to/file.tes"   // inline another file
+// #define NAME value            // define a text macro
+// #define FLAG                  // define with implicit value 1
+// #ifdef NAME  ... #endif       // conditional assembly
+// #ifndef NAME ... #endif
+// #undef NAME
+
+// ============================================================================
+// [Meta] — STRUCT DEFINITIONS
+// ============================================================================
+
+[Meta]
+struct Point {
+    x: u16;
+    y: u16;
+}
+
+struct Rect {
+    origin: Point;   // nested struct
+    w: u16;
+    h: u16;
+}
+
+// Primitive types:
+//   u8   — 1 byte unsigned
+//   u16  — 2 bytes unsigned
+//   i8   — 1 byte signed
+//   i16  — 2 bytes signed
+//
+// Array fields (in struct definitions):
+//   buf: u8[64]     // 64 bytes
+
+// ============================================================================
+// [Data] — STATIC DATA
+// ============================================================================
+//
+// Syntax:  label: "string"        — bare string
+//          label: .type value     — typed scalar
+//          label: .type[N] value  — array (all elements set to value)
+//
+// Data defaults to page 0, offset 0 and is laid out sequentially.
+// Use [Data(page:offset)] to place data at a specific location.
+
+[Data]
+greeting:   "Hello!\n\0"      // bare string literal (escapes: \n \r \t \\ \0)
+answer:     .u16 42           // typed scalar
+flags:      .u8  0xFF
+neg:        .i16 -100
+char_a:     .u8 'A'           // character literal as initializer
+
+// Array — fill all elements with a single value:
+lut_zeros:  .u8[4] 0
+
+// Data on a specific page and offset:
+[Data(1:0x0100)]
+page1_buf:  .u8[16] 0
+
+// ============================================================================
+// REGISTERS
+// ============================================================================
+//
+// General purpose (16-bit):
+//   r0 – r13
+//
+// Special:
+//   sp   — stack pointer
+//   pc   — program counter (read-only in most contexts)
+//
+// Register names are case-insensitive: R0, r0, and R0 are the same.
+
+// ============================================================================
+// [Program] — INSTRUCTIONS
+// ============================================================================
+
+[Program]
+_start:
+    // ── Data movement ──────────────────────────────────────────────────────
+
+    mov  r0, 42          // r0 = immediate constant (up to 19-bit)
+    mov  r1, r0          // r1 = r0  (register copy)
+    mov  r0, [r2]        // r0 = memory word at address in r2
+    mov  r0, [r2+4]      // r0 = memory word at r2 + byte offset
+    mov  [r2], r0        // memory[r2] = r0
+    mov  (byte) r0, [r2] // load single byte (zero-extended)
+    mov  [r2], (byte) r0 // store low byte
+
+    // Extended (page:offset) memory access — r1=page reg, r2=offset reg:
+    mov  r0, [r1, r2]
+    mov  [r1, r2], r0
+
+    // Load effective address of a data symbol (32-bit address → two regs):
+    lea  r1, r2, greeting   // r1 = page, r2 = offset
+
+    // ── Arithmetic (unsigned) ───────────────────────────────────────────────
+    // DstSrc format: dst and src are both registers; result stored in dst.
+
+    add  r0, r1          // r0 = r0 + r1
+    sub  r0, r1          // r0 = r0 - r1
+    mul  r0, r1          // r0 = r0 * r1  (low word)
+    shr  r0, r1          // r0 = r0 >> r1 (logical)
+    shl  r0, r1          // r0 = r0 << r1
+    neg  r0              // r0 = -r0
+    inc  r0              // r0 = r0 + 1
+    dec  r0              // r0 = r0 - 1
+
+    // div produces quotient and remainder into two destination registers:
+    div  r0, r1, r2, r3  // r0=r2/r3, r1=r2%r3  (unsigned)
+
+    // Signed variants:
+    iadd r0, r1          // r0 = r0 + r1  (signed)
+    isub r0, r1
+    imul r0, r1
+    idiv r0, r1, r2, r3  // r0=r2/r3, r1=r2%r3  (signed)
+
+    // ── Bitwise ────────────────────────────────────────────────────────────
+
+    bin_and  r0, r1      // r0 = r0 & r1
+    bin_or   r0, r1      // r0 = r0 | r1
+    bin_xor  r0, r1      // r0 = r0 ^ r1
+    bin_not  r0          // r0 = ~r0
+    log_and  r0, r1      // r0 = r0 && r1  (logical)
+    log_or   r0, r1      // r0 = r0 || r1
+    log_not  r0          // r0 = !r0
+
+    // ── Comparison (result is 0 or 1) ──────────────────────────────────────
+    // DstSrc2 format: three registers — dst, lhs, rhs.
+
+    seteq   r0, r1, r2   // r0 = (r1 == r2)
+    setneq  r0, r1, r2   // r0 = (r1 != r2)
+    setlt   r0, r1, r2   // r0 = (r1 <  r2)  unsigned
+    setle   r0, r1, r2   // r0 = (r1 <= r2)  unsigned
+    setgt   r0, r1, r2   // r0 = (r1 >  r2)  unsigned
+    setge   r0, r1, r2   // r0 = (r1 >= r2)  unsigned
+
+    // Signed comparisons:
+    isetlt  r0, r1, r2
+    isetle  r0, r1, r2
+    isetgt  r0, r1, r2
+    isetge  r0, r1, r2
+
+    // ── Branching ──────────────────────────────────────────────────────────
+
+    // Near branches (±8191 instructions from branch site):
+    bn   some_label      // unconditional near branch
+    bnt  r0, some_label  // branch if r0 is non-zero (true)
+    bnf  r0, some_label  // branch if r0 is zero (false)
+
+    // Register-indirect branches (32-bit address in two regs):
+    b    r1, r2          // jump to address (r1=page, r2=offset)
+    bt   r1, r2, r0      // jump if r0 non-zero
+    bf   r1, r2, r0      // jump if r0 zero
+
+    // ── Stack ──────────────────────────────────────────────────────────────
+
+    push r0              // push 16-bit value  (push16)
+    pop  r0              // pop  16-bit value  (pop16)
+    push (byte)  r0      // push 8-bit value   (push8)
+    pop  (byte)  r0      // pop  8-bit value   (pop8)
+    push (dword) r0      // push 32-bit value  (push32)
+    pop  (dword) r0      // pop  32-bit value  (pop32)
+
+    // ── Miscellaneous ──────────────────────────────────────────────────────
+
+    nop                  // no operation
+    swap r0, r1          // swap r0 and r1
+    abs  r0              // r0 = |r0|  (signed absolute value)
+    min  r0, r1          // r0 = min(r0, r1)
+    max  r0, r1          // r0 = max(r0, r1)
+
+    // ── System ─────────────────────────────────────────────────────────────
+
+    syscall 0, 0         // syscall pool=0, event=0
+    int  r0              // software interrupt with code in r0
+    hlt                  // halt execution
+
+    // ── Labels ─────────────────────────────────────────────────────────────
+    //
+    // Labels mark an instruction address and are case-sensitive.
+    // They can appear anywhere inside a [Program] section.
+
+some_label:
+    hlt
+
+// ============================================================================
+// ADDRESSING DATA SYMBOLS
+// ============================================================================
+//
+// Data symbols have a 32-bit address (page:offset).
+// Use lea to load the address into a register pair, then access via [r1, r2]:
+//
+//   lea  r1, r2, my_data     // r1 = page, r2 = offset
+//   mov  r0, [r1, r2]        // load word from my_data
+//   mov  [r1, r2], r0        // store word to my_data
+//
+// Struct field access uses dot notation in address expressions:
+//   lea  r1, r2, my_rect.w   // address of field 'w' inside my_rect
+
+// ============================================================================
+// MINIMAL PROGRAM TEMPLATE
+// ============================================================================
+//
+// Every program needs at least one [Program] section with a _start label.
+// The assembler will error if _start is missing.
+
+// [Program]
+// _start:
+//     // ... your code here ...
+//     hlt
+
+// ============================================================================
+// COMPLETE EXAMPLE — hello world
+// ============================================================================
+//
+// See hello.tes for a working example that prints "Hello, World!" using
+// a write syscall (pool=0, event=0).

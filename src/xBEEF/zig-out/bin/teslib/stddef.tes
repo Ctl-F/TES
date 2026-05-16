@@ -1,0 +1,17 @@
+#once
+[Meta]
+
+
+; WRITE EXAMPLE
+; [Data]
+; Message: "Hello World";
+; Message_End:
+; ; Load Address R0, R1
+; lea R0, R1, Message;
+;
+; ; Calculate length of message (R2)
+; mov R2, Message_End;
+; sub R2, R1;
+; syscall cat_Sys, SerialWrite;
+#define cat_Sys 0
+#define SerialWrite 0
