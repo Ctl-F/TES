@@ -1,0 +1,511 @@
+[Indexable Registers (IXR)]
+
+General Purpose Registers (GPR):
+R0..RF (16bit, ID 0..15)
+
+Special Purpose Registers (SPR):
+IP: Instruction Pointer, 32bit, index 16 (and 17 = IPH)
+JR: Jump (link) Register, 32bit, index 18 (and 19 = JRH)
+FCL: Frame Counter Low (cycles in frame), index 20
+FCH: Frame Counter High (cycles in frame), index 21
+GCL: Global Counter Low (Cycles since startup), index 22
+GCH: Global Counter High (Cycles since startup), index 23
+
+SH: Stack Head (lower address of stack - stack grows down, stack must live on page 0), index 24
+SB: Stack Base (upper address of stack), index 25
+SP: Stack Pointer, index 26
+
+RegisterID 27..31 -- reserved
+
+
+[Non Indexable Registers (NXR)]
+Non General Purpose Registers:
+Flags: (u16)
+    halted: u1
+    coProcessor: u1
+    CoProcessorPolicy: u2,
+    Reserved: u4,
+    interruptCode: u8,
+IVT: (u32) Interrupt vector table base (grows up)
+PIL: (u8) Length in 32bit words of the previous instruction
+
+
+==============================================================================
+Address Modes
+==============================================================================
+
+Simple (page 0):
+    [IXR]                   address on page 0, offset stored in IXR
+    [IXR + i9]              with signed byte offset (-256..255)
+    [IXR - i9]
+
+Extended (any page):
+    [page_reg, off_reg]     address on page[page_reg], offset in off_reg
+    [page_reg, off_reg + i9]
+
+Struct field offsets (resolved at assembly time, embedded as the i9 offset):
+    [(StructName.field) IXR]            page-0 access at field offset
+    [(StructName.field) IXR + extra]    with additional byte offset
+    [(StructName.field[N]) IXR]         array element N of field
+    [page_reg, (StructName.field) IXR]  extended access at field offset
+
+All instructions follow (dst, src) operand order.
+
+
+==============================================================================
+Instructions
+==============================================================================
+
+Notation:
+    IXR         any indexable register
+    IMM16       16-bit immediate (stored in lower 16 bits of the 19-bit payload field)
+    [mem]       simple memory address (page 0)
+    [page,mem]  extended memory address
+    i14         signed 14-bit branch offset in instructions (-8192..8191)
+
+0x00  nop
+0x01  mov  IXR, IXR                  register copy
+0x02  mov  IXR, IMM16                load immediate (16-bit; upper 3 payload bits unused)
+0x03  mov  [IXR], IXR                store word (page 0)
+0x04  mov  IXR, [IXR]                load word (page 0)
+0x05  mov  [IXR, IXR], IXR           store word (extended address)
+0x06  mov  IXR, [IXR, IXR]           load word (extended address)
+0x07  mov  (byte)[IXR], IXR          store byte (page 0)
+0x08  mov  IXR, (byte)[IXR]          load byte (page 0, zero-extended)
+0x09  mov  (byte)[IXR, IXR], IXR     store byte (extended address)
+0x0A  mov  IXR, (byte)[IXR, IXR]     load byte (extended address, zero-extended)
+
+  Note: (byte) qualifier may appear on either side of the comma in a mov.
+        Without it, word (16-bit) access is used.
+        Immediate operands are sign-extended from 16 bits; the register holds
+        the lower 16 bits of the IMM19 payload field.
+
+0x0B  add   IXR, IXR                 dst += src
+0x0C  sub   IXR, IXR                 dst -= src
+0x0D  mul   IXR, IXR                 dst *= src (low 16 bits)
+0x0E  div   IXR, IXR, IXR, IXR      dst0=src0/src1, dst1=src0%src1 (unsigned)
+0x0F  shr   IXR, IXR                 dst >>= src (logical)
+0x10  shl   IXR, IXR                 dst <<= src
+0x11  and   IXR, IXR                 dst &= src
+0x12  or    IXR, IXR                 dst |= src
+0x13  xor   IXR, IXR                 dst ^= src
+0x14  not   IXR                      dst = ~dst
+0x15  land  IXR, IXR                 dst = dst && src (logical, result 0 or 1)
+0x16  lor   IXR, IXR                 dst = dst || src
+0x17  lnot  IXR                      dst = !dst
+0x18  neg   IXR                      dst = -dst
+
+-- 2-channel unsigned 8-bit vector ops (each reg holds two 8-bit lanes) --
+
+0x19  vadd2  IXR, IXR
+0x1A  vsub2  IXR, IXR
+0x1B  vmul2  IXR, IXR
+0x1C  vshr2  IXR, IXR
+0x1D  vshl2  IXR, IXR
+0x1E  vand2  IXR, IXR
+0x1F  vor2   IXR, IXR
+0x20  vxor2  IXR, IXR
+0x21  vnot2  IXR
+0x22  vneg2  IXR
+
+-- Scalar comparisons (result is 0 or 1) --
+
+0x23  inc    IXR                      dst++
+0x24  dec    IXR                      dst--
+0x25  seteq  IXR, IXR, IXR            dst = (src0 == src1)
+0x26  setneq IXR, IXR, IXR            dst = (src0 != src1)
+0x27  setlt  IXR, IXR, IXR            dst = (src0 <  src1) unsigned
+0x28  setle  IXR, IXR, IXR            dst = (src0 <= src1) unsigned
+0x29  setgt  IXR, IXR, IXR            dst = (src0 >  src1) unsigned
+0x2A  setge  IXR, IXR, IXR            dst = (src0 >= src1) unsigned
+
+-- Branching --
+
+0x2B  b    IXR, IXR                   jump to address in register pair (hi, lo)
+       b   jr                         shorthand: jump to address in JR/JRH
+0x2C  bt   IXR, IXR, IXR              branch to (hi,lo) if cond != 0
+       bt  jr, IXR                    shorthand using JR/JRH
+0x2D  bf   IXR, IXR, IXR              branch to (hi,lo) if cond == 0
+       bf  jr, IXR                    shorthand using JR/JRH
+
+-- Stack --
+
+0x2E  push8   IXR                     push 8-bit value  (assembler: push (byte) IXR)
+0x2F  push16  IXR                     push 16-bit value (assembler: push IXR)
+0x30  pop8    IXR                     pop 8-bit value   (assembler: pop (byte) IXR)
+0x31  pop16   IXR                     pop 16-bit value  (assembler: pop IXR)
+0x32  bump_r  IXR                     SP -= IXR         (assembler: bump IXR)
+0x33  bump_c  IMM19                   SP -= imm         (assembler: bump imm)
+
+  Note: bump allocates space on the stack (stack grows down).
+        $nSizeOf(T) returns -size, convenient as: bump $nSizeOf(MyStruct)
+
+-- Extended memory with auto-increment / auto-decrement --
+   Assembled via the movi / movd pseudo-instructions (same dispatch logic as mov).
+   The offset register (off_reg) is modified after each access.
+
+0x34  mov_aevi  [page_reg, off_reg], IXR    store word, then off_reg++ (movi)
+0x35  mov_raei  IXR, [page_reg, off_reg]    load word,  then off_reg++ (movi)
+0x36  mov_haevi [page_reg, off_reg], IXR    store byte, then off_reg++ (movi)
+0x37  mov_hraei IXR, [page_reg, off_reg]    load byte,  then off_reg++ (movi)
+0x38  mov_aevd  [page_reg, off_reg], IXR    store word, then off_reg-- (movd)
+0x39  mov_raed  IXR, [page_reg, off_reg]    load word,  then off_reg-- (movd)
+0x3A  mov_haevd [page_reg, off_reg], IXR    store byte, then off_reg-- (movd)
+0x3B  mov_hraed IXR, [page_reg, off_reg]    load byte,  then off_reg-- (movd)
+
+-- Miscellaneous arithmetic --
+
+0x3C  fma       IXR, IXR, IXR       dst = (dst * src0) + src1
+0x3D  stackset  IXR, IXR            set stack: SB=base, SH=base-len
+                                    Stack must be empty (SP==SB). Base must be
+                                    4-byte aligned. Minimum len is 256 bytes.
+0x3E  int       IXR                 software interrupt, code from register
+0x3F  syscall   IMM9, IMM15         system call: pool (9-bit), event (15-bit)
+0x40  hlt                           halt execution
+
+-- Coprocessor channel --
+
+0x41  yield                         yield execution to coprocessor
+0x42  resume                        resume from yield, skip next instruction
+                                    (assembler: resume)
+0x43  resume_at  IXR, IXR           resume at address in register pair (hi, lo)
+                                    (assembler: resume [hi, lo])
+0x44  retry                         retry current instruction
+0x45  sync_mov   IXR, IXR           coprocessor register copy     [NOT YET IMPLEMENTED]
+0x46  sync_write [page_reg,off_reg], IXR   synchronous word write  [NOT YET IMPLEMENTED]
+0x47  sync_hwrite [page_reg,off_reg], IXR  synchronous byte write  [NOT YET IMPLEMENTED]
+0x48  sync_read  IXR, [page_reg,off_reg]   synchronous word read   [NOT YET IMPLEMENTED]
+0x49  sync_hread IXR, [page_reg,off_reg]   synchronous byte read   [NOT YET IMPLEMENTED]
+
+-- Type conversion / bit ops --
+
+0x4A  extz    IXR                   zero upper byte: dst &= 0x00FF
+0x4B  exts    IXR                   sign-extend lower 8 bits to i16
+0x4C  truncz  IXR                   truncate to u8: dst = u8(dst) (zero upper byte)
+0x4D  clamp   IXR                   saturate to [0, 255]: dst = min(dst, 255)
+0x4E  swap    IXR, IXR              swap two registers
+0x4F  bittest IXR, IXR, IXR         dst = (src0 >> src1) & 1
+
+-- 2-channel unsigned 8-bit vector comparisons (result lanes are 0 or 0xFF) --
+
+0x50  vseteq2  IXR, IXR
+0x51  vsetneq2 IXR, IXR
+0x52  vsetlt2  IXR, IXR
+0x53  vsetle2  IXR, IXR
+0x54  vsetgt2  IXR, IXR
+0x55  vsetge2  IXR, IXR
+
+-- 2-channel vector advanced --
+
+0x56  vreduce2  IXR, IXR, op        reduce two 8-bit lanes: dst = lane0 op lane1
+                                    ops: add sub mul and or bitand bitor bitxor max min
+0x57  vsplat2   IXR                 splat low 8 bits of dst into both lanes
+0x58  vldc2     IXR                 load two separate 8-bit constants into lanes
+                                    (high byte = lane1, low byte = lane0)
+0x59  trap                          unreachable trap; halts with fault if executed
+                                    (use in logically-dead code paths for security)
+
+-- Signed integer arithmetic --
+
+0x5A  iadd   IXR, IXR               dst += src  (signed)
+0x5B  isub   IXR, IXR               dst -= src  (signed)
+0x5C  imul   IXR, IXR               dst *= src  (signed, low 16 bits)
+0x5D  idiv   IXR, IXR, IXR, IXR    dst0=src0/src1, dst1=src0%src1 (signed)
+0x5E  isetlt IXR, IXR, IXR          dst = (src0 <  src1) signed
+0x5F  isetle IXR, IXR, IXR          dst = (src0 <= src1) signed
+0x60  isetgt IXR, IXR, IXR          dst = (src0 >  src1) signed
+0x61  isetge IXR, IXR, IXR          dst = (src0 >= src1) signed
+
+-- 2-channel signed 8-bit vector arithmetic --
+
+0x62  viadd2   IXR, IXR
+0x63  visub2   IXR, IXR
+0x64  vimul2   IXR, IXR
+0x65  visetlt2 IXR, IXR
+0x66  visetle2 IXR, IXR
+0x67  visetgt2 IXR, IXR
+0x68  visetge2 IXR, IXR
+
+-- Memory bulk operations --
+
+0x69  mcpy  IXR, IXR, IXR, IXR, IXR   copy len words: mcpy dst_pg,dst_off, src_pg,src_off, len_reg
+                                        len_reg must be R0-RF
+0x6A  mset  IXR, IXR, IXR, IXR        fill: mset dst_pg, dst_off, len, val
+                                        writes len bytes of val&0xFF to page[dst_pg][dst_off..]
+0x6B  mmov  IXR, IXR, IXR, IXR, IXR   move (handles overlap): mmov dst_pg,dst_off, src_pg,src_off, len_reg
+
+-- Selection / vector --
+
+0x6C  select   IXR, IXR, IXR, IXR     dst = cond ? true_src : false_src
+                                        syntax: select dst, true_src, false_src, cond
+0x6D  vselect2 IXR, IXR, IXR, IXR     per-lane vector select (mask is 4th operand)
+0x6E  vswap2   IXR                     swap the two 8-bit lanes in dst
+
+0x6F  sar   IXR, IXR                   arithmetic right shift (signed): dst = i16(dst) >> (src & 0xF)
+0x70  vsar2 IXR, IXR                   vector signed arithmetic right shift per lane
+
+-- Scalar min/max / abs / sign --
+
+0x71  abs    IXR                        dst = |dst|
+0x72  sign   IXR                        dst = sign(dst)  (-1, 0, or 1)
+0x73  min    IXR, IXR                   dst = min(dst, src)
+0x74  max    IXR, IXR                   dst = max(dst, src)
+0x75  vabs2  IXR                        vector absolute value
+0x76  vsign2 IXR                        vector sign
+0x77  vmin2  IXR, IXR                   vector minimum per lane
+0x78  vmax2  IXR, IXR                   vector maximum per lane
+
+-- Rotation --
+
+0x79  rol   IXR, IXR                    rotate left
+0x7A  ror   IXR, IXR                    rotate right
+0x7B  vrol2 IXR, IXR                    vector rotate left
+0x7C  vror2 IXR, IXR                    vector rotate right
+
+-- Load effective address / near branches / extended stack / misc --
+
+0x7D  lea   IXR, IXR, addr32            load 32-bit address into register pair (hi, lo)
+                                         2-word instruction; addr may be label or symbol
+0x7E  bn    label                        unconditional near branch (i14 PC-relative)
+0x7F  bnt   IXR, label                   near branch if IXR != 0
+0x80  bnf   IXR, label                   near branch if IXR == 0
+0x81  push32  IXR                        push 32-bit value (assembler: push (dword) IXR)
+0x82  pop32   IXR                        pop 32-bit value  (assembler: pop  (dword) IXR)
+0x83  ivs     IXR, IXR, IXR, IXR        read IVT: ivs dst_hi, dst_lo, ignored, index
+                                        loads interrupt vector table entry[index&0xFF]
+                                        into dst_hi:dst_lo (page:offset)
+
+
+==============================================================================
+Instruction Encoding Formats
+==============================================================================
+
+All instructions are 32-bit words (little-endian). Bits[7:0] = opcode.
+
+  Bare:         opcode[8] | payload[24]
+  Dst:          opcode[8] | dst[5]  | payload[19]
+  DstSrc:       opcode[8] | dst[5]  | src[5]   | payload[14]
+  DstAddrSrc:   opcode[8] | dPOR[5] | src[5]   | offset_i9[9] | reserved[5]
+  DstAddrXSrc:  opcode[8] | dPSR[5] | dPOR[5]  | src[5]       | offset_i9[9]
+  DstSrcAddr:   opcode[8] | dst[5]  | sPOR[5]  | offset_i9[9] | reserved[5]
+  DstSrcAddrX:  opcode[8] | dst[5]  | sPSR[5]  | sPOR[5]      | offset_i9[9]
+  Dst2Src2:     opcode[8] | dst0[5] | dst1[5]  | src0[5]      | src1[5] | reserved[4]
+  Dst2Src2Len:  opcode[8] | dst0[5] | dst1[5]  | src0[5]      | src1[5] | len_reg[4]
+  DstSrc2:      opcode[8] | dst[5]  | src0[5]  | src1[5]      | reserved[9]
+  DstSrc3:      opcode[8] | dst[5]  | src0[5]  | src1[5]      | src2[5] | reserved[4]
+  LeaWide:      word0: opcode[8] | hi[5] | lo[5] | 0[14]
+                word1: address[32]
+  BranchReg:    opcode[8] | hi[5]  | lo[5]   | 0[14]
+  BranchRegCond:opcode[8] | hi[5]  | lo[5]   | cond[5] | 0[9]
+  BranchNear:   opcode[8] | offset_i14[14] | 0[10]
+  BranchNearCond:opcode[8]| cond[5] | offset_i14[14] | 0[5]
+  Syscall:      opcode[8] | pool[9] | event[15]
+  ResumeReg:    opcode[8] | hi[5]  | lo[5]   | 0[14]
+  VReduce:      opcode[8] | dst[5] | src[5]  | reduce_code[4] | 0[10]
+
+dPSR = destination page-selector register
+dPOR = destination page-offset register
+sPSR = source page-selector register
+sPOR = source page-offset register
+
+
+==============================================================================
+Assembly Syntax
+==============================================================================
+
+----------------------------------------------------------------------
+File Structure
+----------------------------------------------------------------------
+
+A .tes file is assembled by 'tas' into a .tbf binary.
+Every binary must define a _start label. The assembler automatically
+prepends:
+    [0]  bn _start
+    [1]  hlt
+
+Sections (may appear multiple times, in any order):
+    [Meta]              struct type definitions
+    [Data]              static data on page 0, offset 0, laid out sequentially
+    [Data(page:offset)] static data on a specific page at a byte offset
+    [Program]           instructions
+
+----------------------------------------------------------------------
+Comments
+----------------------------------------------------------------------
+
+    // line comment
+    ;  line comment (traditional assembly style)
+    /* block comment */
+
+----------------------------------------------------------------------
+Preprocessor
+----------------------------------------------------------------------
+
+    #include "path/to/file.tes"     inline another file
+    #once                           include this file at most once
+    #define NAME value              text macro
+    #define FLAG                    macro with implicit value 1
+    #ifdef NAME  ... #endif         conditional assembly
+    #ifndef NAME ... #endif
+    #undef NAME
+    -D NAME=value                   define macro from command line
+
+Macros may be used anywhere with $NAME.
+Expression macros:  ${NAME * 4}  (evaluates at parse time)
+
+----------------------------------------------------------------------
+[Meta] — Struct Definitions
+----------------------------------------------------------------------
+
+    struct StructName {
+        field0: u8;
+        field1: u16;
+        arr:    u8[4];      // array field
+        nested: OtherStruct;
+    }
+
+Primitive types:  u8  u16  i8  i16
+Array fields are declared with [N] after the type.
+Structs may be nested. Total size is sum of all field sizes (no padding).
+
+----------------------------------------------------------------------
+[Data] — Static Data
+----------------------------------------------------------------------
+
+    label: "string\n\0"             bare string (supports \n \r \t \\ \0)
+    label: .type value              typed scalar
+    label: .type[N] value           array, all N elements set to value
+    label: .type[N] .{v0, v1, ...}  array with explicit per-element values
+    label: .StructName .{f0, f1, …} struct literal
+    label:                          zero-size label (address marker)
+
+    [Data(page:offset)]  places subsequent symbols at the given page/offset.
+    The page cursor uses the maximum of the current position and the given
+    offset, so sections within the same page should be declared in
+    ascending offset order.
+
+----------------------------------------------------------------------
+[Program] — Instructions and Labels
+----------------------------------------------------------------------
+
+Labels:
+    name:        declares a label at the current instruction index
+                 Labels are case-sensitive.
+                 _start is required.
+
+Pseudo-instruction: mov
+    The assembler selects the correct opcode based on operands:
+        mov  dst, src              register copy           (0x01)
+        mov  dst, imm              load immediate          (0x02)
+        mov  dst, [base]           load word, page 0       (0x04)
+        mov  dst, [base + i9]      with static offset
+        mov  [base], src           store word, page 0      (0x03)
+        mov  dst, [page, off]      load word, extended     (0x06)
+        mov  [page, off], src      store word, extended    (0x05)
+        mov  (byte) dst, [...]     load byte               (0x08 / 0x0A)
+        mov  [...], (byte) src     store byte              (0x07 / 0x09)
+    (byte) may appear on either side.
+    Addressing operators are described in the Address Modes section above.
+
+Pseudo-instruction: push / pop
+    push IXR            push 16-bit  (push16 / 0x2F)
+    pop  IXR            pop  16-bit  (pop16  / 0x31)
+    push (byte)  IXR    push  8-bit  (push8  / 0x2E)
+    pop  (byte)  IXR    pop   8-bit  (pop8   / 0x30)
+    push (dword) IXR    push 32-bit  (push32 / 0x81)
+    pop  (dword) IXR    pop  32-bit  (pop32  / 0x82)
+
+Pseudo-instruction: movi / movd
+    Same dispatch logic as mov, but post-modifies the offset register.
+    Only extended ([page, off]) addressing is valid.
+        movi [page, off], src      store word, off++ after  (mov_aevi / 0x34)
+        movi dst, [page, off]      load  word, off++ after  (mov_raei / 0x35)
+        movi (byte)[page, off], src  store byte, off++      (mov_haevi / 0x36)
+        movi dst, (byte)[page, off]  load  byte, off++      (mov_hraei / 0x37)
+        movd [page, off], src      store word, off-- after  (mov_aevd / 0x38)
+        movd dst, [page, off]      load  word, off-- after  (mov_raed / 0x39)
+        movd (byte)[page, off], src  store byte, off--      (mov_haevd / 0x3A)
+        movd dst, (byte)[page, off]  load  byte, off--      (mov_hraed / 0x3B)
+
+Pseudo-instruction: bump
+    bump IXR            SP -= IXR   (bump_r / 0x32)
+    bump imm            SP -= imm   (bump_c / 0x33)
+    Positive value allocates space (stack grows down).
+    Use $nSizeOf(T) to allocate space for a struct: bump $nSizeOf(MyStruct)
+
+Pseudo-instruction: resume
+    resume              resume_skip (0x42) — resume and skip next instruction
+    resume [hi, lo]     resume_at   (0x43) — resume at address in register pair
+
+Branch shorthand for JR:
+    b  jr               equivalent to b  JRH, JR
+    bt jr, cond         equivalent to bt JRH, JR, cond
+    bf jr, cond         equivalent to bf JRH, JR, cond
+
+----------------------------------------------------------------------
+Register Aliases (@bind scopes)
+----------------------------------------------------------------------
+
+Inside a [Program] section, registers can be given local names within
+a scope block. Scopes can be named (informative) or anonymous.
+
+    ; Named scope
+    FunctionName@{
+        @bind AliasName : register
+        ; instructions using AliasName as if it were a register
+    }
+
+    ; Anonymous scope
+    @{
+        @bind Ptr : rb
+        @bind Len : rc
+        mov Ptr, someData
+    }
+
+Aliases are scoped: they shadow outer aliases and are released when
+the } is reached. A register name cannot be used as an alias name
+without a warning (it would shadow the real register).
+
+----------------------------------------------------------------------
+Built-in Constant Expressions  ($name)
+----------------------------------------------------------------------
+
+Used anywhere a constant is expected.
+
+    $sizeOf(T)                  size in bytes of type T
+    $nSizeOf(T)                 negative size — useful for bump/stack alloc
+    $sizeOfAligned(T, align)    size rounded up to alignment boundary
+    $nSizeOfAligned(T, align)   negative aligned size
+    $offsetOf(StructName, field)          byte offset of field in struct
+    $offsetOf(StructName, field[N])       byte offset of Nth element in array field
+    $offsetOf(StructName, nested.field)   nested struct field offset
+
+T may be a primitive type (u8, u16, i8, i16), a struct name, or a
+data symbol name.
+
+Preprocessor macros:
+    $NAME                   expands text macro NAME
+    ${expr}                 evaluates integer expression (supports *, /, +, -)
+
+----------------------------------------------------------------------
+vreduce2 Operation Codes
+----------------------------------------------------------------------
+
+    vreduce2 dst, src, op
+
+    add     0    sub     1    mul     2
+    and     3    or      4
+    bitand  5    bitor   6    bitxor  7
+    max     8    min     9
+
+----------------------------------------------------------------------
+Assembler Command Line
+----------------------------------------------------------------------
+
+    tas input.tes                   assemble to input.tbf
+    tas input.tes -o output.tbf     specify output file
+    tas input.tes --debug           include debug symbols
+    tas input.tes --dump-symbols    print symbol table and exit
+    tas input.tes --dump-tokens     print token stream and exit
+    tas -I ./include input.tes      add include search directory
+    tas -D NAME=value input.tes     define preprocessor macro

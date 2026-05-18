@@ -486,10 +486,19 @@ fn emitInstruction(
             const por = r.reg(word, 13);
             const src = r.reg(word, 18);
             const off = r.off9(word, 23);
+            const mn: []const u8 = switch (info.opcode) {
+                0x34, 0x36 => "movi",
+                0x38, 0x3A => "movd",
+                else => info.mnemonic,
+            };
+            const bq: []const u8 = switch (info.opcode) {
+                0x36, 0x3A => "(byte) ",
+                else => "",
+            };
             if (off == 0) {
-                try w.print("{s} [{s}, {s}], {s}", .{ info.mnemonic, regName(psr), regName(por), regName(src) });
+                try w.print("{s} {s}[{s}, {s}], {s}", .{ mn, bq, regName(psr), regName(por), regName(src) });
             } else {
-                try w.print("{s} [{s}, {s}{s}{d}], {s}", .{ info.mnemonic, regName(psr), regName(por), if (off > 0) "+" else "", off, regName(src) });
+                try w.print("{s} {s}[{s}, {s}{s}{d}], {s}", .{ mn, bq, regName(psr), regName(por), if (off > 0) "+" else "", off, regName(src) });
             }
         },
 
@@ -509,10 +518,19 @@ fn emitInstruction(
             const psr = r.reg(word, 13);
             const por = r.reg(word, 18);
             const off = r.off9(word, 23);
+            const mn: []const u8 = switch (info.opcode) {
+                0x35, 0x37 => "movi",
+                0x39, 0x3B => "movd",
+                else => info.mnemonic,
+            };
+            const bq: []const u8 = switch (info.opcode) {
+                0x37, 0x3B => "(byte) ",
+                else => "",
+            };
             if (off == 0) {
-                try w.print("{s} {s}, [{s}, {s}]", .{ info.mnemonic, regName(dst), regName(psr), regName(por) });
+                try w.print("{s} {s}, {s}[{s}, {s}]", .{ mn, regName(dst), bq, regName(psr), regName(por) });
             } else {
-                try w.print("{s} {s}, [{s}, {s}{s}{d}]", .{ info.mnemonic, regName(dst), regName(psr), regName(por), if (off > 0) "+" else "", off });
+                try w.print("{s} {s}, {s}[{s}, {s}{s}{d}]", .{ mn, regName(dst), bq, regName(psr), regName(por), if (off > 0) "+" else "", off });
             }
         },
 

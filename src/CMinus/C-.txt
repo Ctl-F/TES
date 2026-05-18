@@ -1,0 +1,163 @@
+Purpose: A Stripped down C Dilect specifically for use with TES
+
+C- will compile directly to tes assembly language. It will not have libc
+and will be a minimal subset of c. With different syntax sprinkled in
+
+Basic types:
+u8, u16, i8, i16,
+u8_vec2, i8_vec2,
+void
+
+Arrays:
+[SIZE]type
+
+
+Structs -- follow c abi alignment,
+
+struct [NAME] {
+    field: [type];
+    ...
+};
+
+
+Unions -- follow c rules, are what you would expect
+
+union [NAME] {
+    field: [type];
+    ...
+}
+
+functions:
+
+fn NAME(PARAM: type...) type {
+    // ...
+}
+
+inline fn --> a function that is ALWAYS INLINED
+
+C- will take the programmer for their word and produce determanistic code results
+if the programmer declares something, then the compiler will honor it.
+
+Calling Convention:
+
+r0..r9 are parameters.
+If more parameters are needed they are pushed to the stack.
+If a nested function call is performed and the function will need to preserve it's own parameters then they must be pushed to the stack
+
+RA..RF are scratch registeres.
+The callee is expected to preserve them as needed (via the stack)
+
+R0 is the return value.
+If multiple registers are needed for a return then registers up to r9 may be used.
+Though if more data is needed then the programmer should consider passing a result buffer
+into the function instead of returning the result buffer out.
+
+
+basic function in assembly:
+function name:
+    push JR
+    push ra
+
+    mov ra, 10
+    syscall DO_SOMETHING_WITH_RA
+
+    pop ra;
+    pop JR
+    b jr;
+
+structs and unions may be used as types and they may be nested in themselves (as you can in c)
+though the "struct name" syntax required by early c is not required in c-. You can use the name direclty without the "struct" keyword.
+
+String literals are ascii, and treated as u8 arrays
+
+booleans are just integers, zero is false, non-zero is true
+
+if(value) {
+
+}
+else if(value) {
+
+}
+else {
+    // something
+}
+
+while(value) {
+
+}
+
+do {
+
+} while(value);
+
+for(u8 i=0; i<10; i++) {
+
+}
+
+[INLINE FOR]
+Inline for is an unrolled loop. The C- compiler will not guess as to where unrolling might be beneficial. You may use inline for to tell the compiler that something must be unwraped
+
+inline for(u8 i: 0..10) {
+    // this is unrolled and i is treated as a constant index
+}
+
+Pointers:
+If something lives on page0 it can use a single u16 address
+If something lives anywhere else, (functions included) then two u16s must be used
+
+u16 address = 0x32;
+*address = 100;
+
+// --
+
+u16 page = 255;
+u16 address = 10;
+
+*(page, address) = true;
+
+// ..
+
+(page, address) = &myFunction;
+(page, address)(10, 22, &foo[10]);
+
+u8 bar = *foo;
+
+
+[REGISTER]
+the reg keyword may be used to bind a variable to a register. This is to make inline
+assembly easier to reason about:
+
+reg(RA) u8 foo = 10;
+
+
+// hello world example:
+#include "stddef.tes"
+
+inline fn prints(addrPage: reg(R0) u8, addrOff: reg(R1) u16, len: reg(R2) u16) void {
+    // since we've already bound the parameters to the correct registers we don't
+    // actually need to do anything else to move them around
+    asm {
+        syscall cat_Sys, SerialWrite
+    };
+}
+
+// the asterisk means to calculate the array size from the constant data
+// with this the length must be comptime known. It should be accessible from
+// message.len, though it should be treated purely as a compile-known constant
+// not runtime data that is stored anywhere
+[*]u8 message = "Hello World";
+
+fn main() void {
+    // u8 psr; would be a compile error
+    u8 psr = undefined; // explicit undefined keyword to avoid accidental undefined behavior
+    u16 por = undefined;
+
+    (psr, por) = &message;
+    prints(psr, por, message.len);
+}
+
+// alternate syntax
+fn alt_main() void {
+    (u8 psr, u16 por) = &message;
+    prints(psr, por, message.len);
+}

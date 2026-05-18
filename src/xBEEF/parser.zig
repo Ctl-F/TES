@@ -925,6 +925,16 @@ pub const Parser = struct {
             self.consumeEOL();
             return;
         }
+        if (std.mem.eql(u8, mt.text, "movi")) {
+            try self.parseMovIncrDecr(mt.line, true);
+            self.consumeEOL();
+            return;
+        }
+        if (std.mem.eql(u8, mt.text, "movd")) {
+            try self.parseMovIncrDecr(mt.line, false);
+            self.consumeEOL();
+            return;
+        }
 
         const info = encoder.findOpcode(mt.text) orelse {
             std.debug.print("{s}:{}:{}: error: unknown mnemonic '{s}'\n", .{ mt.source_file, mt.line, mt.col, mt.text });
@@ -1237,6 +1247,55 @@ pub const Parser = struct {
                 const src = try self.parseReg(line);
                 try self.emitWord(pDstSrc(0x01, dst, src, 0));
             }
+        }
+    }
+
+    // ── Smart movi/movd dispatch ───────────────────────────────────────────
+
+    fn parseMovIncrDecr(self: *@This(), line: u32, increment: bool) ParseError!void {
+        const byte_left = self.tryConsumeSizeQual("byte");
+
+        if (self.peek().kind == .LBracket) {
+            // Write: movi/movd [page, off], src
+            if (!self.peekMemIsExt()) {
+                const t = self.peek();
+                std.debug.print("{s}:{}:{}: error: movi/movd requires extended [page, offset] addressing\n",
+                    .{ t.source_file, t.line, t.col });
+                return ParseError.InvalidMemoryOperand;
+            }
+            const mem = try self.parseMemExt(line);
+            _ = self.tryConsume(.Comma);
+            const byte_right = self.tryConsumeSizeQual("byte");
+            const src = try self.parseReg(line);
+            const opcode: u8 = if (increment)
+                if (byte_left or byte_right) 0x36 else 0x34
+            else
+                if (byte_left or byte_right) 0x3A else 0x38;
+            try self.emitWord(pDstAddrXSrc(opcode, mem.page_reg, mem.off_reg, src, mem.offset));
+        } else {
+            // Read: movi/movd dst, [page, off]
+            const dst = try self.parseReg(line);
+            _ = self.tryConsume(.Comma);
+            const byte_right = self.tryConsumeSizeQual("byte");
+
+            if (self.peek().kind != .LBracket) {
+                const t = self.peek();
+                std.debug.print("{s}:{}:{}: error: movi/movd: expected '[page, offset]' memory operand\n",
+                    .{ t.source_file, t.line, t.col });
+                return ParseError.InvalidMemoryOperand;
+            }
+            if (!self.peekMemIsExt()) {
+                const t = self.peek();
+                std.debug.print("{s}:{}:{}: error: movi/movd requires extended [page, offset] addressing\n",
+                    .{ t.source_file, t.line, t.col });
+                return ParseError.InvalidMemoryOperand;
+            }
+            const mem = try self.parseMemExt(line);
+            const opcode: u8 = if (increment)
+                if (byte_left or byte_right) 0x37 else 0x35
+            else
+                if (byte_left or byte_right) 0x3B else 0x39;
+            try self.emitWord(pDstSrcAddrX(opcode, dst, mem.page_reg, mem.off_reg, mem.offset));
         }
     }
 
