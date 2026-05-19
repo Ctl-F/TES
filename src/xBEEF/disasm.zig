@@ -467,7 +467,22 @@ fn emitInstruction(
         .DstSrc => {
             const dst = r.reg(word, 8);
             const src = r.reg(word, 13);
-            try w.print("{s} {s}, {s}", .{ info.mnemonic, regName(dst), regName(src) });
+            // push32/pop32 use user-facing push/pop syntax
+            if (info.opcode == 0x81) { // push32
+                if (dst == 18 and src == 19) { // JR and JRH
+                    try w.writeAll("push jr");
+                } else {
+                    try w.print("push {s}, {s}", .{ regName(dst), regName(src) });
+                }
+            } else if (info.opcode == 0x82) { // pop32
+                if (dst == 18 and src == 19) { // JR and JRH
+                    try w.writeAll("pop jr");
+                } else {
+                    try w.print("pop {s}, {s}", .{ regName(dst), regName(src) });
+                }
+            } else {
+                try w.print("{s} {s}, {s}", .{ info.mnemonic, regName(dst), regName(src) });
+            }
         },
 
         .DstAddrSrc => {

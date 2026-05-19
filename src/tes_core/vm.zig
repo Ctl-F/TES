@@ -1983,7 +1983,7 @@ fn StackFactory(comptime op: StackOp) InstructionInfo {
 
                         const size = @sizeOf(vTy);
 
-                        const de: InstructionDst = @bitCast(i);
+                        const de: InstructionDstSrc = @bitCast(i);
                         const registers = vm.registers.registers();
                         const sp = registers[SP];
                         const sh = registers[SH];
@@ -1995,15 +1995,14 @@ fn StackFactory(comptime op: StackOp) InstructionInfo {
 
                         registers[SP] -= size;
 
-                        if (de.dst != @intFromEnum(RegisterID.JR)) {
-                            @panic("register provided is not a valid 32 bit register for pushing");
-                        }
+                        const low = registers[de.dst];
+                        const high = registers[de.src];
 
-                        const value: vTy = vm.registers.doubleRegisters()[TESVM.wideRegIndex(de.dst)];
                         const page0 = vm.getPage0();
 
                         const address = @as([*]u8, @ptrCast(&page0[registers[SP]]));
-                        std.mem.writeInt(vTy, address[0..size], value, .little);
+                        std.mem.writeInt(u16, address[0..2], low, .little);
+                        std.mem.writeInt(u16, address[2..4], high, .little);
                     }
                 }.do,
                 .cycles = 1,
@@ -2015,14 +2014,10 @@ fn StackFactory(comptime op: StackOp) InstructionInfo {
 
                         const size = @sizeOf(vTy);
 
-                        const de: InstructionDst = @bitCast(i);
+                        const de: InstructionDstSrc = @bitCast(i);
                         const registers = vm.registers.registers();
                         const sp = registers[SP];
                         const sb = registers[SB];
-
-                        if (de.dst != @intFromEnum(RegisterID.JR)) {
-                            @panic("register provided is not a valid 32 bit register for popping");
-                        }
 
                         if (sp + size > sb) {
                             @branchHint(.unlikely);
@@ -2030,10 +2025,13 @@ fn StackFactory(comptime op: StackOp) InstructionInfo {
                         }
                         const page0 = vm.getPage0();
                         const address = @as([*]u8, @ptrCast(&page0[registers[SP]]));
-                        const value: vTy = std.mem.readInt(vTy, address[0..size], .little);
+                        //const value: vTy = std.mem.readInt(vTy, address[0..size], .little);
+
+                        registers[de.dst] = std.mem.readInt(u16, address[0..2], .little);
+                        registers[de.src] = std.mem.readInt(u16, address[2..4], .little);
 
                         registers[SP] += size;
-                        vm.registers.doubleRegisters()[TESVM.wideRegIndex(de.dst)] = value;
+                        //vm.registers.doubleRegisters()[TESVM.wideRegIndex(de.dst)] = value;
                     }
                 }.do,
                 .cycles = 1,

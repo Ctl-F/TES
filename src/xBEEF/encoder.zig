@@ -173,8 +173,8 @@ pub const opcodes = [_]OpcodeInfo{
     .{.opcode=0x7E,.format=.BranchNear,   .mnemonic="bn"},
     .{.opcode=0x7F,.format=.BranchNearCond,.mnemonic="bnt"},
     .{.opcode=0x80,.format=.BranchNearCond,.mnemonic="bnf"},
-    .{.opcode=0x81,.format=.Dst,          .mnemonic="push32"},
-    .{.opcode=0x82,.format=.Dst,          .mnemonic="pop32"},
+    .{.opcode=0x81,.format=.DstSrc,        .mnemonic="push32"},
+    .{.opcode=0x82,.format=.DstSrc,        .mnemonic="pop32"},
     .{.opcode=0x83,.format=.Dst2Src2,     .mnemonic="ivs"},
 };
 

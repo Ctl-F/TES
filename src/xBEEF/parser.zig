@@ -1321,24 +1321,77 @@ pub const Parser = struct {
 
     fn parsePush(self: *@This(), line: u32) ParseError!void {
         const sq = self.parseSizeQual();
-        const reg = try self.parseReg(line);
-        const opcode: u8 = switch (sq) {
-            .byte  => 0x2E, // push8
-            .dword => 0x81, // push32
-            .none  => 0x2F, // push16 default
-        };
-        try self.emitWord(pDst(opcode, reg, 0));
+        switch (sq) {
+            .byte => {
+                const reg = try self.parseReg(line);
+                try self.emitWord(pDst(0x2E, reg, 0)); // push8
+            },
+            .dword => {
+                // (dword) qualifier forces push32: accept `jr` or `lo, hi`
+                const lo, const hi = try self.parsePair32(line);
+                try self.emitWord(pDstSrc(0x81, lo, hi, 0));
+            },
+            .none => {
+                if (self.isJrToken(self.peek())) {
+                    // push jr → push32 JR:JRH pair
+                    _ = self.advance();
+                    try self.emitWord(pDstSrc(0x81, .JR, .JRH, 0));
+                } else {
+                    const r1 = try self.parseReg(line);
+                    if (self.tryConsume(.Comma)) {
+                        // push IXR, IXR → push32 explicit pair
+                        const r2 = try self.parseReg(line);
+                        try self.emitWord(pDstSrc(0x81, r1, r2, 0));
+                    } else {
+                        // push IXR → push16
+                        try self.emitWord(pDst(0x2F, r1, 0));
+                    }
+                }
+            },
+        }
     }
 
     fn parsePop(self: *@This(), line: u32) ParseError!void {
         const sq = self.parseSizeQual();
-        const reg = try self.parseReg(line);
-        const opcode: u8 = switch (sq) {
-            .byte  => 0x30, // pop8
-            .dword => 0x82, // pop32
-            .none  => 0x31, // pop16 default
-        };
-        try self.emitWord(pDst(opcode, reg, 0));
+        switch (sq) {
+            .byte => {
+                const reg = try self.parseReg(line);
+                try self.emitWord(pDst(0x30, reg, 0)); // pop8
+            },
+            .dword => {
+                // (dword) qualifier forces pop32: accept `jr` or `lo, hi`
+                const lo, const hi = try self.parsePair32(line);
+                try self.emitWord(pDstSrc(0x82, lo, hi, 0));
+            },
+            .none => {
+                if (self.isJrToken(self.peek())) {
+                    // pop jr → pop32 JR:JRH pair
+                    _ = self.advance();
+                    try self.emitWord(pDstSrc(0x82, .JR, .JRH, 0));
+                } else {
+                    const r1 = try self.parseReg(line);
+                    if (self.tryConsume(.Comma)) {
+                        // pop IXR, IXR → pop32 explicit pair
+                        const r2 = try self.parseReg(line);
+                        try self.emitWord(pDstSrc(0x82, r1, r2, 0));
+                    } else {
+                        // pop IXR → pop16
+                        try self.emitWord(pDst(0x31, r1, 0));
+                    }
+                }
+            },
+        }
+    }
+
+    // Parse a 32-bit register pair: `jr` (expands to JR/JRH) or `lo_reg, hi_reg`.
+    fn parsePair32(self: *@This(), line: u32) ParseError!struct { RegID, RegID } {
+        if (self.isJrToken(self.peek())) {
+            _ = self.advance();
+            return .{ .JR, .JRH };
+        }
+        const lo = try self.parseReg(line); _ = self.tryConsume(.Comma);
+        const hi = try self.parseReg(line);
+        return .{ lo, hi };
     }
 
     // ── Smart resume dispatch ──────────────────────────────────────────────
