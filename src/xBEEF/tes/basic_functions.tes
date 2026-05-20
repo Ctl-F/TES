@@ -1,0 +1,138 @@
+#define STACK_SIZE 0x2000
+
+[Data(0:${0xFFFF - STACK_SIZE})]
+_Stack_Head: .u8 0
+
+[Program]
+_start:
+    ; It's important to set the stack
+    ; before writing any code, otherwise
+    ; any push or pop will immediately
+    ; cause a stack overflow error
+    ; Since _Stack_Head lives on page 0
+    ; (and the stack is required to live
+    ; on page 0)
+    ; we don't need a full lea,
+    ; we can just move the offset into ra
+    mov ra, _Stack_Head;
+    mov rb, $STACK_SIZE;
+    stackset ra, rb;
+
+    mov r0, 10;
+    mov r1, 11;
+    bn basicFunction_Add;
+
+    ; r0 now equals 21
+
+_end:
+    hlt;
+
+; registers r0..r9 are conventionally
+; parameters. r0 is conventionally the
+; return value
+; registers ra..rf are conventionally scratch
+; registers
+basicFunction_Add:
+    push jr;
+
+    add r0, r1;
+
+    pop jr;
+    b jr;
+
+; the above is an example of a "safe"
+; function that follows the basic flow
+; of a function, but since it's technically
+; a function that has no branches we can
+; remove the stack manipulation entirely:
+basicFunction_Add_Optimized:
+    add r0, r1;
+    b jr;
+
+; here is a recursive factorial function
+; factorial_recursive(n: r0) -> r0
+factorial_recursive:
+    push jr;
+
+    mov rb, 1;
+    setle ra, r0, rb;
+    bnt ra, _fact_rec_ret_1;
+
+    ; n > 1 so we calculate n * n-1 * ... * 2
+    ; keep our n
+    ; and call factorial_recursive(n-1)
+    push r0;
+    dec r0;
+    bn factorial_recursive;
+
+    ; pop our n back into ra
+    pop ra;
+
+    ; multiply factorial(n-1) with our n
+    mul r0, ra;
+    bn _fact_rec_ret;
+_fact_rec_ret_1:
+    mov r0, 1;
+
+_fact_rec_ret:
+    pop jr;
+    b jr;
+
+
+; here is an annotated recursive factorial
+; function:
+factorial_recursive2: @{
+    push jr;
+
+    @bind n : r0;
+    @bind cond : ra;
+    @bind refVal : rb;
+
+    mov refVal, 1;
+    setle cond, n, refVal;
+    bnt cond, _factorial_rec2_return_1;
+
+    push n;
+    dec n;
+    bn factorial_recursive2;
+
+    pop refVal;
+    mul r0, refVal;
+    bn _factorial_rec2_ret;
+_factorial_rec2_return_1:
+    mov r0, 1;
+
+_factorial_rec2_ret:
+    pop jr;
+    b jr;
+}
+
+
+factorial_loop: @{
+    push jr;
+
+    @bind n: r0;
+    @bind refVal: rb;
+    @bind condition: ra;
+    @bind accum: rc;
+
+    mov refVal, 1;
+    setle condition, n, refVal;
+    bnt condition, factorial_loop_ret_1;
+
+    mov accum, 1;
+
+factorial_loop_begin:
+    mul accum, n;
+    dec n;
+    setle condition, n, refVal;
+    bnf condition, factorial_loop_begin;
+factorial_loop_end:
+    mov r0, accum;
+    bn factorial_loop_ret;
+factorial_loop_ret_1:
+    mov r0, 1;
+factorial_loop_ret:
+    pop jr;
+    b jr;
+}
