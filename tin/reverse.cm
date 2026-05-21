@@ -1,0 +1,23 @@
+#include "stddef.tes"
+
+inline fn prints(psr: reg(r0) u8, por: reg(r1) u16, len: reg(r2) u16) void {
+	asm {
+		syscall $cat_Sys, $SerialWrite;
+	}
+}
+
+[*]u8 Secret = "0123456789";
+[Secret.len]u8 Buffer = 0;
+
+fn main() void {
+    (u8 sP, u16 sO) = &Secret;
+    (u8 dP, u16 dO) = &Buffer;
+
+    reverse(sP, sO, dP, dO);
+    print(dP, dO, Secret.len);
+}
+
+fn reverse(srcH: u8, srcL: u16, dstH: u8, dstL: u16) void {
+
+
+}

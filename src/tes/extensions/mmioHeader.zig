@@ -33,9 +33,9 @@ pub const MMMap = extern struct {
 
     pub const GFXPixelLayerConfig = extern struct {
         structType: u8,
+        format: u8,
         width: u16,
         height: u16,
-        format: u8,
     };
 
     pub const GFXLayerConfig = extern struct {

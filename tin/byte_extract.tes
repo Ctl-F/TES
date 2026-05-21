@@ -1,0 +1,56 @@
+#include "stddef.tes"
+
+#define STACK_SIZE 0x800
+
+[Data(0:0xF000)]
+_StackHead: .u8[$STACK_SIZE] 0
+
+[Data(0:0x1000)]
+byteBuffer: .u8[3] 0
+
+[Data(0:0x2000)]
+message: "321Blastoff"
+messageEof: .u8 0
+
+[Program]
+_start:
+    mov ra, _StackHead;
+    mov rb, $STACK_SIZE;
+    stackset ra, rb;
+
+    @{
+    @bind src : re;
+    @bind page : r0;
+    @bind dst : r1;
+    @bind len : r2;
+
+    lea r0, r1, byteBuffer;
+    mov re, message;
+    mov r2, 2;
+
+    mov rf, 10;
+
+    inc r1;
+    ; TODO: fix allow bound symbols in address deref
+    mov (byte)[r1], rf;
+    inc r1;
+
+    xor rf, rf;
+    mov (byte)[r1], rf;
+    dec r1;
+    dec r1;
+
+loop:
+    mov ra, (byte)[re];
+    bnf ra, endLoop;
+
+    mov (byte)[r1], ra;
+
+    syscall $cat_Sys, $SerialWrite;
+
+    inc re;
+    bn loop;
+endLoop:
+    }
+
+    hlt;

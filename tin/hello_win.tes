@@ -1,0 +1,72 @@
+#include "stddef.tes"
+
+#define STACK_SIZE 0x800
+
+#define WINDOW_WIDTH 240
+#define WINDOW_HEIGHT 120
+
+[Data(0:0xF000]
+_StackHead: .u8[$STACK_SIZE] 0
+
+[Program]
+_start:
+    mov ra, _StackHead
+    mov rb, $STACK_SIZE
+    stackset ra, rb;
+
+    bn _init_gpu;
+
+    mov re, $MMIO_PAGE_ID;
+    mov rf, $MMIO_HEADER_BASE;
+
+_loop:
+    ; poll close event
+    mov ra, (byte)[re, (MemIOMap.io.closeSignal)rf];
+    bnf ra, _loop;
+
+_exit:
+    hlt;
+
+
+_init_gpu:
+    push jr;
+
+    mov re, $MMIO_PAGE_ID;
+    mov rf, $MMIO_HEADER_BASE;
+
+    ; initalize gpu
+    mov ra, 1
+    mov (byte) [re, (MemIOMap.gpu.enable)rf], ra;
+
+    ; set screen scale of 1
+    mov (byte) [re, (MemIOMap.gpu.screenScale)rf], ra;
+
+    ; set screen dimensions
+    mov ra, $WINDOW_WIDTH
+    mov [re, (MemIOMap.gpu.screenWidth)rf], ra;
+    mov ra, $WINDOW_HEIGHT
+    mov [re, (MemIOMap.gpu.screenHeight)rf], ra;
+
+    ; set clear color
+    xor ra, ra;
+    mov [re, (MemIOMap.gpu.clearColor.r)rf], ra;
+    mov [re, (MemIOMap.gpu.clearColor.b)rf], ra;
+
+    mov ra, 64;
+    mov (byte)[re, (MemIOMap.gpu.clearColor.b)rf], ra;
+
+    ; enable clear
+    ; for optimizations we could move this up to
+    ; when ra is already set to 1
+    ; but for ease of logic I'll eat the extra
+    ; instruction here
+    mov ra, 1
+    mov (byte)[re, (MemIOMap.gpu.clearEnable)rf], ra;
+
+    xor ra, ra;
+    mov [re, (MemIOMap.gpu.layerEnable)rf], ra;
+
+    syscall $cat_GFX, $GFXSync;
+
+    pop jr;
+    b jr;

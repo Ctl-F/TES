@@ -1,0 +1,14 @@
+#include "stddef.tes"
+
+inline fn prints(psr: reg(r0) u8, por: reg(r1) u16, len: reg(r2) u16) void {
+	asm {
+		syscall $cat_Sys, $SerialWrite;
+	}
+}
+
+[*]u8 HelloMessage = "Hello World\n";
+
+fn main() void {
+	(u8 psr, u16 por) = &HelloMessage;
+	prints(psr, por, HelloMessage.len);
+}

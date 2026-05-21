@@ -1,6 +1,64 @@
 #once
 [Meta]
 
+#define GPU_LAYER_COUNT 16
+
+struct IOHeader {
+    closeSignal: u8;
+};
+
+#define STRUCT_LAYER_CONFIG_DISABLED 0
+#define STRUCT_LAYER_CONFIG_FRAMEBUFFER 1
+
+#define PIXEL_FORMAT_RGBA32 0
+#define PIXEL_FORMAT_RGB565 1
+#define PIXEL_FORMAT_RGB555A1 2
+
+#define ColorRGB565_Mask_R 0b1111100000000000
+#define ColorRGB565_Mask_G 0b0000011111100000
+#define ColorRGB565_Mask_B 0b0000000000011111
+
+#define ColorRGB565_ShiftToR 11
+#define ColorRGB565_ShiftToG 5
+#define ColorRGB565_ShiftToB 0
+
+struct ColorRGB32 {
+    r: u8;
+    g: u8;
+    b: u8;
+    a: u8;
+};
+
+struct GPUPixelLayerConfig {
+    sType: u8;
+    format: u8;
+    width: u16;
+    height: u16;
+};
+
+struct GPULayerConfig {
+    configHigh: u16;
+    configLow: u16;
+    dataHigh: u16;
+    dataLow: u16;
+};
+
+struct GPUHeader {
+    enable: u8;
+    screenWidth: u16;
+    screenHeight: u16;
+    screenScale: u8;
+    clearColor: ColorRGB32;
+    clearEnable: u8;
+    layerEnable: u16;
+    layers: [$GPU_LAYER_COUNT]GPULayerConfig;
+};
+
+struct MemIOMap {
+    gpu: GPUHeader;
+    io: IOHeader;
+};
+
 
 ; WRITE EXAMPLE
 ; [Data]
@@ -14,4 +72,19 @@
 ; sub R2, R1;
 ; syscall cat_Sys, SerialWrite;
 #define cat_Sys 0
+#define cat_GFX 1
+#define cat_IO 2
+
+; cat_Sys
 #define SerialWrite 0
+
+; cat_GFX
+#define GFXSync 1
+#define GFXPresent 2
+
+; cat_IO
+#define IOSync 1
+#define IOPoll 2
+
+#define MMIO_PAGE_ID 255
+#define MMIO_HEADER_BASE 0
