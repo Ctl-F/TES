@@ -2,7 +2,7 @@ const native = @import("native");
 const std = @import("std");
 const vm = @import("tes_core").vm;
 const Layers = @import("layer.zig");
-const mmMap = @import("../mmioHeader.zig");
+const mmMap = @import("../mmioHeader.zig").MMMap;
 
 const CompositerVertexSource = @embedFile("CompositerVertex.glsl");
 const CompositerFragmentSource = @embedFile("CompositerFragment.glsl");
@@ -44,9 +44,9 @@ pub const Resources = struct {
 
 pub const vGPU = struct {
     enabled: bool = false,
-    layerMask: u16 = 0,
     arena: std.mem.Allocator,
     resources: Resources,
+    layerMask: u16 = 0,
     layers: [16]Layer = [_]Layer{.{ .disabled = .{} }} ** 16,
     parent: *vm.TESVM,
     context: struct {
@@ -202,8 +202,8 @@ pub const vGPU = struct {
             .width = width,
             .height = height,
 
-            .windowWidth = wWidth,
-            .windowHeight = wHeight,
+            .windowWidth = @intCast(wWidth),
+            .windowHeight = @intCast(wHeight),
 
             .compositeShader = shader,
             .compositeUniformLayerMaskLocation = layerMaskLoc,
@@ -233,20 +233,20 @@ pub const vGPU = struct {
         );
     }
 
-    pub fn disable(this: *@This()) void {
+    pub fn disable(this: *@This()) !void {
         for (0..this.layers.len) |idx| {
-            this.layers[idx].detach(this, @truncate(idx));
+            try this.layers[idx].detach(this, @truncate(idx));
             this.layers[idx] = .{ .disabled = .{} };
         }
 
         native.glDeleteProgram(this.context.compositeShader);
         native.glDeleteVertexArrays(1, &this.context.compositeVao);
         native.glDeleteBuffers(1, &this.context.compositeVbo);
-        native.glDeleteFramebuffer(this.context.fbo);
+        native.glDeleteFramebuffers(1, &this.context.fbo);
         native.glDeleteTextures(1, &this.context.layerTextureArray);
 
         _ = native.SDL_GL_DestroyContext(this.context.context);
-        _ = native.SDL_GL_DestroyWindow(this.context.window);
+        _ = native.SDL_DestroyWindow(this.context.window);
 
         native.SDL_Quit();
 
@@ -255,42 +255,42 @@ pub const vGPU = struct {
         this.enabled = false;
     }
 
-    pub fn setLayer(this: *@This(), idx: u16, new: Layer) void {
-        this.layers[idx].detach(this, idx);
+    pub fn setLayer(this: *@This(), idx: u16, new: Layer) !void {
+        try this.layers[idx].detach(this, idx);
         this.layers[idx] = new;
-        this.layers[idx].attach(this, idx);
+        try this.layers[idx].attach(this, idx);
     }
 
-    pub fn present(this: *@This()) void {
+    pub fn present(this: *@This()) !void {
         const header = this.getHeader();
 
-        native.glBindFramebuffer(this.context.fbo);
+        native.glBindFramebuffer(native.GL_FRAMEBUFFER, this.context.fbo);
         native.glViewport(0, 0, this.context.width, this.context.height);
 
-        if (header.clearEnable) {
+        if (header.clearEnable != 0) {
             const color = header.clearColor.normalize();
             native.glClearColor(color.r, color.g, color.b, color.a);
             native.glClear(native.GL_COLOR_BUFFER_BIT);
         }
 
         for (&this.layers, 0..) |*layer, idx| {
-            const mask: u16 = 1 << @as(u4, @truncate(idx));
+            const mask: u16 = @as(u16, 1) << @as(u4, @truncate(idx));
             if (this.layerMask & mask == 0) continue;
 
-            native.glFramebufferTextureLayer(native.GL_FRAMEBUFFER, native.COLOR_ATTACHMENT0, this.context.layerTextureArray, 0, @intCast(idx));
+            native.glFramebufferTextureLayer(native.GL_FRAMEBUFFER, native.GL_COLOR_ATTACHMENT0, this.context.layerTextureArray, 0, @intCast(idx));
 
-            layer.present();
+            try layer.present(this, @truncate(idx));
         }
 
-        native.glBindFramebuffer(0);
-        native.glViewport(0, 0, this.context.windowWidth, this.context.windowHeight);
+        native.glBindFramebuffer(native.GL_FRAMEBUFFER, 0);
+        native.glViewport(0, 0, @intCast(this.context.windowWidth), @intCast(this.context.windowHeight));
 
         native.glBindVertexArray(this.context.compositeVao);
         native.glBindBuffer(native.GL_ARRAY_BUFFER, this.context.compositeVbo);
 
         native.glUseProgram(this.context.compositeShader);
-        native.glSetUniform1i(this.context.compositeUniformLayerMaskLocation, @intCast(this.layerMask));
-        native.glSetUniform1i(this.context.compositeUniformLayerTextureLocation, 0);
+        native.glUniform1i(@intCast(this.context.compositeUniformLayerMaskLocation), @intCast(this.layerMask));
+        native.glUniform1i(@intCast(this.context.compositeUniformLayerTextureLocation), 0);
 
         native.glDrawArrays(native.GL_TRIANGLES, 0, 6);
 

@@ -1,0 +1,20 @@
+#include "stddef.tes"
+[Data(0:0x0400)]
+_cm_g_Message:
+    .u8 72, 101, 108, 108, 111, 32, 87, 111, 114, 108, 100, 10, 0
+
+[Program]
+_start:
+_cm_main:
+    push ra
+    push rb
+    lea ra, rb, _cm_g_Message
+    mov r0, ra
+    mov r1, rb
+    mov r2, 13
+    syscall $cat_Sys , $SerialWrite ;
+_cm_L_0:
+    pop rb
+    pop ra
+    b jr
+

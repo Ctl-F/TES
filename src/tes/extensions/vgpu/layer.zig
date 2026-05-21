@@ -1,7 +1,7 @@
 const native = @import("native");
 const std = @import("std");
 const VGPU = @import("vgpu.zig");
-const MMMap = @import("../mmioHeader.zig");
+const MMMap = @import("../mmioHeader.zig").MMMap;
 const gpu = VGPU.vGPU;
 
 pub const Layer = union(enum) {
@@ -9,23 +9,23 @@ pub const Layer = union(enum) {
     pixelBuffer: PixelBufferLayer,
 
     pub fn attach(this: *@This(), parent: *gpu, idx: u16) anyerror!void {
-        switch (this) {
-            .disabled => |d| try d.attach(parent, idx),
-            .pixelBuffer => |p| try p.attach(parent, idx),
+        switch (this.*) {
+            .disabled => |*layer| try PassThroughLayer.attach(layer, parent, idx),
+            .pixelBuffer => |*layer| try PixelBufferLayer.attach(layer, parent, idx),
         }
     }
 
-    pub fn detach(this: @This(), parent: *gpu, idx: u16) anyerror!void {
-        switch (this) {
-            .disabled => |d| try d.detach(parent, idx),
-            .pixelBuffer => |p| try p.detach(parent, idx),
+    pub fn detach(this: *@This(), parent: *gpu, idx: u16) anyerror!void {
+        switch (this.*) {
+            .disabled => |*layer| try PassThroughLayer.detach(layer, parent, idx),
+            .pixelBuffer => |*layer| try PixelBufferLayer.detach(layer, parent, idx),
         }
     }
 
-    pub fn present(this: @This(), parent: *gpu, idx: u16) anyerror!void {
-        switch (this) {
-            .disabled => |d| try d.present(parent, idx),
-            .pixelBuffer => |p| try p.present(parent, idx),
+    pub fn present(this: *@This(), parent: *gpu, idx: u16) anyerror!void {
+        switch (this.*) {
+            .disabled => |*layer| try PassThroughLayer.present(layer, parent, idx),
+            .pixelBuffer => |*layer| try PixelBufferLayer.present(layer, parent, idx),
         }
     }
 };
@@ -45,6 +45,7 @@ pub const PixelBufferLayer = struct {
         shader: u32 = 0,
         textureUniformLocation: u32 = 0,
         textureHandle: u32 = 0,
+        decompressionBuffer: ?[]u8 = null,
     } = .{},
     config: *MMMap.GFXPixelLayerConfig,
 
@@ -56,7 +57,15 @@ pub const PixelBufferLayer = struct {
 
         const header = parent.getHeader();
         const config = try header.layers[idx].getConfigBuffer(parent.parent);
-        const pixelConfig: *MMMap.GFXPixelLayerConfig = @ptrCast(config);
+        const pixelConfig: *MMMap.GFXPixelLayerConfig = @ptrCast(@alignCast(config));
+
+        if (pixelConfig.format != @intFromEnum(MMMap.PixelFormat.RGBA32)) {
+            this.context.decompressionBuffer = try parent.arena.alloc(u8, pixelConfig.width * pixelConfig.height * 4);
+            errdefer {
+                parent.arena.free(this.context.decompressionBuffer);
+                this.context.decompressionBuffer = null;
+            }
+        }
 
         native.glGenVertexArrays(1, &this.context.vao);
         native.glGenBuffers(1, &this.context.vbo);
@@ -81,7 +90,7 @@ pub const PixelBufferLayer = struct {
 
         this.context.shader = try VGPU.compileShader(PixelShaderVert, PixelShaderFrag);
         this.context.textureUniformLocation =
-            native.glGetUniformLocation(this.context.shader, "PixelBuffer");
+            @intCast(native.glGetUniformLocation(this.context.shader, "PixelBuffer"));
 
         native.glGenTextures(1, &this.context.textureHandle);
         native.glBindTexture(native.GL_TEXTURE_2D, this.context.textureHandle);
@@ -91,25 +100,79 @@ pub const PixelBufferLayer = struct {
         native.glBindTexture(native.GL_TEXTURE_2D, 0);
     }
 
+    inline fn formatToSDL(fmt: MMMap.PixelFormat) c_uint {
+        return switch (fmt) {
+            .RGBA32 => native.SDL_PIXELFORMAT_RGBA8888,
+            .RGB565 => native.SDL_PIXELFORMAT_RGB565,
+            .RGB555A1 => native.SDL_PIXELFORMAT_RGBA5551,
+        };
+    }
+
+    inline fn getFormatWidth(fmt: MMMap.PixelFormat) u32 {
+        return switch (fmt) {
+            .RGBA32 => 4,
+            .RGB565, .RGB555A1 => 2,
+        };
+    }
+
+    fn convert(width: i32, height: i32, srcFormat: MMMap.PixelFormat, srcBuffer: []const u8, dstFormat: MMMap.PixelFormat, dstBuffer: []u8) !void {
+        const sdlFormatSrc = formatToSDL(srcFormat);
+        const sdlFormatDst = formatToSDL(dstFormat);
+
+        const sourcePitch = @as(c_int, @intCast(width)) * @as(c_int, @intCast(getFormatWidth(srcFormat)));
+        const dstPitch = @as(c_int, @intCast(width)) * @as(c_int, @intCast(getFormatWidth(dstFormat)));
+
+        if (!native.SDL_ConvertPixels(
+            width,
+            height,
+            sdlFormatSrc,
+            srcBuffer.ptr,
+            sourcePitch,
+            sdlFormatDst,
+            @ptrCast(dstBuffer.ptr),
+            dstPitch,
+        )) {
+            std.debug.print("Image Conversion Error: {s}\n", .{native.SDL_GetError()});
+            return error.FormatConvert;
+        }
+    }
+
     pub fn present(this: *@This(), parent: *gpu, idx: u16) anyerror!void {
         const header = parent.getHeader();
         const config = try header.layers[idx].getConfigBuffer(parent.parent);
         const data = try header.layers[idx].getDataBuffer(parent.parent);
-        const pixelConfig: *MMMap.GFXPixelLayerConfig = @ptrCast(config);
+        const pixelConfig: *MMMap.GFXPixelLayerConfig = @ptrCast(@alignCast(config));
 
         const pixelBuffer = if (pixelConfig.format != @intFromEnum(MMMap.PixelFormat.RGBA32)) CONV: {
-            // TODO: convert texture
-            break :CONV &.{};
+            const sourceLength: usize = pixelConfig.width * pixelConfig.height * getFormatWidth(@enumFromInt(pixelConfig.format));
+            try convert(pixelConfig.width, pixelConfig.height, @as(MMMap.PixelFormat, @enumFromInt(pixelConfig.format)), data[0..sourceLength], .RGBA32, this.context.decompressionBuffer.?);
+            break :CONV this.context.decompressionBuffer.?.ptr;
         } else data;
 
         native.glBindTexture(native.GL_TEXTURE_2D, this.context.textureHandle);
-        native.glTexSubImage2D(native.GL_TEXTURE_2D, 0, 0, 0, @intCast(pixelConfig.width), @intCast(pixelConfig.height), native.GL_RGBA8, native.GL_UNSIGNED_BYTE, @ptrCast(pixelBuffer.ptr));
+        native.glTexSubImage2D(native.GL_TEXTURE_2D, 0, 0, 0, @intCast(pixelConfig.width), @intCast(pixelConfig.height), native.GL_RGBA8, native.GL_UNSIGNED_BYTE, @ptrCast(pixelBuffer));
 
         native.glBindVertexArray(this.context.vao);
         native.glBindBuffer(native.GL_ARRAY_BUFFER, this.context.vbo);
 
         native.glUseProgram(this.context.shader);
+
+        native.glUniform1i(@intCast(this.context.textureUniformLocation), 0);
+        native.glDrawArrays(native.GL_TRIANGLES, 0, 6);
+
+        native.glUseProgram(0);
+        native.glBindVertexArray(0);
+        native.glBindTexture(native.GL_TEXTURE_2D, 0);
     }
 
-    pub fn detach(_: *@This(), _: *gpu, _: u16) anyerror!void {}
+    pub fn detach(this: *@This(), parent: *gpu, _: u16) anyerror!void {
+        native.glDeleteTextures(1, &this.context.textureHandle);
+        native.glDeleteProgram(this.context.shader);
+        native.glDeleteBuffers(1, &this.context.vbo);
+        native.glDeleteVertexArrays(1, &this.context.vao);
+
+        parent.arena.free(this.context.decompressionBuffer.?);
+
+        this.context = .{};
+    }
 };

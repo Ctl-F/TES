@@ -2,13 +2,11 @@ const native = @import("native");
 const std = @import("std");
 const tes = @import("tes_core").vm;
 
+const mmMap = @import("mmioHeader.zig").MMMap;
+
 pub const pool: tes.PoolID = 2;
 
 const gfx = @import("Graphics.zig");
-
-pub const IOBufferLen = 1024;
-pub const IOPageOffset = gfx.GFXPageOffset + gfx.GFXBufferLen;
-pub const IOHeaderOffset = 0;
 
 pub const ErrorCodes = enum(u8) {
     UnknownEventCode = 0,
@@ -30,16 +28,13 @@ pub fn extension(enable: bool) tes.Extension {
     };
 }
 
-const IOHeader = struct {
-    closeSignal: u8,
-};
-
 fn getFriendlyName() []const u8 {
     return "I/O Controller";
 }
 
-fn getIOHeader(page: tes.PageBuffer) *IOHeader {
-    return @ptrCast(@alignCast(&page[IOPageOffset + IOHeaderOffset]));
+fn getIOHeader(page: tes.PageBuffer) *mmMap.IOHeader {
+    const mmPtr: *mmMap = @ptrCast(@alignCast(&page[0]));
+    return &mmPtr.io;
 }
 
 fn handle(vm: *tes.TESVM, evCode: tes.EventID) tes.EventResult {

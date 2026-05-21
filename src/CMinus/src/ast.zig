@@ -230,6 +230,7 @@ pub const Decl = union(enum) {
     fn_decl: FnDecl,
     struct_decl: StructDecl,
     global_var: GlobalVar,
+    passthrough: []const u8, // #directive line emitted verbatim into asm output
 };
 
 pub const File = struct {

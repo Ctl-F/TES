@@ -142,11 +142,9 @@ pub const Parser = struct {
     fn parseDecl(self: *Parser) ParseError!?ast.Decl {
         const t = self.peek();
         switch (t.kind) {
-            .prep_include => {
-                _ = self.advance();
-                // consume path string
-                if (self.check(.string_lit)) _ = self.advance();
-                return null; // #include handled by caller (file inclusion)
+            .prep_passthrough => {
+                const tok = self.advance();
+                return .{ .passthrough = tok.text };
             },
             .kw_import => {
                 _ = self.advance();
@@ -290,6 +288,63 @@ pub const Parser = struct {
 
     // ─── statements ───────────────────────────────────────────────────────────
 
+    /// True when the current token is `(` and the next is a type keyword,
+    /// indicating `(type name, type name) = expr` pair-declaration syntax.
+    fn isPairDeclStart(self: *Parser) bool {
+        return switch (self.peekAt(1).kind) {
+            .ty_u8, .ty_u16, .ty_i8, .ty_i16, .ty_u8_vec2, .ty_i8_vec2 => true,
+            else => false,
+        };
+    }
+
+    /// Parse `(type1 name1, type2 name2) = expr;` and desugar it into a block:
+    ///   type1 name1 = undefined;
+    ///   type2 name2 = undefined;
+    ///   (name1, name2) = expr;
+    fn parsePairDecl(self: *Parser, loc: Loc) ParseError!ast.Stmt {
+        _ = self.advance(); // consume '('
+
+        const type1 = try self.parseTypeExpr();
+        const name1 = (try self.expect(.ident)).text;
+        _ = try self.expect(.comma);
+        const type2 = try self.parseTypeExpr();
+        const name2 = (try self.expect(.ident)).text;
+        _ = try self.expect(.r_paren);
+        _ = try self.expect(.eq);
+        const rhs = try self.parseExpr();
+        _ = try self.expect(.semi);
+
+        // var decl 1
+        const undef1 = try self.gpa.create(ast.Expr);
+        undef1.* = .{ .undefined_val = loc };
+        const s1 = try self.gpa.create(ast.Stmt);
+        s1.* = .{ .var_decl = .{ .type_expr = type1, .name = name1, .reg_hint = null, .init = undef1, .loc = loc } };
+
+        // var decl 2
+        const undef2 = try self.gpa.create(ast.Expr);
+        undef2.* = .{ .undefined_val = loc };
+        const s2 = try self.gpa.create(ast.Stmt);
+        s2.* = .{ .var_decl = .{ .type_expr = type2, .name = name2, .reg_hint = null, .init = undef2, .loc = loc } };
+
+        // (name1, name2) = rhs
+        const page_e = try self.gpa.create(ast.Expr);
+        page_e.* = .{ .ident = .{ .name = name1, .loc = loc } };
+        const addr_e = try self.gpa.create(ast.Expr);
+        addr_e.* = .{ .ident = .{ .name = name2, .loc = loc } };
+        const lhs_e = try self.gpa.create(ast.Expr);
+        lhs_e.* = .{ .ext_ptr = .{ .page_expr = page_e, .addr_expr = addr_e, .loc = loc } };
+        const assign_e = try self.gpa.create(ast.Expr);
+        assign_e.* = .{ .binary = .{ .op = .assign, .lhs = lhs_e, .rhs = rhs, .loc = loc } };
+        const s3 = try self.gpa.create(ast.Stmt);
+        s3.* = .{ .expr_stmt = assign_e };
+
+        const stmts = try self.gpa.alloc(*ast.Stmt, 3);
+        stmts[0] = s1;
+        stmts[1] = s2;
+        stmts[2] = s3;
+        return .{ .block = stmts };
+    }
+
     fn parseBlock(self: *Parser) ParseError![]*ast.Stmt {
         _ = try self.expect(.l_brace);
         var stmts: std.ArrayList(*ast.Stmt) = .empty;
@@ -396,8 +451,10 @@ pub const Parser = struct {
                 s.* = .{ .expr_stmt = e };
             },
             else => {
-                // var decl or expr stmt
-                if (self.isTypeStart()) {
+                // (type name, type name) = expr  — paired ext-ptr declaration shorthand
+                if (t.kind == .l_paren and self.isPairDeclStart()) {
+                    s.* = try self.parsePairDecl(t.loc);
+                } else if (self.isTypeStart()) {
                     s.* = try self.parseLocalVarDecl();
                 } else {
                     const e = try self.parseExpr();

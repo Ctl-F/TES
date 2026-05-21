@@ -17,8 +17,9 @@ pub const TokenKind = enum {
     kw_page, kw_offset,
     // type keywords
     ty_u8, ty_u16, ty_i8, ty_i16, ty_u8_vec2, ty_i8_vec2,
-    // preprocessor
-    prep_include,
+    // preprocessor / assembler passthrough
+    prep_passthrough, // any #directive line — passed verbatim to asm output
+    dollar_ident,     // $TOKEN or ${EXPRESSION} — passed verbatim inside asm lines
     // punctuation
     l_brace, r_brace, l_paren, r_paren, l_bracket, r_bracket,
     semi, comma, colon, dot, star, amp,
@@ -133,13 +134,27 @@ pub const Lexer = struct {
         const c = self.cur();
 
         if (c == '#') {
-            self.bump();
-            const ds = self.pos;
-            while (std.ascii.isAlphabetic(self.cur())) self.bump();
-            const dir = self.src[ds..self.pos];
-            if (std.mem.eql(u8, dir, "include"))
-                return Token{ .kind = .prep_include, .text = self.src[s..self.pos], .loc = .{ .file = self.file, .line = l, .col = c2 } };
-            return LexError.UnexpectedChar;
+            // Consume the rest of the line verbatim and pass it through to the assembler.
+            while (self.cur() != '\n' and self.cur() != 0) self.bump();
+            return Token{ .kind = .prep_passthrough, .text = self.src[s..self.pos], .loc = .{ .file = self.file, .line = l, .col = c2 } };
+        }
+
+        if (c == '$') {
+            self.bump(); // consume '$'
+            if (self.cur() == '{') {
+                // ${expression} — read until the matching '}'
+                self.bump(); // consume '{'
+                var depth: usize = 1;
+                while (self.pos < self.src.len and depth > 0) {
+                    if (self.cur() == '{') depth += 1;
+                    if (self.cur() == '}') depth -= 1;
+                    self.bump();
+                }
+            } else {
+                // $identifier
+                while (std.ascii.isAlphanumeric(self.cur()) or self.cur() == '_') self.bump();
+            }
+            return Token{ .kind = .dollar_ident, .text = self.src[s..self.pos], .loc = .{ .file = self.file, .line = l, .col = c2 } };
         }
 
         if (std.ascii.isAlphabetic(c) or c == '_') {

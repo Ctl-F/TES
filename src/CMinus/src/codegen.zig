@@ -4,19 +4,20 @@ const sema_mod = @import("sema.zig");
 const Sema = sema_mod.Sema;
 
 // ─── Register constants ────────────────────────────────────────────────────────
-// Param registers: R0-R7 (8 params max)
-// Local scratch:   RA-RD (4 slots, callee-saved)
-// Expr temps:      R8 (primary), R9 (secondary)
-// Call setup:      RE (target offset), RF (target page)
-// Return addr:     JR, JRH (callee-saved pair)
+// Allocation order for local variables:
+//   1. ra..rd  — callee-saved; always available; must be pushed/popped by this function
+//   2. r9..r1  — caller-saved; available only when this function makes no real calls
+//              (no push/pop needed — callee clobbers are the caller's problem)
+//   r0 excluded — return-value register, cannot hold a persistent local
+//   re, rf     — reserved as expression temporaries (EXPR_TEMP / EXPR_TEMP2);
+//                also double as CALL_OFFSET / CALL_PAGE for ext_call
+// Return addr:   JR, JRH (callee-saved pair, handled via push jr / pop jr)
 
-const MAX_LOCALS = 4;
-const SCRATCH_REGS = [MAX_LOCALS][]const u8{ "ra", "rb", "rc", "rd" };
+const LOCAL_POOL_HAS_CALLS = [_][]const u8{ "ra", "rb", "rc", "rd" };
+const LOCAL_POOL_NO_CALLS  = [_][]const u8{ "ra", "rb", "rc", "rd", "r9", "r8", "r7", "r6", "r5", "r4", "r3", "r2", "r1" };
 const PARAM_REGS = [_][]const u8{ "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7" };
-const EXPR_TEMP = "r8";
-const EXPR_TEMP2 = "r9";
-const CALL_PAGE = "rf";
-const CALL_OFFSET = "re";
+const EXPR_TEMP   = "re"; // doubles as CALL_OFFSET
+const EXPR_TEMP2  = "rf"; // doubles as CALL_PAGE
 
 pub const CodegenError = error{
     TooManyLocals,
@@ -36,18 +37,23 @@ pub const Codegen = struct {
     sema: *const Sema,
     label_counter: u32 = 0,
 
-    // Per-function state — reset in beginFn
+    // Inline function registry — populated in generate() before emission
+    inline_fns: std.StringHashMapUnmanaged(*const ast.FnDecl) = .{},
+
+    // Per-function state — reset in resetFn
     fn_name: []const u8 = "",
     fn_ret_label: []const u8 = "",
+    fn_local_pool: []const []const u8 = &LOCAL_POOL_HAS_CALLS,
     locals: std.StringHashMapUnmanaged(LocalInfo) = .{},
     const_vals: std.StringHashMapUnmanaged(i64) = .{},
-    scratch_used: u3 = 0, // how many scratch regs allocated so far
+    scratch_used: usize = 0, // how many pool slots consumed so far
 
     pub fn init(gpa: std.mem.Allocator, s: *const Sema) Codegen {
         return .{ .gpa = gpa, .sema = s };
     }
 
     pub fn deinit(self: *Codegen) void {
+        self.inline_fns.deinit(self.gpa);
         self.locals.deinit(self.gpa);
         self.const_vals.deinit(self.gpa);
     }
@@ -59,12 +65,12 @@ pub const Codegen = struct {
     }
 
     fn nextScratch(self: *Codegen) CodegenError![]const u8 {
-        if (self.scratch_used >= MAX_LOCALS) {
-            std.debug.print("error: too many local variables in function '{s}' (max {})\n",
-                .{ self.fn_name, MAX_LOCALS });
+        if (self.scratch_used >= self.fn_local_pool.len) {
+            std.debug.print("error: too many local variables in function '{s}' (max {} with current pool)\n",
+                .{ self.fn_name, self.fn_local_pool.len });
             return CodegenError.TooManyLocals;
         }
-        const reg = SCRATCH_REGS[self.scratch_used];
+        const reg = self.fn_local_pool[self.scratch_used];
         self.scratch_used += 1;
         return reg;
     }
@@ -75,13 +81,31 @@ pub const Codegen = struct {
         self.scratch_used = 0;
         self.fn_name = "";
         self.fn_ret_label = "";
+        self.fn_local_pool = &LOCAL_POOL_HAS_CALLS;
+    }
+
+    // ra..rf are callee-saved; r0..r9 are caller-saved
+    fn isCalleeSavedReg(reg: []const u8) bool {
+        return reg.len == 2 and reg[0] == 'r' and reg[1] >= 'a' and reg[1] <= 'f';
+    }
+
+    // Returns true for expressions that are safe to emit directly into any
+    // destination register without risking a function call clobbering other registers.
+    fn isLeafExpr(e: *const ast.Expr) bool {
+        return switch (e.*) {
+            .int_lit, .undefined_val, .string_lit => true,
+            .ident => true,
+            .dot_len => true,
+            .unary => |u| u.op == .addr_of,
+            else => false,
+        };
     }
 
     // ─── Pre-scan to count locals ──────────────────────────────────────────────
 
     fn countLocalsInStmt(s: *const ast.Stmt) u32 {
         return switch (s.*) {
-            .var_decl => 1,
+            .var_decl => |vd| if (vd.reg_hint == null) 1 else 0,
             .block => |stmts| blk: {
                 var n: u32 = 0;
                 for (stmts) |st| n += countLocalsInStmt(st);
@@ -105,17 +129,167 @@ pub const Codegen = struct {
         };
     }
 
+    // ─── Helpers ───────────────────────────────────────────────────────────────
+
+    fn exprHasRealCall(self: *const Codegen, e: *const ast.Expr) bool {
+        return switch (e.*) {
+            .call => |c| blk: {
+                const name = switch (c.callee.*) {
+                    .ident => |id| id.name,
+                    else => break :blk true,
+                };
+                break :blk !self.inline_fns.contains(name);
+            },
+            .ext_call => true,
+            .unary    => |u|  self.exprHasRealCall(u.operand),
+            .binary   => |b|  self.exprHasRealCall(b.lhs) or self.exprHasRealCall(b.rhs),
+            .ternary  => |t|  self.exprHasRealCall(t.cond) or self.exprHasRealCall(t.then_val) or self.exprHasRealCall(t.else_val),
+            .index    => |idx| self.exprHasRealCall(idx.base) or self.exprHasRealCall(idx.idx),
+            .field    => |f|  self.exprHasRealCall(f.base),
+            .dot_len  => |dl| self.exprHasRealCall(dl.base),
+            .ext_ptr  => |ep| self.exprHasRealCall(ep.page_expr) or self.exprHasRealCall(ep.addr_expr),
+            .ext_deref => |ed| self.exprHasRealCall(ed.page_expr) or self.exprHasRealCall(ed.addr_expr),
+            else => false,
+        };
+    }
+
+    fn stmtHasRealCall(self: *const Codegen, s: *const ast.Stmt) bool {
+        return switch (s.*) {
+            .expr_stmt  => |e|  self.exprHasRealCall(e),
+            .var_decl   => |vd| if (vd.init) |i| self.exprHasRealCall(i) else false,
+            .const_decl => |cd| self.exprHasRealCall(cd.value),
+            .return_stmt => |rs| if (rs.value) |v| self.exprHasRealCall(v) else false,
+            .block => |stmts| blk: {
+                for (stmts) |st| if (self.stmtHasRealCall(st)) break :blk true;
+                break :blk false;
+            },
+            .if_stmt => |is| self.exprHasRealCall(is.cond) or
+                             self.stmtHasRealCall(is.then_stmt) or
+                             (if (is.else_stmt) |es| self.stmtHasRealCall(es) else false),
+            .while_stmt  => |ws| self.exprHasRealCall(ws.cond) or self.stmtHasRealCall(ws.body),
+            .do_while    => |dw| self.exprHasRealCall(dw.cond) or self.stmtHasRealCall(dw.body),
+            .for_stmt => |fs| (if (fs.init) |i| self.stmtHasRealCall(i) else false) or
+                              (if (fs.cond) |c| self.exprHasRealCall(c) else false) or
+                              (if (fs.update) |u| self.exprHasRealCall(u) else false) or
+                              self.stmtHasRealCall(fs.body),
+            .inline_for  => |ilf| self.stmtHasRealCall(ilf.body),
+            .asm_block, .break_stmt, .continue_stmt => false,
+        };
+    }
+
+    fn fnHasRealCalls(self: *const Codegen, fd: *const ast.FnDecl) bool {
+        for (fd.body) |s| if (self.stmtHasRealCall(s)) return true;
+        return false;
+    }
+
+    // ─── Branch detection — for push jr / pop jr elision ──────────────────────
+    // Any BN/BNT/BNF/B/BT/BF in the function body (excluding the epilogue's b jr)
+    // clobbers JR. If none are present, we can skip push jr / pop jr entirely.
+
+    fn asmBlockHasBranches(lines: []const []const u8) bool {
+        const mnemonics = [_][]const u8{ "bnt", "bnf", "bn", "bt", "bf", "b" };
+        for (lines) |line| {
+            const t = std.mem.trim(u8, line, " \t;");
+            for (mnemonics) |m| {
+                if (std.mem.startsWith(u8, t, m)) {
+                    const rest = t[m.len..];
+                    if (rest.len == 0 or rest[0] == ' ' or rest[0] == '\t') return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    fn exprHasBranches(self: *const Codegen, e: *const ast.Expr) bool {
+        return switch (e.*) {
+            .call => |c| blk: {
+                const name = switch (c.callee.*) {
+                    .ident => |id| id.name,
+                    else => break :blk true,
+                };
+                // Inline naked asm: we emit the asm lines verbatim — check those.
+                if (self.inline_fns.get(name)) |ifd| {
+                    if (isNakedAsmFn(ifd)) {
+                        break :blk asmBlockHasBranches(ifd.body[0].asm_block.lines);
+                    }
+                }
+                break :blk true; // non-inline call emits bn
+            },
+            .ext_call => true,
+            .ternary  => true, // genTernary emits bnf / bn
+            .unary    => |u|   self.exprHasBranches(u.operand),
+            .binary   => |b|   self.exprHasBranches(b.lhs) or self.exprHasBranches(b.rhs),
+            .index    => |idx| self.exprHasBranches(idx.base) or self.exprHasBranches(idx.idx),
+            .field    => |f|   self.exprHasBranches(f.base),
+            .dot_len  => |dl|  self.exprHasBranches(dl.base),
+            .ext_ptr  => |ep|  self.exprHasBranches(ep.page_expr) or self.exprHasBranches(ep.addr_expr),
+            .ext_deref => |ed| self.exprHasBranches(ed.page_expr) or self.exprHasBranches(ed.addr_expr),
+            else => false,
+        };
+    }
+
+    fn stmtHasBranches(self: *const Codegen, s: *const ast.Stmt) bool {
+        return switch (s.*) {
+            .if_stmt, .while_stmt, .do_while, .for_stmt => true,
+            .return_stmt => true, // emits bn to ret_label
+            .inline_for => |ilf| blk: {
+                // Fully unrolled with comptime bounds: no loop branches, but body may have some
+                if (ilf.start.* != .int_lit or ilf.end.* != .int_lit) break :blk true;
+                break :blk self.stmtHasBranches(ilf.body);
+            },
+            .block => |stmts| blk: {
+                for (stmts) |st| if (self.stmtHasBranches(st)) break :blk true;
+                break :blk false;
+            },
+            .expr_stmt   => |e|  self.exprHasBranches(e),
+            .var_decl    => |vd| if (vd.init) |i| self.exprHasBranches(i) else false,
+            .const_decl  => |cd| self.exprHasBranches(cd.value),
+            .asm_block   => |ab| asmBlockHasBranches(ab.lines),
+            .break_stmt, .continue_stmt => false,
+        };
+    }
+
+    fn fnHasBranches(self: *const Codegen, fd: *const ast.FnDecl) bool {
+        for (fd.body) |s| if (self.stmtHasBranches(s)) return true;
+        return false;
+    }
+
+    fn isNakedAsmFn(fd: *const ast.FnDecl) bool {
+        if (fd.body.len != 1) return false;
+        if (fd.body[0].* != .asm_block) return false;
+        for (fd.params) |p| {
+            if (p.reg_hint == null) return false;
+        }
+        return true;
+    }
+
     // ─── Public generate entry point ───────────────────────────────────────────
 
     pub fn generate(self: *Codegen, file: *const ast.File, writer: anytype) !void {
+        // ── Collect inline functions ───────────────────────────────────────────
+        for (file.decls) |*decl| {
+            if (decl.* == .fn_decl and decl.fn_decl.is_inline) {
+                try self.inline_fns.put(self.gpa, decl.fn_decl.name, &decl.fn_decl);
+            }
+        }
+
+        // ── Passthrough directives (#include, #define, etc.) ──────────────────
+        // Emitted verbatim at the top so the assembler preprocessor sees them first.
+        for (file.decls) |*decl| {
+            if (decl.* == .passthrough) {
+                try writer.print("{s}\n", .{decl.passthrough});
+            }
+        }
+
         // ── Data section ──────────────────────────────────────────────────────
         try self.emitDataSection(file, writer);
 
         // ── Code section ──────────────────────────────────────────────────────
-        try writer.print("\n[Code({d}:0x0000)]\n", .{sema_mod.CODE_PAGE});
+        try writer.writeAll("\n[Program]\n");
 
         for (file.decls) |*decl| {
             if (decl.* == .fn_decl) {
+                if (decl.fn_decl.is_inline) continue; // inlined at call sites
                 try self.genFunction(&decl.fn_decl, writer);
             }
         }
@@ -197,15 +371,44 @@ pub const Codegen = struct {
         self.resetFn();
         self.fn_name = fd.name;
 
-        // Count params + locals for scratch reg pre-allocation
-        const param_count = fd.params.len;
-        var local_count: u32 = 0;
-        for (fd.body) |s| local_count += countLocalsInStmt(s);
+        // Emit function label
+        if (std.mem.eql(u8, fd.name, "main")) try writer.writeAll("_start:\n");
+        try writer.print("_cm_{s}:\n", .{fd.name});
 
-        const total = param_count + local_count;
-        if (total > MAX_LOCALS) {
-            std.debug.print("error: function '{s}': too many vars ({} params + {} locals > {})\n",
-                .{ fd.name, param_count, local_count, MAX_LOCALS });
+        // ── Naked asm function ────────────────────────────────────────────────
+        // Single asm block + all params register-pinned.
+        // Only save/restore jr if the asm itself contains branch instructions.
+        if (isNakedAsmFn(fd)) {
+            for (fd.params) |p| {
+                try self.locals.put(self.gpa, p.name, .{ .reg = p.reg_hint.?, .type_expr = p.type_expr });
+            }
+            const save_jr = asmBlockHasBranches(fd.body[0].asm_block.lines);
+            if (save_jr) try writer.writeAll("    push jr\n");
+            for (fd.body[0].asm_block.lines) |line| try writer.print("    {s}\n", .{line});
+            if (save_jr) try writer.writeAll("    pop jr\n");
+            try writer.writeAll("    b jr\n\n");
+            return;
+        }
+
+        // ── Normal function ───────────────────────────────────────────────────
+        // Pick local pool: if the function makes real calls, locals must survive across
+        // them, so only callee-saved ra..rd are safe. If no real calls, we can also
+        // use caller-saved r9..r1 without any push/pop overhead.
+        self.fn_local_pool = if (self.fnHasRealCalls(fd))
+            &LOCAL_POOL_HAS_CALLS
+        else
+            &LOCAL_POOL_NO_CALLS;
+
+        // Count pool slots needed: non-hinted params + non-hinted body locals.
+        var scratch_param_count: usize = 0;
+        for (fd.params) |p| if (p.reg_hint == null) { scratch_param_count += 1; };
+        var local_count: usize = 0;
+        for (fd.body) |s| local_count += countLocalsInStmt(s);
+        const total_scratch = scratch_param_count + local_count;
+
+        if (total_scratch > self.fn_local_pool.len) {
+            std.debug.print("error: function '{s}': too many vars ({} + {} > {} available)\n",
+                .{ fd.name, scratch_param_count, local_count, self.fn_local_pool.len });
             return CodegenError.TooManyLocals;
         }
 
@@ -213,32 +416,38 @@ pub const Codegen = struct {
         const ret_lbl_n = self.newLabel();
         self.fn_ret_label = try std.fmt.allocPrint(self.gpa, "_cm_L_{}", .{ret_lbl_n});
 
-        // Emit function label
-        if (std.mem.eql(u8, fd.name, "main")) {
-            try writer.writeAll("main:\n");
-        }
-        try writer.print("_cm_{s}:\n", .{fd.name});
-
         // ── Prologue ──────────────────────────────────────────────────────────
-        // Allocate scratch regs for params first
+        // Assign param registers: pinned params use their hint; others take from pool.
         for (fd.params) |p| {
-            const reg = try self.nextScratch();
-            try self.locals.put(self.gpa, p.name, .{ .reg = reg, .type_expr = p.type_expr });
-        }
-        const scratch_count = self.scratch_used + @as(u3, @intCast(local_count));
-        _ = scratch_count; // used implicitly below via scratch_used at end
-
-        try writer.writeAll("    push jrh\n");
-        try writer.writeAll("    push jr\n");
-
-        // Push scratch regs we'll use (params already counted, locals will be added)
-        // We need to push exactly (total) scratch regs. Since we know total upfront, push them all.
-        for (0..total) |i| {
-            try writer.print("    push {s}\n", .{SCRATCH_REGS[i]});
+            if (p.reg_hint) |hint| {
+                try self.locals.put(self.gpa, p.name, .{ .reg = hint, .type_expr = p.type_expr });
+            } else {
+                const reg = try self.nextScratch();
+                try self.locals.put(self.gpa, p.name, .{ .reg = reg, .type_expr = p.type_expr });
+            }
         }
 
-        // Copy params from R0-Rn into their scratch regs
+        // Only save jr if the body contains branch instructions. Any bn/bnt/bnf/b/bt/bf
+        // clobbers jr, so flat functions (no control flow, no calls) don't need it.
+        const save_jr = self.fnHasBranches(fd);
+        if (save_jr) try writer.writeAll("    push jr\n");
+
+        // Push only callee-saved regs (ra..rf) from the pool slots we'll use.
+        // Caller-saved slots (r9..r1) need no push/pop — the caller doesn't expect us
+        // to preserve them.
+        var push_regs: [16][]const u8 = undefined;
+        var push_count: usize = 0;
+        for (self.fn_local_pool[0..total_scratch]) |reg| {
+            if (isCalleeSavedReg(reg)) {
+                push_regs[push_count] = reg;
+                push_count += 1;
+            }
+        }
+        for (push_regs[0..push_count]) |reg| try writer.print("    push {s}\n", .{reg});
+
+        // Copy non-hinted params from r0..rN (calling convention) into their pool reg.
         for (fd.params, 0..) |p, i| {
+            if (p.reg_hint != null) continue;
             const local = self.locals.get(p.name).?;
             if (!std.mem.eql(u8, local.reg, PARAM_REGS[i])) {
                 try writer.print("    mov {s}, {s}\n", .{ local.reg, PARAM_REGS[i] });
@@ -246,26 +455,16 @@ pub const Codegen = struct {
         }
 
         // ── Body ──────────────────────────────────────────────────────────────
-        for (fd.body) |s| {
-            try self.genStmt(s, writer);
-        }
+        for (fd.body) |s| try self.genStmt(s, writer);
 
         // ── Epilogue ──────────────────────────────────────────────────────────
         try writer.print("{s}:\n", .{self.fn_ret_label});
+        if (fd.return_type != .void) try writer.print("    mov r0, {s}\n", .{EXPR_TEMP});
 
-        // Move return value from R8 to R0 (if not void and not already there)
-        if (fd.return_type != .void) {
-            try writer.print("    mov r0, {s}\n", .{EXPR_TEMP});
-        }
-
-        // Pop scratch regs in reverse order
-        var i: usize = total;
-        while (i > 0) {
-            i -= 1;
-            try writer.print("    pop {s}\n", .{SCRATCH_REGS[i]});
-        }
-        try writer.writeAll("    pop jr\n");
-        try writer.writeAll("    pop jrh\n");
+        // Pop callee-saved regs in reverse order.
+        var i: usize = push_count;
+        while (i > 0) { i -= 1; try writer.print("    pop {s}\n", .{push_regs[i]}); }
+        if (save_jr) try writer.writeAll("    pop jr\n");
         try writer.writeAll("    b jr\n\n");
     }
 
@@ -318,7 +517,7 @@ pub const Codegen = struct {
     }
 
     fn genVarDecl(self: *Codegen, vd: *const ast.VarDecl, writer: anytype) !void {
-        const reg = try self.nextScratch();
+        const reg = if (vd.reg_hint) |hint| hint else try self.nextScratch();
         try self.locals.put(self.gpa, vd.name, .{ .reg = reg, .type_expr = vd.type_expr });
 
         if (vd.init) |init_expr| {
@@ -440,7 +639,56 @@ pub const Codegen = struct {
     }
 
     // ─── Expression generation ─────────────────────────────────────────────────
-    // Result is always in EXPR_TEMP (r8) after genExpr returns.
+    // Result is always in EXPR_TEMP (re) after genExpr returns.
+
+    // Like genExpr but emits directly into `dest` for simple cases that don't
+    // need the EXPR_TEMP round-trip: ident, int_lit, and compile-time dot_len.
+    // Falls back to genExpr + mov for everything else.
+    fn genExprInto(self: *Codegen, e: *const ast.Expr, dest: []const u8, writer: anytype) anyerror!void {
+        switch (e.*) {
+            .int_lit => |il| {
+                try writer.print("    mov {s}, {}\n", .{ dest, il.value });
+            },
+            .ident => |id| {
+                if (self.const_vals.get(id.name)) |cv| {
+                    try writer.print("    mov {s}, {}\n", .{ dest, cv });
+                } else if (self.locals.get(id.name)) |local| {
+                    if (!std.mem.eql(u8, dest, local.reg)) {
+                        try writer.print("    mov {s}, {s}\n", .{ dest, local.reg });
+                    }
+                    // dest == local.reg: already there, no-op
+                } else {
+                    try self.genExpr(e, writer);
+                    if (!std.mem.eql(u8, dest, EXPR_TEMP)) {
+                        try writer.print("    mov {s}, {s}\n", .{ dest, EXPR_TEMP });
+                    }
+                }
+            },
+            .dot_len => |dl| {
+                if (dl.base.* == .ident) {
+                    if (self.sema.globals.get(dl.base.ident.name)) |gi| {
+                        const len: u32 = switch (gi.type_expr) {
+                            .flex_array => gi.array_len,
+                            .array => |arr| arr.size,
+                            else => 1,
+                        };
+                        try writer.print("    mov {s}, {}\n", .{ dest, len });
+                        return;
+                    }
+                }
+                try self.genExpr(e, writer);
+                if (!std.mem.eql(u8, dest, EXPR_TEMP)) {
+                    try writer.print("    mov {s}, {s}\n", .{ dest, EXPR_TEMP });
+                }
+            },
+            else => {
+                try self.genExpr(e, writer);
+                if (!std.mem.eql(u8, dest, EXPR_TEMP)) {
+                    try writer.print("    mov {s}, {s}\n", .{ dest, EXPR_TEMP });
+                }
+            },
+        }
+    }
 
     fn genExpr(self: *Codegen, e: *const ast.Expr, writer: anytype) anyerror!void {
         switch (e.*) {
@@ -678,20 +926,7 @@ pub const Codegen = struct {
             return CodegenError.UnsupportedExpr;
         }
 
-        // Compute each argument and push onto stack
-        for (c.args) |arg| {
-            try self.genExpr(arg, writer);
-            try writer.print("    push {s}\n", .{EXPR_TEMP});
-        }
-
-        // Pop args in reverse into param registers
-        var i = c.args.len;
-        while (i > 0) {
-            i -= 1;
-            try writer.print("    pop {s}\n", .{PARAM_REGS[i]});
-        }
-
-        // Resolve callee
+        // Resolve callee name first
         const callee_name = switch (c.callee.*) {
             .ident => |id| id.name,
             else => {
@@ -700,12 +935,55 @@ pub const Codegen = struct {
             },
         };
 
-        const ret_lbl = self.newLabel();
-        try writer.print("    lea {s}, {s}, _cm_{s}\n", .{ CALL_PAGE, CALL_OFFSET, callee_name });
-        try writer.print("    lea jrh, jr, _cm_L_{}\n", .{ret_lbl});
-        try writer.print("    b {s}, {s}\n", .{ CALL_PAGE, CALL_OFFSET });
-        try writer.print("_cm_L_{}:\n", .{ret_lbl});
-        // Result from callee is in R0; move to EXPR_TEMP for chaining
+        // Inline function: emit body directly at the call site
+        if (self.inline_fns.get(callee_name)) |ifd| {
+            if (isNakedAsmFn(ifd)) {
+                // Move each arg directly into its pinned register — no stack needed
+                // for simple args (ident/literal/dot_len). Complex args fall back to
+                // EXPR_TEMP + mov, which is still one fewer instruction than push/pop.
+                for (c.args, 0..) |arg, i| {
+                    const hint = ifd.params[i].reg_hint.?;
+                    try self.genExprInto(arg, hint, writer);
+                }
+                // Emit asm block inline — no push/pop jr for an inlined call
+                const ab = ifd.body[0].asm_block;
+                for (ab.lines) |line| {
+                    try writer.print("    {s}\n", .{line});
+                }
+                if (ifd.return_type != .void) {
+                    try writer.print("    mov {s}, r0\n", .{EXPR_TEMP});
+                }
+                return;
+            }
+            // Non-naked inline fn: fall through to a regular call.
+            // Full general inlining of arbitrary bodies is not yet implemented.
+        }
+
+        // Regular call.
+        // If every arg is a leaf expression (ident/literal/dot_len/&ident), emit
+        // them directly into their param registers — no stack traffic needed.
+        // Otherwise fall back to push/pop, which is safe for any expression.
+        var all_leaf = true;
+        for (c.args) |arg| if (!isLeafExpr(arg)) { all_leaf = false; break; };
+
+        if (all_leaf) {
+            for (c.args, 0..) |arg, i| {
+                try self.genExprInto(arg, PARAM_REGS[i], writer);
+            }
+        } else {
+            for (c.args) |arg| {
+                try self.genExpr(arg, writer);
+                try writer.print("    push {s}\n", .{EXPR_TEMP});
+            }
+            var i = c.args.len;
+            while (i > 0) {
+                i -= 1;
+                try writer.print("    pop {s}\n", .{PARAM_REGS[i]});
+            }
+        }
+
+        // bn saves IP+1 to JR then jumps — the correct TES call instruction
+        try writer.print("    bn _cm_{s}\n", .{callee_name});
         try writer.print("    mov {s}, r0\n", .{EXPR_TEMP});
     }
 
@@ -731,17 +1009,21 @@ pub const Codegen = struct {
             try writer.print("    pop {s}\n", .{PARAM_REGS[i]});
         }
 
-        // Load target address into CALL_PAGE:CALL_OFFSET
-        try self.genExpr(ec.page_expr, writer);
-        try writer.print("    mov {s}, {s}\n", .{ CALL_PAGE, EXPR_TEMP });
-        try self.genExpr(ec.addr_expr, writer);
-        try writer.print("    mov {s}, {s}\n", .{ CALL_OFFSET, EXPR_TEMP });
+        // Load target address: page → rf (EXPR_TEMP2), offset → re (EXPR_TEMP)
+        try self.genExpr(ec.page_expr, writer);       // re = page
+        try writer.print("    mov {s}, {s}\n", .{ EXPR_TEMP2, EXPR_TEMP }); // rf = page
+        try self.genExpr(ec.addr_expr, writer);       // re = offset (rf still holds page)
 
-        const ret_lbl = self.newLabel();
-        try writer.print("    lea jrh, jr, _cm_L_{}\n", .{ret_lbl});
-        try writer.print("    b {s}, {s}\n", .{ CALL_PAGE, CALL_OFFSET });
-        try writer.print("_cm_L_{}:\n", .{ret_lbl});
-        try writer.print("    mov {s}, r0\n", .{EXPR_TEMP});
+        // Trampoline: bn sets JR = instruction after bn, then b rf,re does the cross-page jump.
+        // The callee returns via b jr back to the instruction after the bn.
+        const tramp_lbl = self.newLabel();
+        const done_lbl = self.newLabel();
+        try writer.print("    bn _cm_L_{}\n", .{tramp_lbl});  // JR = next instr, jump to trampoline
+        try writer.print("    mov {s}, r0\n", .{EXPR_TEMP});  // callee returned here
+        try writer.print("    bn _cm_L_{}\n", .{done_lbl});   // skip over trampoline
+        try writer.print("_cm_L_{}:\n", .{tramp_lbl});
+        try writer.print("    b {s}, {s}\n", .{ EXPR_TEMP2, EXPR_TEMP }); // b rf, re
+        try writer.print("_cm_L_{}:\n", .{done_lbl});
     }
 
     fn genIndex(self: *Codegen, idx: anytype, writer: anytype) !void {
@@ -887,14 +1169,13 @@ pub const Codegen = struct {
             return CodegenError.InvalidLValue;
         };
 
-        // RHS: addr_of(ident) → gives (page, offset) of the global
+        // RHS: addr_of(ident) → emit lea to load the 32-bit symbol address into (psr, por)
         switch (rhs.*) {
             .unary => |u| if (u.op == .addr_of) {
                 switch (u.operand.*) {
                     .ident => |id| {
-                        if (self.sema.globals.get(id.name)) |gi| {
-                            try writer.print("    mov {s}, {}\n", .{ psr_reg, gi.page });
-                            try writer.print("    mov {s}, 0x{X:0>4}\n", .{ por_reg, gi.offset });
+                        if (self.sema.globals.get(id.name) != null) {
+                            try writer.print("    lea {s}, {s}, _cm_g_{s}\n", .{ psr_reg, por_reg, id.name });
                             return;
                         }
                         std.debug.print("error: '{s}' is not a global variable\n", .{id.name});
@@ -905,8 +1186,7 @@ pub const Codegen = struct {
             },
             .string_lit => |sl| {
                 if (self.sema.findStringLit(sl.raw)) |lit| {
-                    try writer.print("    mov {s}, {}\n", .{ psr_reg, lit.page });
-                    try writer.print("    mov {s}, 0x{X:0>4}\n", .{ por_reg, lit.offset });
+                    try writer.print("    lea {s}, {s}, {s}\n", .{ psr_reg, por_reg, lit.label });
                     return;
                 }
             },

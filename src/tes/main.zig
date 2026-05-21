@@ -27,6 +27,17 @@ pub fn main(init: std.process.Init) !void {
         return;
     };
 
+    if (std.mem.eql(u8, binaryPath, "--emit-headers")) {
+        const headerPath = args.next() orelse {
+            std.debug.print("Expected header output path\n", .{});
+            return;
+        };
+
+        try generateHeaders(headerPath);
+        std.debug.print("Headers were generated to: {s}\n", .{headerPath});
+        return;
+    }
+
     const blob = try readFile(init.io, allocator, binaryPath);
     defer allocator.free(blob);
     var binary = try Binary.parseBinary(blob, allocator);
@@ -61,13 +72,86 @@ pub fn main(init: std.process.Init) !void {
 
 pub fn frameBarrier(vm: *tes_core.vm.TESVM) anyerror!void {
     try InputExtension.IOPoll(vm);
-    try GraphicsExtension.presentGFX(vm);
+    try GraphicsExtension.presentGraphics();
 }
 
 // Exported for web
 // export fn wasm_main() void {
 //     main() catch {};
 // }
+
+fn generateHeaders(path: [:0]const u8) !void {
+    const cwd = try std.Io.Dir.openDir(std.Io.Dir.cwd(), mainIO, path, .{});
+    defer cwd.close(mainIO);
+
+    var file = try cwd.createFile(mainIO, "stdmap.tes", .{});
+    defer {
+        file.close(mainIO);
+    }
+
+    var buffer: [1024]u8 = undefined;
+
+    var writer = file.writer(mainIO, &buffer);
+    defer {
+        writer.flush() catch {
+            std.debug.print("Failed to flush output to file\n", .{});
+        };
+    }
+    var ofs = &writer.interface;
+
+    try ofs.writeAll("#once\n[Meta]\n");
+
+    const MMMap = @import("extensions/mmioHeader.zig").MMMap;
+    const mmInfo = @typeInfo(MMMap).@"struct";
+    try writeStruct(ofs, "MMMap", MMMap, mmInfo);
+}
+
+fn writeStruct(ofs: *std.Io.Writer, name: []const u8, comptime structType: type, structInfo: std.builtin.Type.Struct) !void {
+    try ofs.writeAll("struct ");
+    try ofs.writeAll(name);
+    try ofs.writeAll(" {\n");
+
+    inline for (structInfo.fields) |fieldInfo| {
+        try ofs.writeAll("    ");
+        try ofs.writeAll(fieldInfo.name);
+        try ofs.writeAll(": ");
+        try ofs.writeAll(@typeName(fieldInfo.type));
+        try ofs.writeAll(";\n");
+    }
+
+    try ofs.writeAll("};\n\n");
+
+    var formatBuffer: [2048]u8 = undefined;
+
+    inline for (structInfo.decls) |decl| {
+        const v = @field(structType, decl.name);
+        const t = @TypeOf(v);
+        const i = @typeInfo(t);
+
+        switch (i) {
+            .@"struct" => |sInfo| {
+                try writeStruct(ofs, t, decl.name, sInfo);
+            },
+            .@"enum" => |eInfo| {
+                try writeEnum(ofs, decl.name, eInfo);
+            },
+            .int, .comptime_int => {
+                const slice = try std.fmt.bufPrint(&formatBuffer, "#define {s} {}\n", .{ decl.name, v });
+                try ofs.writeAll(slice);
+            },
+            else => {},
+        }
+    }
+}
+
+fn writeEnum(ofs: *std.Io.Writer, name: []const u8, eInfo: std.builtin.Type.Enum) !void {
+    var formatBuffer: [2048]u8 = undefined;
+
+    inline for (eInfo.fields) |field| {
+        const slice = try std.fmt.bufPrint(&formatBuffer, "#define {s}_{s} {}\n", .{ name, field.name, field.value });
+        try ofs.writeAll(slice);
+    }
+}
 
 test "native-tes basic test" {
     try std.testing.expect(true);
