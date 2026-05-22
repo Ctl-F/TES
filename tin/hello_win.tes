@@ -52,8 +52,10 @@ _init_gpu:
     mov [re, (MemIOMap.gpu.clearColor.r)rf], ra;
     mov [re, (MemIOMap.gpu.clearColor.b)rf], ra;
 
-    mov ra, 64;
+    mov ra, 200;
     mov (byte)[re, (MemIOMap.gpu.clearColor.b)rf], ra;
+    mov ra, 255;
+    mov (byte)[re, (MemIOMap.gpu.clearColor.a)rf], ra;
 
     ; enable clear
     ; for optimizations we could move this up to

@@ -267,12 +267,6 @@ pub const vGPU = struct {
         native.glBindFramebuffer(native.GL_FRAMEBUFFER, this.context.fbo);
         native.glViewport(0, 0, this.context.width, this.context.height);
 
-        if (header.clearEnable != 0) {
-            const color = header.clearColor.normalize();
-            native.glClearColor(color.r, color.g, color.b, color.a);
-            native.glClear(native.GL_COLOR_BUFFER_BIT);
-        }
-
         for (&this.layers, 0..) |*layer, idx| {
             const mask: u16 = @as(u16, 1) << @as(u4, @truncate(idx));
             if (this.layerMask & mask == 0) continue;
@@ -285,14 +279,28 @@ pub const vGPU = struct {
         native.glBindFramebuffer(native.GL_FRAMEBUFFER, 0);
         native.glViewport(0, 0, @intCast(this.context.windowWidth), @intCast(this.context.windowHeight));
 
+        if (header.clearEnable != 0) {
+            const color = header.clearColor.normalize();
+            native.glClearColor(color.r, color.g, color.b, color.a);
+            native.glClear(native.GL_COLOR_BUFFER_BIT);
+        }
+
         native.glBindVertexArray(this.context.compositeVao);
         native.glBindBuffer(native.GL_ARRAY_BUFFER, this.context.compositeVbo);
+
+        native.glActiveTexture(native.GL_TEXTURE0);
+        native.glBindTexture(native.GL_TEXTURE_2D_ARRAY, this.context.layerTextureArray);
+
+        native.glEnable(native.GL_BLEND);
+        native.glBlendFunc(native.GL_SRC_ALPHA, native.GL_ONE_MINUS_SRC_ALPHA);
 
         native.glUseProgram(this.context.compositeShader);
         native.glUniform1i(@intCast(this.context.compositeUniformLayerMaskLocation), @intCast(this.layerMask));
         native.glUniform1i(@intCast(this.context.compositeUniformLayerTextureLocation), 0);
 
         native.glDrawArrays(native.GL_TRIANGLES, 0, 6);
+
+        native.glDisable(native.GL_BLEND);
 
         _ = native.SDL_GL_SwapWindow(this.context.window);
     }

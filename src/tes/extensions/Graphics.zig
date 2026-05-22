@@ -45,6 +45,7 @@ fn initializeSingleton(vm: *tes.TESVM) void {
     singleton = .{
         .gpu = .initialize(vm, vm.allocator),
     };
+    singletonIsInitialized = true;
 }
 
 fn handle(vm: *tes.TESVM, evCode: tes.EventID) tes.EventResult {
@@ -124,6 +125,7 @@ fn getHeader(page: tes.PageBuffer) *mmMap {
 
 pub fn presentGraphics() !void {
     if (!singletonIsInitialized) {
+        std.debug.print("Graphics not initialized\n", .{});
         return;
     }
     try singleton.gpu.present();
@@ -142,10 +144,12 @@ fn syncGraphicsState() !void {
 }
 
 fn syncGPUEnable(header: *mmMap, gpu: *vGPU.vGPU) !void {
-    if (header.gpu.enable != 0) {
+    if (header.gpu.enable == 0) {
         try gpu.disable();
+        std.debug.print("GPU Disabled\n", .{});
     } else {
         try gpu.enable();
+        std.debug.print("GPU Enabled\n", .{});
     }
 }
 
