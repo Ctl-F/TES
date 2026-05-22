@@ -39,6 +39,7 @@ _init_gpu:
     mov (byte) [re, (MemIOMap.gpu.enable)rf], ra;
 
     ; set screen scale of 1
+    inc ra;
     mov (byte) [re, (MemIOMap.gpu.screenScale)rf], ra;
 
     ; set screen dimensions

@@ -29,6 +29,9 @@ pub const Preprocessor = struct {
     include_depth: u32,
     /// tracks files that have used #once; keys are heap-allocated
     once_files:   std.StringHashMapUnmanaged(void),
+    /// Maps resolved source path → original source text.
+    /// Populated during process(); used by the parser for error display.
+    source_map: std.StringHashMapUnmanaged([]const u8),
 
     const MaxIncludeDepth = 16;
 
@@ -40,6 +43,7 @@ pub const Preprocessor = struct {
             .include_dirs  = .empty,
             .include_depth = 0,
             .once_files    = .{},
+            .source_map    = .{},
         };
     }
 
@@ -54,6 +58,12 @@ pub const Preprocessor = struct {
         var oit = self.once_files.keyIterator();
         while (oit.next()) |k| self.allocator.free(k.*);
         self.once_files.deinit(self.allocator);
+        var sit = self.source_map.iterator();
+        while (sit.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.source_map.deinit(self.allocator);
     }
 
     pub fn addIncludeDir(self: *@This(), dir: []const u8) !void {
@@ -75,6 +85,14 @@ pub const Preprocessor = struct {
     /// Preprocess src; returns heap-allocated expanded source. Caller frees.
     pub fn process(self: *@This(), src: []const u8, source_path: []const u8) PreprocError![]u8 {
         if (self.include_depth >= MaxIncludeDepth) return PreprocError.TooManyIncludes;
+
+        // Store the original source text so the parser can display it in errors.
+        if (!self.source_map.contains(source_path)) {
+            const k = self.allocator.dupe(u8, source_path) catch return PreprocError.OutOfMemory;
+            errdefer self.allocator.free(k);
+            const v = self.allocator.dupe(u8, src) catch return PreprocError.OutOfMemory;
+            self.source_map.put(self.allocator, k, v) catch return PreprocError.OutOfMemory;
+        }
 
         // #once: skip this file if it has already been fully processed
         if (self.once_files.contains(source_path)) {

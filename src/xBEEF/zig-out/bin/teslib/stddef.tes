@@ -3,6 +3,9 @@
 
 #define GPU_LAYER_COUNT 16
 
+#define true 1
+#define false 0
+
 struct IOHeader {
     closeSignal: u8;
 };

@@ -233,10 +233,11 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // ── Parse ────────────────────────────────────────────────────────────
-    var p = parser.Parser.init(allocator, token_slice, emit_debug);
+    var p = parser.Parser.init(allocator, token_slice, emit_debug, &prep.source_map);
     p.parse() catch |e| {
         p.deinit();
-        try stderr.print("Assembly error: {}\n", .{e});
+        // The parser already printed a specific diagnostic above.
+        // Return the error code so the shell sees a non-zero exit status.
         return e;
     };
     defer p.deinit();

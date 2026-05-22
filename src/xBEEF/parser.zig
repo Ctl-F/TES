@@ -50,6 +50,7 @@ const ForwardRef = struct {
     kind:        BranchKind,
     cond_reg:    RegID,
     line:        u32,
+    col:         u32,
     source_file: []const u8,
 };
 
@@ -74,9 +75,18 @@ pub const Parser = struct {
     /// Each entry maps alias name (heap-allocated) → RegID.
     alias_stack: std.ArrayList(std.StringHashMapUnmanaged(RegID)),
 
+    /// Optional map from source filename → original source text, used to
+    /// display the source line and a caret underline in error messages.
+    source_map: ?*const std.StringHashMapUnmanaged([]const u8),
+
     // ── init / deinit ──────────────────────────────────────────────────────
 
-    pub fn init(allocator: std.mem.Allocator, tokens: []const Token, emit_debug: bool) @This() {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        tokens: []const Token,
+        emit_debug: bool,
+        source_map: ?*const std.StringHashMapUnmanaged([]const u8),
+    ) @This() {
         return .{
             .allocator    = allocator,
             .tokens       = tokens,
@@ -88,7 +98,53 @@ pub const Parser = struct {
             .page_cursors = .{},
             .emit_debug   = emit_debug,
             .alias_stack  = .empty,
+            .source_map   = source_map,
         };
+    }
+
+    // ── Source context helpers ─────────────────────────────────────────────
+
+    /// Print the source line and a caret underline for `tok`.
+    fn printSourceContext(self: *const @This(), tok: Token) void {
+        self.printSourceContextAt(tok.source_file, tok.line, tok.col, tok.text.len);
+    }
+
+    /// Print the source line at (source_file, line) with a caret at (col, span_len).
+    /// col is 1-based; span_len is the number of characters to underline (clamped to ≥1).
+    fn printSourceContextAt(
+        self: *const @This(),
+        source_file: []const u8,
+        line: u32,
+        col: u32,
+        span_len: usize,
+    ) void {
+        const map = self.source_map orelse return;
+        const src = map.get(source_file) orelse return;
+
+        // Walk to the requested line (1-based).
+        var line_no: u32 = 1;
+        var it = std.mem.splitScalar(u8, src, '\n');
+        while (it.next()) |raw| : (line_no += 1) {
+            if (line_no != line) continue;
+            const text = std.mem.trimEnd(u8, raw, "\r");
+            std.debug.print("    {s}\n", .{text});
+
+            // Build the underline: 4 spaces of prefix, (col-1) spaces, then ^~~~
+            const prefix: usize = 4;
+            const col0: usize   = if (col > 0) col - 1 else 0;
+            const width: usize  = @max(span_len, 1);
+
+            var buf: [1024]u8 = undefined;
+            const available = buf.len;
+            const total = @min(prefix + col0 + width, available);
+            if (total == 0) return;
+            @memset(buf[0..total], ' ');
+            const caret_pos = @min(prefix + col0, total - 1);
+            buf[caret_pos] = '^';
+            if (caret_pos + 1 < total) @memset(buf[caret_pos + 1 .. total], '~');
+            std.debug.print("{s}\n", .{buf[0..total]});
+            return;
+        }
     }
 
     pub fn deinit(self: *@This()) void {
@@ -159,9 +215,10 @@ pub const Parser = struct {
     fn expect(self: *@This(), kind: TokenKind) ParseError!Token {
         const t = self.advance();
         if (t.kind != kind) {
-            std.debug.print("{s}:{}:{}: parse error: expected {s}, got '{s}'\n", .{
+            std.debug.print("{s}:{}:{}: error: expected '{s}', got '{s}'\n", .{
                 t.source_file, t.line, t.col, @tagName(kind), t.text,
             });
+            self.printSourceContext(t);
             return ParseError.UnexpectedToken;
         }
         return t;
@@ -170,9 +227,10 @@ pub const Parser = struct {
     fn expectIdent(self: *@This()) ParseError!Token {
         const t = self.advance();
         if (t.kind != .Identifier) {
-            std.debug.print("{s}:{}:{}: parse error: expected identifier, got '{s}'\n", .{
+            std.debug.print("{s}:{}:{}: error: expected identifier, got '{s}'\n", .{
                 t.source_file, t.line, t.col, t.text,
             });
+            self.printSourceContext(t);
             return ParseError.UnexpectedToken;
         }
         return t;
@@ -221,7 +279,7 @@ pub const Parser = struct {
         try self.emitWord(@as(u32, 0x7E)); // bn placeholder
         self.forward_refs.append(self.allocator, .{
             .instr_idx = 0, .from_idx = 0,
-            .label = start_label, .kind = .Near, .cond_reg = .R0, .line = 0, .source_file = "",
+            .label = start_label, .kind = .Near, .cond_reg = .R0, .line = 0, .col = 0, .source_file = "",
         }) catch return ParseError.OutOfMemory;
         try self.emitWord(@as(u32, 0x40)); // hlt
         while (true) {
@@ -235,6 +293,7 @@ pub const Parser = struct {
                 .Newline        => self.pos += 1,
                 else => {
                     std.debug.print("{s}:{}:{}: warning: unexpected top-level token '{s}'\n", .{ t.source_file, t.line, t.col, t.text });
+                    self.printSourceContext(t);
                     self.skipToEOL();
                 },
             }
@@ -251,6 +310,7 @@ pub const Parser = struct {
             if (t.kind == .Newline) { self.pos += 1; continue; }
             if (t.kind == .KwStruct) { try self.parseStruct(); continue; }
             std.debug.print("{s}:{}:{}: warning: unexpected token in [Meta]: '{s}'\n", .{ t.source_file, t.line, t.col, t.text });
+            self.printSourceContext(t);
             self.skipToEOL();
         }
         self.sym.resolveForwardStructRefs();
@@ -365,6 +425,7 @@ pub const Parser = struct {
             if (t.kind == .Hash) { self.skipToEOL(); continue; }
             if (t.kind != .Identifier) {
                 std.debug.print("{s}:{}:{}: warning: unexpected token in [Data]: '{s}'\n", .{ t.source_file, t.line, t.col, t.text });
+                self.printSourceContext(t);
                 self.skipToEOL();
                 continue;
             }
@@ -415,6 +476,7 @@ pub const Parser = struct {
         if (prim == .Struct) {
             const sd = self.sym.getStruct(type_tok.text) orelse {
                 std.debug.print("{s}:{}:{}: error: unknown type '{s}'\n", .{ type_tok.source_file, type_tok.line, type_tok.col, type_tok.text });
+                self.printSourceContext(type_tok);
                 return ParseError.InvalidType;
             };
             type_size = sd.total_size;
@@ -453,7 +515,7 @@ pub const Parser = struct {
         if (next.kind == .Dot or next.kind == .Integer or next.kind == .Minus or
             next.kind == .Identifier or next.kind == .CharLit)
         {
-            if (elem_count > 1 and next.kind == .Dot and self.peekIsBrace()) {
+            if (elem_count > 1 and next.kind == .Dot and self.peekIsDotBrace()) {
                 // .{v1, v2, ...} for explicit array init
                 _ = self.advance(); // consume '.'
                 _ = try self.expect(.LBrace);
@@ -485,6 +547,14 @@ pub const Parser = struct {
 
     fn peekIsBrace(self: *const @This()) bool {
         var i = self.pos;
+        while (i < self.tokens.len and self.tokens[i].kind == .Newline) i += 1;
+        return i < self.tokens.len and self.tokens[i].kind == .LBrace;
+    }
+
+    /// Returns true when the current token is '.' and the next non-newline
+    /// token is '{' — i.e. the sequence ".{" that starts an array initializer.
+    fn peekIsDotBrace(self: *const @This()) bool {
+        var i = self.pos + 1; // skip the '.' at self.pos
         while (i < self.tokens.len and self.tokens[i].kind == .Newline) i += 1;
         return i < self.tokens.len and self.tokens[i].kind == .LBrace;
     }
@@ -611,10 +681,15 @@ pub const Parser = struct {
                     full.append(self.allocator, '.') catch return ParseError.OutOfMemory;
                     full.appendSlice(self.allocator, f.text) catch return ParseError.OutOfMemory;
                 }
-                break :blk @intCast(self.sym.resolveAddress(full.items) catch return ParseError.UndefinedSymbol);
+                break :blk @intCast(self.sym.resolveAddress(full.items) catch {
+                    std.debug.print("{s}:{}:{}: error: undefined symbol '{s}'\n", .{ t.source_file, t.line, t.col, full.items });
+                    self.printSourceContext(t);
+                    return ParseError.UndefinedSymbol;
+                });
             },
             else => {
-                std.debug.print("{s}:{}:{}: parse error: expected constant, got '{s}'\n", .{ t.source_file, t.line, t.col, t.text });
+                std.debug.print("{s}:{}:{}: error: expected constant expression, got '{s}'\n", .{ t.source_file, t.line, t.col, t.text });
+                self.printSourceContext(t);
                 return ParseError.InvalidOperand;
             },
         };
@@ -634,11 +709,13 @@ pub const Parser = struct {
                 .Label => {
                     std.debug.print("{s}:{}:{}: error: $nSizeOf: '{s}' is a label, not a type\n",
                         .{ arg.source_file, arg.line, arg.col, arg.text });
+                    self.printSourceContext(arg);
                     return ParseError.TypeMismatch;
                 },
             };
             std.debug.print("{s}:{}:{}: error: $nSizeOf: unknown type or symbol '{s}'\n",
                 .{ arg.source_file, arg.line, arg.col, arg.text });
+            self.printSourceContext(arg);
             return ParseError.UndefinedSymbol;
         }
         if (std.mem.eql(u8, name_tok.text, "sizeOfAligned") or
@@ -657,17 +734,20 @@ pub const Parser = struct {
                     .Label => {
                         std.debug.print("{s}:{}:{}: error: ${s}: '{s}' is a label, not a type\n",
                             .{ arg.source_file, arg.line, arg.col, name_tok.text, arg.text });
+                        self.printSourceContext(arg);
                         return ParseError.TypeMismatch;
                     },
                 };
                 std.debug.print("{s}:{}:{}: error: ${s}: unknown type or symbol '{s}'\n",
                     .{ arg.source_file, arg.line, arg.col, name_tok.text, arg.text });
+                self.printSourceContext(arg);
                 return ParseError.UndefinedSymbol;
             };
             const alignment = @as(i64, @intCast(align_tok.int_value));
             if (alignment <= 0) {
                 std.debug.print("{s}:{}:{}: error: ${s}: alignment must be positive\n",
                     .{ align_tok.source_file, align_tok.line, align_tok.col, name_tok.text });
+                self.printSourceContext(align_tok);
                 return ParseError.InvalidOperand;
             }
             const aligned_sz = @divTrunc(sz + alignment - 1, alignment) * alignment;
@@ -684,11 +764,13 @@ pub const Parser = struct {
                 .Label => {
                     std.debug.print("{s}:{}:{}: error: $sizeOf: '{s}' is a label, not a type\n",
                         .{ arg.source_file, arg.line, arg.col, arg.text });
+                    self.printSourceContext(arg);
                     return ParseError.TypeMismatch;
                 },
             };
             std.debug.print("{s}:{}:{}: error: $sizeOf: unknown type or symbol '{s}'\n",
                 .{ arg.source_file, arg.line, arg.col, arg.text });
+            self.printSourceContext(arg);
             return ParseError.UndefinedSymbol;
         }
         if (std.mem.eql(u8, name_tok.text, "offsetOf")) {
@@ -730,6 +812,7 @@ pub const Parser = struct {
         }
         std.debug.print("{s}:{}:{}: error: unknown builtin '${s}'\n",
             .{ name_tok.source_file, name_tok.line, name_tok.col, name_tok.text });
+        self.printSourceContext(name_tok);
         return ParseError.InvalidOperand;
     }
 
@@ -796,6 +879,7 @@ pub const Parser = struct {
                 }
                 std.debug.print("{s}:{}:{}: warning: unknown '@' directive '{s}'\n",
                     .{ next.source_file, next.line, next.col, next.text });
+                self.printSourceContext(next);
                 self.skipToEOL();
                 continue;
             }
@@ -807,6 +891,7 @@ pub const Parser = struct {
                 if (self.alias_stack.items.len == 0) {
                     std.debug.print("{s}:{}:{}: error: '}}' without matching '@{{'\n",
                         .{ t.source_file, t.line, t.col });
+                    self.printSourceContext(t);
                     return ParseError.UnexpectedToken;
                 }
                 var scope = self.alias_stack.pop().?;
@@ -832,6 +917,7 @@ pub const Parser = struct {
             const t = self.peek();
             std.debug.print("{s}:{}:{}: error: @bind used outside of a '@{{' scope\n",
                 .{ t.source_file, t.line, t.col });
+            self.printSourceContext(t);
             self.skipToEOL();
             return ParseError.UnexpectedToken;
         }
@@ -843,6 +929,7 @@ pub const Parser = struct {
         if (RegID.fromStr(name_tok.text) != null) {
             std.debug.print("{s}:{}:{}: warning: @bind '{s}' shadows a register name\n",
                 .{ name_tok.source_file, name_tok.line, name_tok.col, name_tok.text });
+            self.printSourceContext(name_tok);
         }
 
         const top = &self.alias_stack.items[self.alias_stack.items.len - 1];
@@ -895,7 +982,8 @@ pub const Parser = struct {
         const mt = self.advance();
         if (mt.kind == .Eof) return;
         if (mt.kind != .Identifier) {
-            std.debug.print("{s}:{}:{}: parse error: expected mnemonic, got '{s}'\n", .{ mt.source_file, mt.line, mt.col, mt.text });
+            std.debug.print("{s}:{}:{}: error: expected mnemonic, got '{s}'\n", .{ mt.source_file, mt.line, mt.col, mt.text });
+            self.printSourceContext(mt);
             self.skipToEOL();
             return ParseError.UnexpectedToken;
         }
@@ -938,15 +1026,16 @@ pub const Parser = struct {
 
         const info = encoder.findOpcode(mt.text) orelse {
             std.debug.print("{s}:{}:{}: error: unknown mnemonic '{s}'\n", .{ mt.source_file, mt.line, mt.col, mt.text });
+            self.printSourceContext(mt);
             self.skipToEOL();
             return ParseError.UnexpectedToken;
         };
         const instr_idx: u32 = @intCast(self.tbfWriter.instructions.items.len);
-        try self.encodeInstruction(info, instr_idx, mt.line, mt.source_file);
+        try self.encodeInstruction(info, instr_idx, mt.line, mt.col, mt.source_file);
         self.consumeEOL();
     }
 
-    fn encodeInstruction(self: *@This(), info: OpcodeInfo, instr_idx: u32, line: u32, source_file: []const u8) ParseError!void {
+    fn encodeInstruction(self: *@This(), info: OpcodeInfo, instr_idx: u32, line: u32, col: u32, source_file: []const u8) ParseError!void {
         switch (info.format) {
             .Bare => try self.emitWord(@as(u32, info.opcode)),
 
@@ -1005,6 +1094,7 @@ pub const Parser = struct {
                 if (@intFromEnum(len) > 15) {
                     std.debug.print("{s}:{}: error: mcpy/mmov length register must be R0-RF\n",
                         .{ source_file, line });
+                    self.printSourceContextAt(source_file, line, 0, 0);
                     return ParseError.InvalidOperand;
                 }
                 try self.emitWord(pDst2Src2Len(info.opcode, r0, r1, r2, r3, len));
@@ -1059,7 +1149,7 @@ pub const Parser = struct {
                         try self.emitWord(@as(u32, info.opcode));
                         self.forward_refs.append(self.allocator, .{
                             .instr_idx = instr_idx, .from_idx = instr_idx,
-                            .label = name, .kind = .Near, .cond_reg = .R0, .line = line, .source_file = source_file,
+                            .label = name, .kind = .Near, .cond_reg = .R0, .line = line, .col = col, .source_file = source_file,
                         }) catch return ParseError.OutOfMemory;
                     },
                 }
@@ -1074,7 +1164,7 @@ pub const Parser = struct {
                         try self.emitWord(pDst(info.opcode, cond, 0));
                         self.forward_refs.append(self.allocator, .{
                             .instr_idx = instr_idx, .from_idx = instr_idx,
-                            .label = name, .kind = .NearCond, .cond_reg = cond, .line = line, .source_file = source_file,
+                            .label = name, .kind = .NearCond, .cond_reg = cond, .line = line, .col = col, .source_file = source_file,
                         }) catch return ParseError.OutOfMemory;
                     },
                 }
@@ -1101,6 +1191,7 @@ pub const Parser = struct {
                 const rc_tok = try self.expectIdent();
                 const rc = encoder.findReduceCode(rc_tok.text) orelse {
                     std.debug.print("{s}:{}:{}: error: unknown reduce code '{s}'\n", .{ rc_tok.source_file, rc_tok.line, rc_tok.col, rc_tok.text });
+                    self.printSourceContext(rc_tok);
                     return ParseError.InvalidOperand;
                 };
                 try self.emitWord(pDstSrc(info.opcode, dst, src, @as(u32, rc)));
@@ -1115,10 +1206,12 @@ pub const Parser = struct {
         const t = self.advance();
         if (t.kind != .Identifier) {
             std.debug.print("{s}:{}:{}: error: expected register, got '{s}'\n", .{ t.source_file, t.line, t.col, t.text });
+            self.printSourceContext(t);
             return ParseError.InvalidOperand;
         }
         return RegID.fromStr(t.text) orelse self.lookupAlias(t.text) orelse {
             std.debug.print("{s}:{}:{}: error: '{s}' is not a register or alias\n", .{ t.source_file, t.line, t.col, t.text });
+            self.printSourceContext(t);
             return ParseError.InvalidOperand;
         };
     }
@@ -1134,6 +1227,7 @@ pub const Parser = struct {
         }
         if (t.kind != .Integer) {
             std.debug.print("{s}:{}:{}: error: expected integer, got '{s}'\n", .{ t.source_file, t.line, t.col, t.text });
+            self.printSourceContext(t);
             return ParseError.InvalidOperand;
         }
         var v: i64 = @bitCast(t.int_value);
@@ -1261,6 +1355,7 @@ pub const Parser = struct {
                 const t = self.peek();
                 std.debug.print("{s}:{}:{}: error: movi/movd requires extended [page, offset] addressing\n",
                     .{ t.source_file, t.line, t.col });
+                self.printSourceContext(t);
                 return ParseError.InvalidMemoryOperand;
             }
             const mem = try self.parseMemExt(line);
@@ -1282,12 +1377,14 @@ pub const Parser = struct {
                 const t = self.peek();
                 std.debug.print("{s}:{}:{}: error: movi/movd: expected '[page, offset]' memory operand\n",
                     .{ t.source_file, t.line, t.col });
+                self.printSourceContext(t);
                 return ParseError.InvalidMemoryOperand;
             }
             if (!self.peekMemIsExt()) {
                 const t = self.peek();
                 std.debug.print("{s}:{}:{}: error: movi/movd requires extended [page, offset] addressing\n",
                     .{ t.source_file, t.line, t.col });
+                self.printSourceContext(t);
                 return ParseError.InvalidMemoryOperand;
             }
             const mem = try self.parseMemExt(line);
@@ -1434,10 +1531,12 @@ pub const Parser = struct {
             }
             return self.sym.resolveAddress(full.items) catch {
                 std.debug.print("{s}:{}:{}: error: undefined symbol '{s}'\n", .{ t.source_file, t.line, t.col, full.items });
+                self.printSourceContext(t);
                 return ParseError.UndefinedSymbol;
             };
         }
         std.debug.print("{s}:{}:{}: error: expected address, got '{s}'\n", .{ t.source_file, t.line, t.col, t.text });
+        self.printSourceContext(t);
         return ParseError.InvalidOperand;
     }
 
@@ -1451,7 +1550,8 @@ pub const Parser = struct {
         if (t.kind == .Integer or t.kind == .Minus) {
             const v = try self.parseImm(line);
             if (v < -8192 or v > 8191) {
-                std.debug.print("{s}:{}:{}: error: branch offset {} out of i14 range\n", .{ t.source_file, t.line, t.col, v });
+                std.debug.print("{s}:{}:{}: error: branch offset {} out of i14 range [-8192, 8191]\n", .{ t.source_file, t.line, t.col, v });
+                self.printSourceContext(t);
                 return ParseError.BranchTooFar;
             }
             return LabelOrImm{ .resolved = @intCast(v) };
@@ -1470,7 +1570,8 @@ pub const Parser = struct {
             if (self.sym.getSymbol(full.items)) |sym| {
                 switch (sym.*) {
                     .Data => {
-                        std.debug.print("{s}:{}:{}: error: '{s}' is a data symbol, not a label\n", .{ t.source_file, t.line, t.col, full.items });
+                        std.debug.print("{s}:{}:{}: error: '{s}' is a data symbol, not a branch label\n", .{ t.source_file, t.line, t.col, full.items });
+                        self.printSourceContext(t);
                         return ParseError.TypeMismatch;
                     },
                     .Label => {},
@@ -1480,6 +1581,7 @@ pub const Parser = struct {
             return LabelOrImm{ .unresolved = owned };
         }
         std.debug.print("{s}:{}:{}: error: expected label or offset, got '{s}'\n", .{ t.source_file, t.line, t.col, t.text });
+        self.printSourceContext(t);
         return ParseError.InvalidOperand;
     }
 
@@ -1510,6 +1612,7 @@ pub const Parser = struct {
                 const elem_size = self.sym.resolveFieldElemSize(full.items) catch |e| {
                     std.debug.print("{s}:{}:{}: error: array index on non-array field '{s}'\n",
                         .{ sym_tok.source_file, sym_tok.line, sym_tok.col, full.items });
+                    self.printSourceContext(sym_tok);
                     return switch (e) {
                         sym_mod.SymbolError.FieldNotFound   => ParseError.FieldNotFound,
                         sym_mod.SymbolError.UndefinedSymbol => ParseError.UndefinedSymbol,
@@ -1521,12 +1624,14 @@ pub const Parser = struct {
             _ = try self.expect(.RParen);
             const field_off = self.sym.resolveFieldOffset(full.items) catch {
                 std.debug.print("{s}:{}:{}: error: undefined symbol '{s}'\n", .{ sym_tok.source_file, sym_tok.line, sym_tok.col, full.items });
+                self.printSourceContext(sym_tok);
                 return ParseError.UndefinedSymbol;
             };
             const sym_off: i32 = @intCast(field_off);
             const reg_tok = self.advance();
             const base = RegID.fromStr(reg_tok.text) orelse {
                 std.debug.print("{s}:{}:{}: error: expected register after symbol, got '{s}'\n", .{ reg_tok.source_file, reg_tok.line, reg_tok.col, reg_tok.text });
+                self.printSourceContext(reg_tok);
                 return ParseError.InvalidMemoryOperand;
             };
             var extra: i32 = 0;
@@ -1546,7 +1651,7 @@ pub const Parser = struct {
         }
 
         // [Symbol reg] — bare symbol (no parens, legacy/plain address)
-        if (first.kind == .Identifier and RegID.fromStr(first.text) == null) {
+        if (first.kind == .Identifier and RegID.fromStr(first.text) == null and self.lookupAlias(first.text) == null) {
             var full: std.ArrayList(u8) = .empty;
             defer full.deinit(self.allocator);
             full.appendSlice(self.allocator, first.text) catch return ParseError.OutOfMemory;
@@ -1558,12 +1663,14 @@ pub const Parser = struct {
             }
             const addr = self.sym.resolveAddress(full.items) catch {
                 std.debug.print("{s}:{}:{}: error: undefined symbol '{s}'\n", .{ first.source_file, first.line, first.col, full.items });
+                self.printSourceContext(first);
                 return ParseError.UndefinedSymbol;
             };
             const sym_off: i32 = @intCast(addr & 0xFFFF);
             const reg_tok = self.advance();
             const base = RegID.fromStr(reg_tok.text) orelse {
                 std.debug.print("{s}:{}:{}: error: expected register after symbol, got '{s}'\n", .{ reg_tok.source_file, reg_tok.line, reg_tok.col, reg_tok.text });
+                self.printSourceContext(reg_tok);
                 return ParseError.InvalidMemoryOperand;
             };
             var extra: i32 = 0;
@@ -1582,8 +1689,9 @@ pub const Parser = struct {
             return MemSimple{ .base = base, .offset = @intCast(total) };
         }
 
-        const base = RegID.fromStr(first.text) orelse {
+        const base = RegID.fromStr(first.text) orelse self.lookupAlias(first.text) orelse {
             std.debug.print("{s}:{}:{}: error: expected register, got '{s}'\n", .{ first.source_file, first.line, first.col, first.text });
+            self.printSourceContext(first);
             return ParseError.InvalidMemoryOperand;
         };
         var off: i32 = 0;
@@ -1628,6 +1736,7 @@ pub const Parser = struct {
                 const elem_size = self.sym.resolveFieldElemSize(full.items) catch |e| {
                     std.debug.print("{s}:{}:{}: error: array index on non-array field '{s}'\n",
                         .{ sym_tok.source_file, sym_tok.line, sym_tok.col, full.items });
+                    self.printSourceContext(sym_tok);
                     return switch (e) {
                         sym_mod.SymbolError.FieldNotFound   => ParseError.FieldNotFound,
                         sym_mod.SymbolError.UndefinedSymbol => ParseError.UndefinedSymbol,
@@ -1639,6 +1748,7 @@ pub const Parser = struct {
             _ = try self.expect(.RParen);
             const field_off = self.sym.resolveFieldOffset(full.items) catch {
                 std.debug.print("{s}:{}:{}: error: undefined symbol '{s}'\n", .{ sym_tok.source_file, sym_tok.line, sym_tok.col, full.items });
+                self.printSourceContext(sym_tok);
                 return ParseError.UndefinedSymbol;
             };
             sym_off = @intCast(field_off);
@@ -1672,12 +1782,14 @@ pub const Parser = struct {
     fn pass2FixupRefs(self: *@This()) ParseError!void {
         for (self.forward_refs.items) |*ref| {
             const target_idx = self.sym.resolveLabel(ref.label) catch {
-                std.debug.print("{s}:{}: error: undefined label '{s}'\n", .{ ref.source_file, ref.line, ref.label });
+                std.debug.print("{s}:{}:{}: error: undefined label '{s}'\n", .{ ref.source_file, ref.line, ref.col, ref.label });
+                self.printSourceContextAt(ref.source_file, ref.line, ref.col, ref.label.len);
                 return ParseError.LabelNotFound;
             };
             const offset = @as(i64, @intCast(target_idx)) - @as(i64, @intCast(ref.from_idx));
             if (offset < -8192 or offset > 8191) {
-                std.debug.print("{s}:{}: error: branch to '{s}' offset {} exceeds i14 range\n", .{ ref.source_file, ref.line, ref.label, offset });
+                std.debug.print("{s}:{}:{}: error: branch to '{s}' is too far ({} instructions, max ±8192)\n", .{ ref.source_file, ref.line, ref.col, ref.label, offset });
+                self.printSourceContextAt(ref.source_file, ref.line, ref.col, ref.label.len);
                 return ParseError.BranchTooFar;
             }
             const words = self.tbfWriter.instructions.items;

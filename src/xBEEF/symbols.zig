@@ -315,10 +315,7 @@ pub const SymbolTable = struct {
     }
 
     pub fn resolveLabel(self: *@This(), name: []const u8) SymbolError!u32 {
-        const sym = self.symbols.get(name) orelse {
-            std.debug.print("Error: undefined label '{s}'\n", .{name});
-            return SymbolError.UndefinedSymbol;
-        };
+        const sym = self.symbols.get(name) orelse return SymbolError.UndefinedSymbol;
         return switch (sym) {
             .Label => |idx| idx,
             .Data  => SymbolError.TypeMismatch,

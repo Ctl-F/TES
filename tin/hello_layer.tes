@@ -1,0 +1,108 @@
+#include "stddef.tes"
+
+#define STACK_SIZE 0x800
+
+#define WINDOW_WIDTH 240
+#define WINDOW_HEIGHT 120
+#define BYTES_PER_PIXEL 2
+
+[Data(0:0x0400)]
+defaultClearColor: .ColorRGB32 .{ 25, 25, 45, 255 }
+layerConfigInst: .GPUPixelLayerConfig .{ $STRUCT_LAYER_CONFIG_FRAMEBUFFER, $PIXEL_FORMAT_RGB565, $WINDOW_WIDTH, $WINDOW_HEIGHT }
+
+[Data(0:0xF000)]
+_StackHead: .u8[$STACK_SIZE] 0
+
+[Data(1:0x0000)]
+_PixelBuffer: .u8[${ WINDOW_WIDTH * WINDOW_HEIGHT * 2 }] 0
+
+
+[Program]
+_start:
+    mov ra, _StackHead;
+    mov rb, $STACK_SIZE;
+    stackset ra, rb;
+
+    bn _init_gpu;
+
+loop:
+    ; check if window should close
+    mov re, $MMIO_PAGE_ID;
+    mov rf, $MMIO_HEADER_BASE;
+    mov r0, $offsetOf(MMIOMap, io);
+    add rf, r0;
+    mov ra, (byte)[re, (IOHeader.closeSignal)rf];
+
+
+    bnf loop;
+
+_end:
+    hlt;
+
+@{
+    @bind page : re;
+    @bind ptr : rf;
+    @bind val : rd;
+    @bind valPtrPage : rc;
+    @bind valPtr : rb;
+    @bind val2 : ra;
+
+_init_gpu:
+    push jr;
+
+    mov page, $MMIO_PAGE_ID;
+    mov ptr, $MMIO_HEADER_BASE;
+    mov val, $offsetOf(MemIOMap, gpu);
+    add ptr, val;
+
+    ; initialize gpu
+    mov val, true;
+    mov (byte) [page, (GPUHeader.enable)ptr], val;
+
+    ; save an instruction and write true to clear color also
+    mov (byte) [page, (GPUHeader.clearEnable)], val;
+
+    ; configure screen
+    inc val; true is just 1 so incrementing gives us a value of 2 for our scale
+    mov (byte) [page, (GPUHeader.screenScale)ptr], val;
+
+    mov val, $WINDOW_WIDTH;
+    mov [page, (GPUHeader.screenWidth)ptr], val;
+
+    mov val, $WINDOW_HEIGHT;
+    mov [page, (GPUHeader.screenHeight)ptr], val;
+
+
+    ; configure clear color
+    lea valPtrPage, valPtr, defaultClearColor;
+    mov val2, $offsetOf(GPUHeader, clearColor);
+    add ptr, val2;
+    mov val, $sizeOf(ColorRGB32);
+
+    mcpy page, ptr, valPtrPage, valPtr, val;
+
+    sub ptr, val2;
+
+    ; enable only 0
+    mov val, 0x0001;
+    mov [page, (GPUHeader.layerEnable)ptr], val;
+
+    ; set the layer config data in the gpu header
+    mov val2, $offsetOf(GPUHeader, layers);
+    add ptr, val2;
+
+    lea valPtrPage, valPtr, layerConfigInst;
+    mov [page, (GPULayerConfig.configHigh)ptr], valPtrPage;
+    mov [page, (GPULayerConfig.configLow)ptr], valPtr;
+
+    lea valPtrPage, valPtr, _PixelBuffer;
+    mov [page, (GPULayerConfig.dataHigh)ptr], valPtrPage;
+    mov [page, (GPULayerConfig.dataLow)ptr], valPtr;
+
+
+    ; push the config to the gpu
+    syscall cat_GFX, GFXSync;
+
+    pop jr;
+    b jr;
+}

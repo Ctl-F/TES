@@ -284,6 +284,9 @@ pub const Codegen = struct {
         // ── Data section ──────────────────────────────────────────────────────
         try self.emitDataSection(file, writer);
 
+        // ── Stack reservation ─────────────────────────────────────────────────
+        try emitStackSection(writer);
+
         // ── Code section ──────────────────────────────────────────────────────
         try writer.writeAll("\n[Program]\n");
 
@@ -320,12 +323,12 @@ pub const Codegen = struct {
                 },
                 .flex_array => {
                     if (info.string_content) |sc| {
-                        try writer.writeAll("    .u8 ");
+                        try writer.print("    .u8[{}] .{{", .{sc.len});
                         for (sc, 0..) |b, i| {
                             if (i > 0) try writer.writeAll(", ");
                             try writer.print("{}", .{b});
                         }
-                        try writer.writeAll("\n");
+                        try writer.writeAll("}\n");
                     } else {
                         try writer.writeAll("    .u8 0\n");
                     }
@@ -333,14 +336,8 @@ pub const Codegen = struct {
                 .array => |arr| {
                     const elem_size = self.sema.typeSize(arr.elem.*);
                     const byte_size = arr.size * elem_size;
-                    // emit as bytes
                     if (byte_size > 0) {
-                        try writer.writeAll("    .u8");
-                        for (0..byte_size) |i| {
-                            if (i == 0) try writer.writeAll(" 0")
-                            else try writer.writeAll(", 0");
-                        }
-                        try writer.writeAll("\n");
+                        try writer.print("    .u8[{}] 0\n", .{byte_size});
                     }
                 },
                 .u8_vec2, .i8_vec2 => {
@@ -356,13 +353,20 @@ pub const Codegen = struct {
         // Emit inline string literals from function bodies
         for (self.sema.string_lits.items) |*sl| {
             try writer.print("{s}:\n", .{sl.label});
-            try writer.writeAll("    .u8 ");
+            try writer.print("    .u8[{}] .{{", .{sl.content.len});
             for (sl.content, 0..) |b, i| {
                 if (i > 0) try writer.writeAll(", ");
                 try writer.print("{}", .{b});
             }
-            try writer.writeAll("\n");
+            try writer.writeAll("}\n");
         }
+    }
+
+    fn emitStackSection(writer: anytype) !void {
+        // Reserve 2 KiB of stack space at page 0, offset 0xF7FC.
+        // stackset in main will configure SB=SP=0xFFFC, SH=0xF7FC.
+        try writer.writeAll("\n[Data(0:0xF7FC)]\n");
+        try writer.writeAll("_StackHead: .u8[0x800] 0\n");
     }
 
     // ─── Function generation ───────────────────────────────────────────────────
@@ -372,7 +376,8 @@ pub const Codegen = struct {
         self.fn_name = fd.name;
 
         // Emit function label
-        if (std.mem.eql(u8, fd.name, "main")) try writer.writeAll("_start:\n");
+        const is_main = std.mem.eql(u8, fd.name, "main");
+        if (is_main) try writer.writeAll("_start:\n");
         try writer.print("_cm_{s}:\n", .{fd.name});
 
         // ── Naked asm function ────────────────────────────────────────────────
@@ -381,6 +386,11 @@ pub const Codegen = struct {
         if (isNakedAsmFn(fd)) {
             for (fd.params) |p| {
                 try self.locals.put(self.gpa, p.name, .{ .reg = p.reg_hint.?, .type_expr = p.type_expr });
+            }
+            if (is_main) {
+                try writer.writeAll("    mov re, 0xFFFC\n");
+                try writer.writeAll("    mov rf, 0x0800\n");
+                try writer.writeAll("    stackset re, rf\n");
             }
             const save_jr = asmBlockHasBranches(fd.body[0].asm_block.lines);
             if (save_jr) try writer.writeAll("    push jr\n");
@@ -425,6 +435,13 @@ pub const Codegen = struct {
                 const reg = try self.nextScratch();
                 try self.locals.put(self.gpa, p.name, .{ .reg = reg, .type_expr = p.type_expr });
             }
+        }
+
+        // Configure the stack before any push — only done once, at program entry.
+        if (is_main) {
+            try writer.writeAll("    mov re, 0xFFFC\n");
+            try writer.writeAll("    mov rf, 0x0800\n");
+            try writer.writeAll("    stackset re, rf\n");
         }
 
         // Only save jr if the body contains branch instructions. Any bn/bnt/bnf/b/bt/bf

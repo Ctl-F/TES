@@ -211,7 +211,9 @@ pub const Lexer = struct {
             if (c >= '0' and c <= '9') { n = n * 10 + (c - '0'); _ = self.advance(); }
             else break;
         }
-        if (n > 0) self.line = n;
+        // Set to n-1 so that the trailing '\n' (consumed by the caller via advance())
+        // increments self.line to exactly n, making the NEXT real token land on line n.
+        if (n > 0) self.line = n - 1;
         // skip whitespace
         while (self.peek()) |c| { if (c == ' ' or c == '\t') _ = self.advance() else break; }
         // parse optional quoted filename
