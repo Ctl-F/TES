@@ -6,8 +6,76 @@
 #define true 1
 #define false 0
 
+#define IO_SOURCE_DISABLED 0
+#define IO_SOURCE_CONTROLLER_0 1
+#define IO_SOURCE_CONTROLLER_1 2
+#define IO_SOURCE_CONTROLLER_2 3
+#define IO_SOURCE_CONTROLLER_3 4
+#define IO_SOURCE_CURSOR 5
+#define IO_SOURCE_TEXT 6
+
+#define IO_CONTROLLER_LEFT 0
+#define IO_CONTROLLER_RIGHT 1
+#define IO_CONTROLLER_UP 2
+#define IO_CONTROLLER_DOWN 3
+#define IO_CONTROLLER_BTN0 4
+#define IO_CONTROLLER_BTN1 5
+#define IO_CONTROLLER_BTN2 6
+#define IO_CONTROLLER_BTN3 7
+#define IO_CONTROLLER_MENU 8
+#define IO_CONTROLLER_START 9
+#define IO_CONTROLLER_ALT 10
+
+#define IO_CURSOR_SOURCE_X 0
+#define IO_CURSOR_SOURCE_Y 1
+#define IO_CURSOR_SOURCE_BUTTON_LEFT 2
+#define IO_CURSOR_BUTTON_RIGHT 3
+#define IO_CURSOR_BUTTON_MIDDLE 4
+
+struct IOBufferControllerSource {
+    left: u8;
+    right: u8;
+    up: u8;
+    down: u8;
+    button0: u8;
+    button1: u8;
+    button2: u8;
+    button3: u8;
+    menu: u8;
+    start: u8;
+    alt: u8;
+};
+
+struct IOBufferCursorSource {
+    x: u16;
+    y: u16;
+    xPrev: u16;
+    yPrev: u16;
+    xRel: u16;
+    yRel: u16;
+    buttonLeft: u8;
+    buttonRight: u8;
+    buttonMiddle: u8;
+};
+
+struct IOBufferTextSource {
+    lastChar: u8;
+    control: u8;
+    shift: u8;
+    alt: u8;
+    accum: [32]u8;
+    accumCursor: u8;
+};
+
+struct IOSource {
+    source: u8;
+    bufferHigh: u16;
+    bufferLow: u16;
+};
+
 struct IOHeader {
     closeSignal: u8;
+    sources: [4]IOSource;
 };
 
 #define STRUCT_LAYER_CONFIG_DISABLED 0

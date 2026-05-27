@@ -318,11 +318,11 @@ pub const TESVM = struct {
     }
 
     fn runImpl(this: *@This(), comptime isCoPro: bool) !void {
-        const ClockSpeed = 1_170_000;
+        const ClockSpeed = 12_510_000;
         const FPS = 30;
-        const CyclesPerFrame = ClockSpeed / FPS;
+        const CyclesPerFrame = ClockSpeed / FPS; // 166,666
         const NsPerCycle = std.time.ns_per_s / ClockSpeed;
-        const NsPerFrame = std.time.ns_per_s / FPS;
+        const NsPerFrame = std.time.ns_per_s / FPS; // 33.3ms
 
         var lastTime = std.Io.Timestamp.now(this.io, .awake);
         var ns_accum: i96 = 0;
@@ -331,6 +331,8 @@ pub const TESVM = struct {
         const RFCL = doubleRegIndex(.FCL);
         const RGCL = doubleRegIndex(.GCL);
 
+        var yielded_frame: bool = false;
+
         while (!this.nonidxRegisters.flags.halted) {
             const currentTime = std.Io.Timestamp.now(this.io, .awake);
             const elapsed = lastTime.durationTo(currentTime);
@@ -338,64 +340,182 @@ pub const TESVM = struct {
 
             ns_accum += elapsed.nanoseconds;
 
+            // Anti-spiral time debt barrier
             if (ns_accum > NsPerFrame * 2) {
                 ns_accum = NsPerFrame;
             }
 
             if (ns_accum >= NsPerCycle) {
-                const cyclesToRun = @as(u32, @intCast(@divFloor(ns_accum, NsPerCycle)));
+                var cyclesToRun = @as(u32, @intCast(@divFloor(ns_accum, NsPerCycle)));
                 ns_accum = @rem(ns_accum, NsPerCycle);
 
                 const wideRegs = this.registers.doubleRegisters();
-                const preClock = wideRegs[RGCL];
 
-                const status = this.exec(cyclesToRun, isCoPro) catch |e| {
-                    if (e == error.AbruptProgramEOF) {
-                        std.debug.print("IP {}/{} instructions\n", .{
-                            this.registers.doubleRegisters()[doubleRegIndex(.IP)],
-                            this.instructionBuffer.len,
-                        });
-                    }
-                    return e;
-                };
-
-                const postClock = wideRegs[RGCL];
-                const consumed = postClock -% preClock;
-
-                cyclesInFrame += consumed;
-
-                if (status == .Yield) {
-                    if (cyclesInFrame < CyclesPerFrame) {
-                        const remaining = CyclesPerFrame - cyclesInFrame;
-                        wideRegs[RFCL] += remaining;
-                        cyclesInFrame = CyclesPerFrame;
-                    }
+                if (cyclesToRun > CyclesPerFrame) {
+                    cyclesToRun = CyclesPerFrame;
                 }
 
-                while (cyclesInFrame >= CyclesPerFrame) {
-                    try this.frameHook(this);
+                // --- STRATEGY: ONLY EXECUTE IF GUEST IS NOT WAITING FOR VSYNC ---
+                if (!yielded_frame) {
+                    const preClock = wideRegs[RGCL];
 
-                    lastTime = std.Io.Timestamp.now(this.io, .awake);
-                    ns_accum = 0;
+                    const status = this.exec(cyclesToRun, isCoPro) catch |e| {
+                        if (e == error.AbruptProgramEOF) {
+                            std.debug.print("IP {}/{} instructions\n", .{
+                                this.registers.doubleRegisters()[doubleRegIndex(.IP)],
+                                this.instructionBuffer.len,
+                            });
+                        }
+                        return e;
+                    };
 
+                    const postClock = wideRegs[RGCL];
+                    const consumed = postClock -% preClock;
+                    cyclesInFrame += consumed;
+
+                    if (status == .Yield) {
+                        yielded_frame = true;
+
+                        // Pad guest frame cycle limits up to full frame metrics
+                        if (cyclesInFrame < CyclesPerFrame) {
+                            const remaining = CyclesPerFrame - cyclesInFrame;
+                            wideRegs[RFCL] += remaining;
+                            cyclesInFrame = CyclesPerFrame;
+                        }
+                    }
+                } else {
+                    // If the guest has already yielded, it is consuming time slices
+                    // up to the hardware frame boundary limit without running instruction loops
+                    cyclesInFrame += cyclesToRun;
+                }
+
+                // --- MASTER HARDWARE FRAME TRIGGER ---
+                if (cyclesInFrame >= CyclesPerFrame) {
+                    if (yielded_frame) {
+                        // The guest explicitly finished drawing its frame!
+                        // It is now safe to show this complete image to the world.
+                        try this.frameHook(this);
+
+                        yielded_frame = false;
+                        ns_accum = 0; // Sync the real-world clock anchor
+                    }
+
+                    // Always balance the structural metrics
                     cyclesInFrame -= CyclesPerFrame;
                     wideRegs[RFCL] = cyclesInFrame;
                 }
-
-                if (ns_accum >= NsPerCycle) {
-                    ns_accum = 0;
-                }
             }
 
-            // if (ns_accum < NsPerCycle) {
-            //     try std.Thread.yield();
-            // }
+            // Clean OS thread resting
             if (ns_accum < NsPerCycle) {
-                const duration = std.Io.Duration.fromNanoseconds(NsPerCycle - ns_accum);
+                const duration = std.Io.Duration.fromMilliseconds(1);
                 _ = try this.io.sleep(duration, .awake);
             }
         }
     }
+
+    // fn runImpl(this: *@This(), comptime isCoPro: bool) !void {
+    //     const ClockSpeed = 5000000; //1_170_000;
+    //     const FPS = 30;
+    //     const CyclesPerFrame = ClockSpeed / FPS;
+    //     const NsPerCycle = std.time.ns_per_s / ClockSpeed;
+    //     const NsPerFrame = std.time.ns_per_s / FPS;
+
+    //     var lastTime = std.Io.Timestamp.now(this.io, .awake);
+    //     var ns_accum: i96 = 0;
+    //     var cyclesInFrame: u32 = 0;
+
+    //     const RFCL = doubleRegIndex(.FCL);
+    //     const RGCL = doubleRegIndex(.GCL);
+
+    //     var frame_cycle_total: u64 = 0;
+    //     var yielded_frame: bool = false;
+
+    //     while (!this.nonidxRegisters.flags.halted) {
+    //         const currentTime = std.Io.Timestamp.now(this.io, .awake);
+    //         const elapsed = lastTime.durationTo(currentTime);
+    //         lastTime = currentTime;
+
+    //         ns_accum += elapsed.nanoseconds;
+
+    //         if (ns_accum > NsPerFrame * 2) {
+    //             ns_accum = NsPerFrame;
+    //         }
+
+    //         if (ns_accum >= NsPerCycle) {
+    //             var cyclesToRun = @as(u32, @intCast(@divFloor(ns_accum, NsPerCycle)));
+    //             ns_accum = @rem(ns_accum, NsPerCycle);
+
+    //             const wideRegs = this.registers.doubleRegisters();
+    //             const preClock = wideRegs[RGCL];
+
+    //             if (cyclesToRun > CyclesPerFrame) {
+    //                 cyclesToRun = CyclesPerFrame;
+    //             }
+
+    //             frame_cycle_total += cyclesToRun;
+
+    //             const status = this.exec(cyclesToRun, isCoPro) catch |e| {
+    //                 if (e == error.AbruptProgramEOF) {
+    //                     std.debug.print("IP {}/{} instructions\n", .{
+    //                         this.registers.doubleRegisters()[doubleRegIndex(.IP)],
+    //                         this.instructionBuffer.len,
+    //                     });
+    //                 }
+    //                 return e;
+    //             };
+
+    //             const postClock = wideRegs[RGCL];
+    //             const consumed = postClock -% preClock;
+
+    //             cyclesInFrame += consumed;
+
+    //             if (status == .Yield) {
+    //                 std.debug.print("Frame Cycles Total (Yielded): {}\n", .{frame_cycle_total});
+    //                 frame_cycle_total = 0;
+    //                 yielded_frame = true;
+
+    //                 lastTime = std.Io.Timestamp.now(this.io, .awake);
+    //                 ns_accum = 0;
+    //                 cyclesInFrame = 0;
+
+    //                 // if (cyclesInFrame < CyclesPerFrame) {
+    //                 //     const remaining = CyclesPerFrame - cyclesInFrame;
+    //                 //     wideRegs[RFCL] += remaining;
+    //                 //     cyclesInFrame = CyclesPerFrame;
+    //                 // }
+    //             }
+
+    //             if (yielded_frame) {
+    //                 while (cyclesInFrame >= CyclesPerFrame) {
+    //                     std.debug.print("Frame Cycles Total: {}\n", .{frame_cycle_total});
+    //                     frame_cycle_total = 0;
+
+    //                     try this.frameHook(this);
+    //                     yielded_frame = false;
+    //                     lastTime = std.Io.Timestamp.now(this.io, .awake);
+    //                     ns_accum = 0;
+
+    //                     cyclesInFrame -= CyclesPerFrame;
+    //                     wideRegs[RFCL] = cyclesInFrame;
+    //                 }
+
+    //                 if (ns_accum >= NsPerCycle) {
+    //                     ns_accum = 0;
+    //                 }
+    //             }
+    //         }
+
+    //         // if (ns_accum < NsPerCycle) {
+    //         //     try std.Thread.yield();
+    //         // }
+    //         if (ns_accum < NsPerCycle) {
+    //             //const duration = std.Io.Duration.fromNanoseconds(NsPerCycle - ns_accum);
+    //             const duration = std.Io.Duration.fromMilliseconds(1);
+    //             _ = try this.io.sleep(duration, .awake);
+    //         }
+    //     }
+    // }
 
     const Status = enum {
         Ok,
@@ -581,13 +701,10 @@ pub const TESVM = struct {
                 const wideRegisters = this.registers.doubleRegisters();
                 wideRegisters[doubleRegIndex(.IP)] += 1;
 
-                var consumed = cycles;
-
-                while (consumed > 0) {
-                    const iterConsumed: u8 = @truncate(consumed);
-                    consumed -= iterConsumed;
-                    this.tickClock(iterConsumed);
-                    cycles = if (iterConsumed > cycles) 0 else cycles - iterConsumed;
+                while (cycles > 0) {
+                    const chunk: u8 = if (cycles > 255) 255 else @truncate(cycles);
+                    this.tickClock(chunk);
+                    cycles -= chunk;
                 }
                 return .Yield;
             },

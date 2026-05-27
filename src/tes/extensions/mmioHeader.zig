@@ -21,8 +21,106 @@ pub const MMMap = extern struct {
     pub const STRUCT_LAYER_CONFIG_DISABLED: u8 = 0;
     pub const STRUCT_LAYER_CONFIG_FRAMEBUFFER: u8 = 1;
 
+    pub const IO_CONTROLLER_LEFT: u8 = 0;
+    pub const IO_CONTROLLER_RIGHT: u8 = 1;
+    pub const IO_CONTROLLER_UP: u8 = 2;
+    pub const IO_CONTROLLER_DOWN: u8 = 3;
+    pub const IO_CONTROLLER_BTN0: u8 = 4;
+    pub const IO_CONTROLLER_BTN1: u8 = 5;
+    pub const IO_CONTROLLER_BTN2: u8 = 6;
+    pub const IO_CONTROLLER_BTN3: u8 = 7;
+    pub const IO_CONTROLLER_MENU: u8 = 8;
+    pub const IO_CONTROLLER_START: u8 = 9;
+    pub const IO_CONTROLLER_ALT: u8 = 10;
+    pub const IO_CONTROLLER_INPUT_COUNT: u8 = 11;
+
+    pub const IO_CURSOR_SOURCE_X: u8 = 0;
+    pub const IO_CURSOR_SOURCE_Y: u8 = 1;
+    pub const IO_CURSOR_BUTTON_LEFT: u8 = 2;
+    pub const IO_CURSOR_BUTTON_RIGHT: u8 = 3;
+    pub const IO_CURSOR_BUTTON_MIDDLE: u8 = 4;
+
+    // SCHEMA:
+    // SOURCE 0
+    // w -> up
+    // a -> left
+    // s -> down
+    // d -> right
+    // j -> BTN 0
+    // k -> BTN 1
+    // l -> BTN 2
+    // i -> BNT 3
+    // lshift -> BTN ALT
+    // escape -> BTN MENU
+    // f -> BTN START
+    //
+    // SOURCE 1
+    // Left -> left
+    // Right -> right
+    // Up -> up
+    // Down -> down
+    // np 1 -> BTN 0
+    // np 2 -> BTN 1
+    // NP 3 -> BNT 2
+    // np 5 -> BNT 3
+    // R ctl -> BTN ALT
+    // R shift -> BTN MENU
+    // NP enter -> BTN START
+    //
+    // SOURCE 2 and SOURCE 3
+    // actually map to controllers
+    pub const IO_SOURCE_DISABLED: u8 = 0;
+    pub const IO_SOURCE_CONTROLLER_0: u8 = 1;
+    pub const IO_SOURCE_CONTROLLER_1: u8 = 2;
+    pub const IO_SOURCE_CONTROLLER_2: u8 = 3;
+    pub const IO_SOURCE_CONTROLLER_3: u8 = 4;
+    pub const IO_SOURCE_CURSOR: u8 = 5;
+    pub const IO_SOURCE_TEXT: u8 = 6;
+
+    pub const IOSource = extern struct {
+        source: u8,
+        bufferHigh: u16,
+        bufferLow: u16,
+    };
+
+    pub const IOBufferControllerSource = extern struct {
+        sLeft: u8,
+        sRight: u8,
+        sUp: u8,
+        sDown: u8,
+        sBtn0: u8,
+        sBtn1: u8,
+        sBtn2: u8,
+        sBtn3: u8,
+        sMenu: u8,
+        sStart: u8,
+        sAlt: u8,
+    };
+
+    pub const IOBufferCursorSource = extern struct {
+        x: u16,
+        y: u16,
+        xPrev: u16,
+        yPrev: u16,
+        xRel: u16,
+        yRel: u16,
+        sBtnLeft: u8,
+        sBtnRight: u8,
+        sBtnMiddle: u8,
+    };
+
+    pub const IOBufferTextSource = extern struct {
+        lastChar: u8,
+        control: u8,
+        shift: u8,
+        alt: u8,
+        accum: [32]u8,
+        accumCursor: u8,
+    };
+
     pub const IOHeader = extern struct {
         closeSignal: u8 = 0,
+        sources: [4]IOSource,
     };
 
     pub const PixelFormat = enum(u8) {

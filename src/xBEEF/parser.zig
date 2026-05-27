@@ -637,6 +637,17 @@ pub const Parser = struct {
             _ = try self.expect(.RBrace);
             return;
         }
+        // Struct type with a scalar initializer (e.g. `myVar: .Pawn 0`).
+        // Only `0` is accepted — it zero-fills the entire struct.
+        if (prim == .Struct) {
+            const sd = self.sym.getStruct(sname.?) orelse return ParseError.StructNotFound;
+            const val = try self.parseConstExpr();
+            if (val != 0) return ParseError.InvalidInitializer;
+            var i: u16 = 0;
+            while (i < sd.total_size) : (i += 1)
+                buf.append(self.allocator, 0) catch return ParseError.OutOfMemory;
+            return;
+        }
         const val = try self.parseConstExpr();
         try self.appendValue(buf, prim, val);
     }
@@ -656,7 +667,7 @@ pub const Parser = struct {
                 std.mem.writeInt(u16, &tmp, @bitCast(v16), .little);
                 buf.appendSlice(self.allocator, &tmp) catch return ParseError.OutOfMemory;
             },
-            .Struct => unreachable,
+            .Struct => return ParseError.InvalidInitializer,
         }
     }
 
