@@ -91,17 +91,17 @@ _reverse_x:
 
     ; extracted.low now holds xvelocity
     ; clear upper half of velocity
-    exts tmp;
-    neg tmp;
-    truncz tmp;
-    mov tmp2, 8;
-    rol tmp, tmp2;
+    exts extracted;
+    neg extracted;
+    truncz extracted;
+    mov tmp, 8;
+    rol extracted, tmp;
 
 
-    ; tmp now holds negated velocity
+    ; extracted now holds negated velocity
     mov tmp2, 0x00FF;
     and ball_velocity, tmp2;
-    or ball_velocity, tmp;
+    or ball_velocity, extracted;
 _skip_reverse_x:
 
     ; get y position;
@@ -123,8 +123,8 @@ _reverse_y:
     truncz extracted;
 
     mov tmp2, 0xFF00;
-    and ball_position, tmp2;
-    or ball_velocity, tmp;
+    and ball_velocity, tmp2;
+    or ball_velocity, extracted;
 
 _skip_reverse_y:
 
@@ -140,12 +140,12 @@ _write_ball:
     ; calculate index
     ; formula: x + y * width;
     ; get x
-    mov tmp, ball_velocity;
+    mov tmp, ball_position;
     mov tmp2, 8;
     ror tmp, tmp2;
     truncz tmp;
 
-    mov tmp2, (byte)ball_velocity;
+    mov tmp2, (byte)ball_position;
     mov tmp3, $WINDOW_WIDTH;
 
     fma tmp, tmp2, tmp3;

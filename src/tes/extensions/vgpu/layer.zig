@@ -211,8 +211,9 @@ pub const PixelBufferLayer = struct {
         native.glDeleteBuffers(1, &this.context.vbo);
         native.glDeleteVertexArrays(1, &this.context.vao);
 
-        parent.arena.free(this.context.decompressionBuffer.?);
-
+        if (this.context.decompressionBuffer) |dbuf| {
+            parent.arena.free(dbuf);
+        }
         this.context = .{};
     }
 };

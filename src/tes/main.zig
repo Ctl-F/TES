@@ -60,10 +60,10 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    if (!native.SDL_Init(native.SDL_INIT_VIDEO)) {
-        return error.SDL_Init;
-    }
-    defer native.SDL_Quit();
+    // if (!native.SDL_Init(native.SDL_INIT_VIDEO)) {
+    //     return error.SDL_Init;
+    // }
+    // defer native.SDL_Quit();
 
     try vm.run();
 

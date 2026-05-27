@@ -235,7 +235,7 @@ pub const vGPU = struct {
             this.context.height,
             1,
             native.GL_RGBA,
-            native.GL_UNSIGEND_BYTE,
+            native.GL_UNSIGNED_BYTE,
             @ptrCast(pixels.ptr),
         );
     }

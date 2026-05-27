@@ -387,8 +387,12 @@ pub const TESVM = struct {
                 }
             }
 
+            // if (ns_accum < NsPerCycle) {
+            //     try std.Thread.yield();
+            // }
             if (ns_accum < NsPerCycle) {
-                try std.Thread.yield();
+                const duration = std.Io.Duration.fromNanoseconds(NsPerCycle - ns_accum);
+                _ = try this.io.sleep(duration, .awake);
             }
         }
     }
