@@ -243,10 +243,13 @@ pub const Preprocessor = struct {
                     const included = try self.processInclude(rest, source_path);
                     defer self.allocator.free(included);
                     try out.appendSlice(self.allocator, included);
-                    // Restore parent file/line after include expansion
+                    // Restore parent file/line after include expansion.
+                    // We emit #line line_num (not line_num+1) because the blank '\n'
+                    // that follows (for the #include directive line itself) will
+                    // advance the lexer counter by one more, landing on line_num+1.
                     {
                         var tmp: [std.fs.max_path_bytes + 32]u8 = undefined;
-                        const mark = std.fmt.bufPrint(&tmp, "#line {} \"{s}\"\n", .{ line_num + 1, source_path }) catch return PreprocError.OutOfMemory;
+                        const mark = std.fmt.bufPrint(&tmp, "#line {} \"{s}\"\n", .{ line_num, source_path }) catch return PreprocError.OutOfMemory;
                         out.appendSlice(self.allocator, mark) catch return PreprocError.OutOfMemory;
                     }
                 }

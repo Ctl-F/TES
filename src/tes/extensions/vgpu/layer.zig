@@ -50,17 +50,16 @@ pub const PixelBufferLayer = struct {
     config: *MMMap.GFXPixelLayerConfig,
 
     const PixelShaderVert = @embedFile("../PixelShader_VTX.glsl");
-    const PixelShaderFrag = @embedFile("../PixelShader_VTX.glsl");
+    const PixelShaderFrag = @embedFile("../PixelShader_FRX.glsl");
 
     pub fn attach(this: *@This(), parent: *gpu, idx: u16) anyerror!void {
-        const FullScreenQuad = VGPU.FullScreenQuad;
-
         const header = parent.getHeader();
         const config = try header.layers[idx].getConfigBuffer(parent.parent);
         const pixelConfig: *MMMap.GFXPixelLayerConfig = @ptrCast(@alignCast(config));
 
         if (pixelConfig.format != @intFromEnum(MMMap.PixelFormat.RGBA32)) {
-            this.context.decompressionBuffer = try parent.arena.alloc(u8, pixelConfig.width * pixelConfig.height * 4);
+            const bufferSize = @as(usize, @intCast(pixelConfig.width)) * @as(usize, @intCast(pixelConfig.height)) * 4;
+            this.context.decompressionBuffer = try parent.arena.alloc(u8, bufferSize);
             errdefer {
                 parent.arena.free(this.context.decompressionBuffer);
                 this.context.decompressionBuffer = null;
@@ -95,7 +94,23 @@ pub const PixelBufferLayer = struct {
         native.glGenTextures(1, &this.context.textureHandle);
         native.glBindTexture(native.GL_TEXTURE_2D, this.context.textureHandle);
 
-        native.glTexImage2D(native.GL_TEXTURE_2D, 0, native.GL_RGBA8, @intCast(pixelConfig.width), @intCast(pixelConfig.height), 0, native.GL_RGBA8, native.GL_UNSIGNED_BYTE, null);
+        native.glTexImage2D(
+            native.GL_TEXTURE_2D,
+            0,
+            native.GL_RGBA8,
+            @intCast(pixelConfig.width),
+            @intCast(pixelConfig.height),
+            0,
+            native.GL_RGBA,
+            native.GL_UNSIGNED_BYTE,
+            null,
+        );
+
+        // Fallback safety filters for flat textures without mipmap chains
+        native.glTexParameteri(native.GL_TEXTURE_2D, native.GL_TEXTURE_MIN_FILTER, native.GL_NEAREST);
+        native.glTexParameteri(native.GL_TEXTURE_2D, native.GL_TEXTURE_MAG_FILTER, native.GL_NEAREST);
+        native.glTexParameteri(native.GL_TEXTURE_2D, native.GL_TEXTURE_WRAP_S, native.GL_CLAMP_TO_EDGE);
+        native.glTexParameteri(native.GL_TEXTURE_2D, native.GL_TEXTURE_WRAP_T, native.GL_CLAMP_TO_EDGE);
 
         native.glBindTexture(native.GL_TEXTURE_2D, 0);
     }
@@ -144,13 +159,38 @@ pub const PixelBufferLayer = struct {
         const pixelConfig: *MMMap.GFXPixelLayerConfig = @ptrCast(@alignCast(config));
 
         const pixelBuffer = if (pixelConfig.format != @intFromEnum(MMMap.PixelFormat.RGBA32)) CONV: {
-            const sourceLength: usize = pixelConfig.width * pixelConfig.height * getFormatWidth(@enumFromInt(pixelConfig.format));
+            const sourceLength: usize = @as(usize, @intCast(pixelConfig.width)) * @as(usize, @intCast(pixelConfig.height)) * getFormatWidth(@enumFromInt(pixelConfig.format));
             try convert(pixelConfig.width, pixelConfig.height, @as(MMMap.PixelFormat, @enumFromInt(pixelConfig.format)), data[0..sourceLength], .RGBA32, this.context.decompressionBuffer.?);
-            break :CONV this.context.decompressionBuffer.?.ptr;
-        } else data;
 
+            var count: usize = 0;
+
+            for (0..this.context.decompressionBuffer.?.len) |i| {
+                if (this.context.decompressionBuffer.?[i] != 0) {
+                    count += 1;
+                }
+            }
+
+            break :CONV this.context.decompressionBuffer.?.ptr;
+        } else BLK: {
+            break :BLK data;
+        };
+
+        native.glActiveTexture(native.GL_TEXTURE0);
         native.glBindTexture(native.GL_TEXTURE_2D, this.context.textureHandle);
-        native.glTexSubImage2D(native.GL_TEXTURE_2D, 0, 0, 0, @intCast(pixelConfig.width), @intCast(pixelConfig.height), native.GL_RGBA8, native.GL_UNSIGNED_BYTE, @ptrCast(pixelBuffer));
+
+        native.glPixelStorei(native.GL_UNPACK_ALIGNMENT, 1);
+
+        native.glTexSubImage2D(
+            native.GL_TEXTURE_2D,
+            0,
+            0,
+            0,
+            @intCast(pixelConfig.width),
+            @intCast(pixelConfig.height),
+            native.GL_RGBA,
+            native.GL_UNSIGNED_BYTE,
+            @ptrCast(pixelBuffer),
+        );
 
         native.glBindVertexArray(this.context.vao);
         native.glBindBuffer(native.GL_ARRAY_BUFFER, this.context.vbo);
@@ -175,4 +215,16 @@ pub const PixelBufferLayer = struct {
 
         this.context = .{};
     }
+};
+
+// Inside PixelBufferLayer
+const FullScreenQuad = [_]f32{
+    // x,    y,    u,   v
+    -1.0, -1.0, 0.0, 0.0,
+    1.0,  -1.0, 1.0, 0.0,
+    -1.0, 1.0,  0.0, 1.0,
+
+    -1.0, 1.0,  0.0, 1.0,
+    1.0,  -1.0, 1.0, 0.0,
+    1.0,  1.0,  1.0, 1.0,
 };

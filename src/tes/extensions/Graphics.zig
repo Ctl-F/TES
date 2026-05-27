@@ -167,11 +167,14 @@ fn syncGPULayer(header: *mmMap, layerID: u16, gpu: *vGPU.vGPU) !void {
         .pixelBuffer => mmMap.STRUCT_LAYER_CONFIG_FRAMEBUFFER,
     };
 
+    std.debug.print("Syncing layer {}: structType={} layerType={} gpuLayerIsEnabled={} headerLayerIsEnabled={}\n", .{ layerID, structType, layerType, gpuLayerIsEnabled, headerLayerIsEnabled });
+
     // if they are both enabled or disabled and of the same type
     // we sync the data and exit
     if (structType == layerType and gpuLayerIsEnabled == headerLayerIsEnabled) {
         if (gpuLayerIsEnabled) {
             try syncGPULayerData(gpu, layerID, headerLayerData);
+            std.debug.print("Synced layer data only {}\n", .{layerID});
         }
         return;
     }
@@ -180,10 +183,12 @@ fn syncGPULayer(header: *mmMap, layerID: u16, gpu: *vGPU.vGPU) !void {
     // do so
     if (gpuLayerIsEnabled != headerLayerIsEnabled) {
         if (!headerLayerIsEnabled) {
+            std.debug.print("Disabling layer {}\n", .{layerID});
             try disableGPULayer(gpu, layerID);
             return;
         } else {
-            try enableGPULayer(gpu, layerType, layerID, header);
+            std.debug.print("Enabling layer {}\n", .{layerID});
+            try enableGPULayer(gpu, structType, layerID, header);
             return;
         }
     }
@@ -198,20 +203,37 @@ fn syncGPULayer(header: *mmMap, layerID: u16, gpu: *vGPU.vGPU) !void {
     // by here we know that the header is enabled, the gpu is also enabled
     // but the header type !== layer type so we need to disable the layer and then
     // enable it to the correct type
+    std.debug.print("Layer type mismatch: header={} layer={}\n", .{ headerLayerIsEnabled, gpuLayerIsEnabled });
     try disableGPULayer(gpu, layerID);
-    try enableGPULayer(gpu, layerType, layerID, header);
+    std.debug.print("Enabling layer {}\n", .{layerID});
+    try enableGPULayer(gpu, structType, layerID, header);
 }
 
 fn disableGPULayer(gpu: *vGPU.vGPU, layerID: u16) !void {
     try gpu.setLayer(layerID, .{ .disabled = .{} });
+
+    // set layer bit
+    const mask: u16 = @as(u16, 1) << @as(u4, @truncate(layerID));
+    const invMask = ~mask;
+    gpu.layerMask &= invMask;
 }
 
 fn enableGPULayer(gpu: *vGPU.vGPU, layerType: u8, layerID: u16, header: *mmMap) !void {
     const layer = try buildGPULayer(gpu, layerType, layerID, header);
+
+    std.debug.print("Enabling layer {}, type: {}\n", .{ layerID, layerType });
+
     try gpu.setLayer(layerID, layer);
+
+    // set layer bit
+    const mask: u16 = @as(u16, 1) << @as(u4, @truncate(layerID));
+    gpu.layerMask |= mask;
+
+    std.debug.print("[egpu] Layer Mask: {b}\n", .{gpu.layerMask});
 }
 
 fn buildGPULayer(gpu: *vGPU.vGPU, layerType: u8, layerID: u16, header: *mmMap) !Layers.Layer {
+    std.debug.print("[egpu] Building layer: {}, type: {}\n", .{ layerID, layerType });
     switch (layerType) {
         mmMap.STRUCT_LAYER_CONFIG_DISABLED => {
             return .{ .disabled = .{} };
@@ -222,6 +244,7 @@ fn buildGPULayer(gpu: *vGPU.vGPU, layerType: u8, layerID: u16, header: *mmMap) !
             );
 
             const pixelConfig: *mmMap.GFXPixelLayerConfig = @ptrCast(@alignCast(config));
+            std.debug.print("[egpu] Building pixel buffer layer, config: {}, {}\n", .{ layerID, pixelConfig });
 
             return .{
                 .pixelBuffer = .{

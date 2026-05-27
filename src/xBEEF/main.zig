@@ -23,6 +23,7 @@ const usage =
     \\  -D <name[=val]>   Define a preprocessor macro (val defaults to 1)
     \\  --debug           Emit debug symbols in TBF output
     \\  --disasm          Disassemble a .tbf binary back to .tes source
+    \\  --map             Prefix each instruction with its raw hex bytes (requires --disasm)
     \\  --extract <ip>    Print the instruction at IP address <ip> (requires --disasm)
     \\  --window <n>      Context lines on each side for --extract (default: 5)
     \\  --dump-tokens     Print token stream and exit
@@ -32,8 +33,10 @@ const usage =
     \\Examples:
     \\  tas game.tes -o game.tbf --debug
     \\  tas --disasm game.tbf -o game_dis.tes
+    \\  tas --disasm --map game.tbf -o game_dis.tes
     \\  tas --disasm --extract 27 game.tbf
     \\  tas --disasm --extract 27 --window 10 game.tbf
+    \\  tas --disasm --extract 27 --map game.tbf
     \\
 ;
 
@@ -66,6 +69,7 @@ pub fn main(init: std.process.Init) !void {
     var dump_tokens = false;
     var dump_symbols = false;
     var do_disasm = false;
+    var map_mode = false;
     var extract_ip: ?u32 = null;
     var extract_window: u32 = 5;
 
@@ -85,6 +89,8 @@ pub fn main(init: std.process.Init) !void {
             emit_debug = true;
         } else if (std.mem.eql(u8, arg, "--disasm")) {
             do_disasm = true;
+        } else if (std.mem.eql(u8, arg, "--map")) {
+            map_mode = true;
         } else if (std.mem.eql(u8, arg, "--extract")) {
             i += 1;
             if (i >= args.len) {
@@ -164,7 +170,7 @@ pub fn main(init: std.process.Init) !void {
     if (do_disasm) {
         if (extract_ip) |ip| {
             // Extract mode: always writes to stdout
-            try disasm.disassembleExtract(allocator, io, inpath, stdout, ip, extract_window);
+            try disasm.disassembleExtract(allocator, io, inpath, stdout, ip, extract_window, map_mode);
         } else {
             const dis_out = output_path orelse blk: {
                 const stem = if (std.mem.lastIndexOfScalar(u8, inpath, '.')) |dot|
@@ -174,13 +180,13 @@ pub fn main(init: std.process.Init) !void {
                 break :blk try std.fmt.allocPrint(allocator, "{s}_dis.tes", .{stem});
             };
             if (std.mem.eql(u8, dis_out, "-")) {
-                try disasm.disassemble(allocator, io, inpath, stdout);
+                try disasm.disassemble(allocator, io, inpath, stdout, map_mode);
             } else {
                 const file = try std.Io.Dir.cwd().createFile(io, dis_out, .{});
                 defer file.close(io);
                 var fbuf: [4096]u8 = undefined;
                 var fw = file.writer(io, &fbuf);
-                try disasm.disassemble(allocator, io, inpath, &fw.interface);
+                try disasm.disassemble(allocator, io, inpath, &fw.interface, map_mode);
                 try fw.interface.flush();
                 try stdout.print("Disassembled {s} -> {s}\n", .{ inpath, dis_out });
             }
@@ -191,7 +197,8 @@ pub fn main(init: std.process.Init) !void {
     // ── Read source ──────────────────────────────────────────────────────
     const src = std.Io.Dir.cwd().readFileAlloc(io, inpath, allocator, .limited(64 * 1024 * 1024)) catch |e| {
         try stderr.print("Error: cannot read '{s}': {}\n", .{ inpath, e });
-        return e;
+        try stderr.flush();
+        std.process.exit(1);
     };
 
     // ── Preprocess ───────────────────────────────────────────────────────
@@ -211,14 +218,16 @@ pub fn main(init: std.process.Init) !void {
 
     const preprocessed = prep.process(src, inpath) catch |e| {
         try stderr.print("Preprocessor error: {}\n", .{e});
-        return e;
+        try stderr.flush();
+        std.process.exit(1);
     };
 
     // ── Lex ──────────────────────────────────────────────────────────────
     var lx = lexer.Lexer.initWithFile(preprocessed, inpath);
     const token_slice = lx.tokenize(allocator) catch |e| {
         try stderr.print("Lexer error: {}\n", .{e});
-        return e;
+        try stderr.flush();
+        std.process.exit(1);
     };
 
     if (dump_tokens) {
@@ -234,11 +243,13 @@ pub fn main(init: std.process.Init) !void {
 
     // ── Parse ────────────────────────────────────────────────────────────
     var p = parser.Parser.init(allocator, token_slice, emit_debug, &prep.source_map);
-    p.parse() catch |e| {
+    p.parse() catch {
         p.deinit();
-        // The parser already printed a specific diagnostic above.
-        // Return the error code so the shell sees a non-zero exit status.
-        return e;
+        // The parser already printed a specific diagnostic with source context.
+        // Use exit(1) instead of returning the error so the Zig runtime does not
+        // print its own "error: XxxError\n[stack trace]" noise on top of ours.
+        try stderr.flush();
+        std.process.exit(1);
     };
     defer p.deinit();
 
@@ -274,7 +285,8 @@ pub fn main(init: std.process.Init) !void {
     // ── Write TBF ────────────────────────────────────────────────────────
     p.tbfWriter.writeFile(io, outpath) catch |e| {
         try stderr.print("Error writing '{s}': {}\n", .{ outpath, e });
-        return e;
+        try stderr.flush();
+        std.process.exit(1);
     };
 
     try stdout.print(

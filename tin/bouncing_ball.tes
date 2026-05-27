@@ -1,0 +1,236 @@
+#include "stddef.tes"
+
+#define STACK_SIZE 0x800
+
+#define WINDOW_WIDTH 240
+#define WINDOW_HEIGHT 120
+
+[Data(0:0xF000]
+_StackHead: .u8[$STACK_SIZE] 0
+
+
+[Data(0:0x0400)]
+defaultClearColor: .ColorRGB32 .{ 25, 25, 45, 255 }
+layerConfigInst: .GPUPixelLayerConfig .{ $STRUCT_LAYER_CONFIG_FRAMEBUFFER, $PIXEL_FORMAT_RGB565, $WINDOW_WIDTH, $WINDOW_HEIGHT }
+
+
+[Data(1:0x0000)]
+_PixelBuffer: .u8[${ WINDOW_WIDTH * WINDOW_HEIGHT * 2 }] 0
+_EndPixelBuffer:
+
+[Program]
+_start:
+    mov ra, _StackHead
+    mov rb, $STACK_SIZE
+    stackset ra, rb;
+
+    bn _init_gpu;
+
+    mov re, $MMIO_PAGE_ID;
+    mov rf, $MMIO_HEADER_BASE;
+
+@{
+    @bind ball_position: r0;
+    @bind ball_velocity: r1;
+
+    @bind ball_limit_min: r2;
+    @bind ball_limit_max: r3;
+
+    @bind extracted : r4;
+    @bind tmp : r5;
+    @bind tmp2 : r6;
+    @bind tmp3 : r7;
+
+    @bind condition : r9;
+
+#define CENTER_X WINDOW_WIDTH / 2
+#define CENTER_Y WINDOW_HEIGHT / 2
+#define CENTER (CENTER_X << 8) | CENTER_Y;
+
+    ;vldc2 ball_position, ${WINDOW_WIDTH / 2}, ${WINDOW_HEIGHT / 2};
+    mov ball_position, ${ CENTER_X << 8 | CENTER_Y };
+
+    ;vldc2 ball_velocity, 1, 1;
+    mov ball_velocity 0x0101;
+
+    ;vldc2 ball_limit_min, 0, 0;
+    mov ball_limit_max 0x0000;
+
+    ; vldc2 ball_limit_max, ${WINDOW_WIDTH}, ${WINDOW_HEIGHT};
+    mov ball_limit_max, ${ WINDOW_WIDTH << 8 | WINDOW_HEIGHT };
+
+_loop:
+    ; update ball
+    viadd2 ball_position, ball_velocity;
+
+    ; clamp ball to window
+    vmin2 ball_position, ball_limit_max;
+    vmax2 ball_position, ball_limit_min;
+
+    ; reverse x if needed
+
+    ; get x position
+    mov extracted, ball_position;
+    mov tmp, 8;
+    ror extracted, tmp;
+
+    ; extracted.low now holds x position
+    mov tmp, (byte) extracted;
+    xor tmp2, tmp2;
+    seteq condition, tmp2, tmp;
+    bnt condition, _reverse_x;
+
+    mov tmp2, $WINDOW_WIDTH;
+    seteq condition, tmp2, tmp;
+    bnf condition, _skip_reverse_x;
+
+_reverse_x:
+    mov extracted, ball_velocity;
+    mov tmp, 8;
+    ror extracted, tmp;
+
+    ; extracted.low now holds xvelocity
+    ; clear upper half of velocity
+    exts tmp;
+    neg tmp;
+    truncz tmp;
+    mov tmp2, 8;
+    rol tmp, tmp2;
+
+
+    ; tmp now holds negated velocity
+    mov tmp2, 0x00FF;
+    and ball_velocity, tmp2;
+    or ball_velocity, tmp;
+_skip_reverse_x:
+
+    ; get y position;
+    mov extracted, ball_position;
+    mov tmp, (byte)extracted;
+    xor tmp2, tmp2;
+    seteq condition, tmp2, tmp;
+    bnt condition, _reverse_y;
+
+    mov tmp2, $WINDOW_HEIGHT;
+    seteq condition, tmp2, tmp;
+    bnf condition, _skip_reverse_y;
+
+_reverse_y:
+    mov extracted, (byte)ball_velocity;
+
+    exts extracted;
+    neg extracted;
+    truncz extracted;
+
+    mov tmp2, 0xFF00;
+    and ball_position, tmp2;
+    or ball_velocity, tmp;
+
+_skip_reverse_y:
+
+    ; clear to white
+    lea ra, rb, _PixelBuffer;
+    lea ra, rc, _EndPixelBuffer;
+    sub rc, rb;
+    mov re, 0xFF;
+    mset ra, rb, rc, re;
+
+
+_write_ball:
+    ; calculate index
+    ; formula: x + y * width;
+    ; get x
+    mov tmp, ball_velocity;
+    mov tmp2, 8;
+    ror tmp, tmp2;
+    truncz tmp;
+
+    mov tmp2, (byte)ball_velocity;
+    mov tmp3, $WINDOW_WIDTH;
+
+    fma tmp, tmp2, tmp3;
+    mov tmp2, 2;
+    mul tmp, tmp2;
+
+    lea tmp2, tmp3, _PixelBuffer;
+    add tmp3, tmp;
+
+    mov tmp, 0x0000;
+    mov [tmp2, tmp3], tmp;
+}
+    yield;
+    ; poll close event
+    mov ra, (byte)[re, (MemIOMap.io.closeSignal)rf];
+    bnf ra, _loop;
+
+_exit:
+    hlt;
+
+
+@{
+    @bind page : re;
+    @bind ptr : rf;
+    @bind val : rd;
+    @bind valPtrPage : rc;
+    @bind valPtr : rb;
+    @bind val2 : ra;
+
+_init_gpu:
+    push jr;
+
+    mov page, $MMIO_PAGE_ID;
+    mov ptr, $MMIO_HEADER_BASE;
+    mov val, $offsetOf(MemIOMap, gpu);
+    add ptr, val;
+
+    ; initialize gpu
+    mov val, $true;
+    mov (byte) [page, (GPUHeader.enable)ptr], val;
+
+    ; save an instruction and write true to clear color also
+    mov (byte) [page, (GPUHeader.clearEnable)ptr], val;
+
+    ; configure screen
+    mov val, 4;
+    mov (byte) [page, (GPUHeader.screenScale)ptr], val;
+
+    mov val, $WINDOW_WIDTH;
+    mov [page, (GPUHeader.screenWidth)ptr], val;
+
+    mov val, $WINDOW_HEIGHT;
+    mov [page, (GPUHeader.screenHeight)ptr], val;
+
+
+    ; configure clear color
+    lea valPtrPage, valPtr, defaultClearColor;
+    mov val2, $offsetOf(GPUHeader, clearColor);
+    add ptr, val2;
+    mov val, $sizeOf(ColorRGB32);
+
+    mcpy page, ptr, valPtrPage, valPtr, val;
+
+    sub ptr, val2;
+
+    ; enable only 0
+    mov val, 0x0001;
+    mov [page, (GPUHeader.layerEnable)ptr], val;
+
+    ; set the layer config data in the gpu header
+    mov val2, $offsetOf(GPUHeader, layers);
+    add ptr, val2;
+
+    lea valPtrPage, valPtr, layerConfigInst;
+    mov [page, (GPULayerConfig.configHigh)ptr], valPtrPage;
+    mov [page, (GPULayerConfig.configLow)ptr], valPtr;
+
+    lea valPtrPage, valPtr, _PixelBuffer;
+    mov [page, (GPULayerConfig.dataHigh)ptr], valPtrPage;
+    mov [page, (GPULayerConfig.dataLow)ptr], valPtr;
+
+
+    ; push the config to the gpu
+    syscall $cat_GFX, $GFXSync;
+
+    pop jr;
+    b jr;
+}

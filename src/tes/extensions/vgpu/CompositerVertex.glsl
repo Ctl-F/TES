@@ -1,5 +1,5 @@
 #version 330 core
-
+//@Name: CompositerVertex.glsl
 layout(location = 0) in vec2 vPosition;
 layout(location = 1) in vec2 vUv;
 

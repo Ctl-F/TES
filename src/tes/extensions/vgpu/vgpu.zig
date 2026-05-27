@@ -52,6 +52,7 @@ pub const vGPU = struct {
     context: struct {
         window: ?*native.SDL_Window = null,
         context: native.SDL_GLContext = null,
+        fence: ?native.GLsync = null,
 
         windowWidth: u32 = 0,
         windowHeight: u32 = 0,
@@ -124,6 +125,12 @@ pub const vGPU = struct {
         _ = native.SDL_GL_MakeCurrent(window, context);
         if (native.gladLoadGLLoader(@ptrCast(&native.SDL_GL_GetProcAddress)) == 0) {
             return error.ContextLoad;
+        }
+
+        if (native.SDL_GL_SetSwapInterval(1)) {
+            std.debug.print("VSync enabled\n", .{});
+        } else {
+            std.debug.print("VSync could not be enabled\n", .{});
         }
 
         const fbo, const tid = GEN_FB_OBJECTS: {
@@ -262,21 +269,38 @@ pub const vGPU = struct {
     }
 
     pub fn present(this: *@This()) !void {
+        if (this.context.fence) |fence| {
+            _ = native.glClientWaitSync(fence, native.GL_SYNC_FLUSH_COMMANDS_BIT, 500_000_000);
+
+            native.glDeleteSync(fence);
+            this.context.fence = null;
+        }
+
         const header = this.getHeader();
 
         native.glBindFramebuffer(native.GL_FRAMEBUFFER, this.context.fbo);
         native.glViewport(0, 0, this.context.width, this.context.height);
 
+        //std.debug.print("[vgpu] Presenting layer mask: {b}\n", .{this.layerMask});
         for (&this.layers, 0..) |*layer, idx| {
             const mask: u16 = @as(u16, 1) << @as(u4, @truncate(idx));
             if (this.layerMask & mask == 0) continue;
 
+            //std.debug.print("[vgpu] Presenting layer {}\n", .{layer});
+
             native.glFramebufferTextureLayer(native.GL_FRAMEBUFFER, native.GL_COLOR_ATTACHMENT0, this.context.layerTextureArray, 0, @intCast(idx));
+
+            native.glClearColor(0, 0, 0, 0);
+            native.glClear(native.GL_COLOR_BUFFER_BIT);
 
             try layer.present(this, @truncate(idx));
         }
 
+        //native.glFramebufferTextureLayer(native.GL_FRAMEBUFFER, native.GL_COLOR_ATTACHMENT0, 0, 0, 0);
+
         native.glBindFramebuffer(native.GL_FRAMEBUFFER, 0);
+        //native.glFlush();
+
         native.glViewport(0, 0, @intCast(this.context.windowWidth), @intCast(this.context.windowHeight));
 
         if (header.clearEnable != 0) {
@@ -302,6 +326,9 @@ pub const vGPU = struct {
 
         native.glDisable(native.GL_BLEND);
 
+        this.context.fence = native.glFenceSync(native.GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+
+        native.glFinish();
         _ = native.SDL_GL_SwapWindow(this.context.window);
     }
 };
@@ -358,7 +385,7 @@ fn compileShaderStage(src: [:0]const u8, stage: c_uint) !u32 {
 
         // we do this incase of broken/old opengl drivers that don't populate length
         // has been reported on mobile platforms
-        const len = std.mem.indexOfScalar(u8, buffer[0..buf_len], 0) orelse @as(usize, @intCast(length));
+        //const len = std.mem.indexOfScalar(u8, buffer[0..buf_len], 0) orelse @as(usize, @intCast(length));
 
         const stage_string = switch (stage) {
             native.GL_VERTEX_SHADER => "Vertex",
@@ -366,19 +393,20 @@ fn compileShaderStage(src: [:0]const u8, stage: c_uint) !u32 {
             else => "Undefined",
         };
 
-        std.log.err("ShaderCompileError [{s}]: {s} ::{d}\n", .{ stage_string, buffer, len });
+        std.log.err("ShaderCompileError [{s}]: {s} ::{s}\n", .{ stage_string, buffer, src[0..64] });
         return error.SHADER_COMPILE_ERROR;
     }
     return shader;
 }
 
-pub const FullScreenQuad = [_]f32{
-    // x,    y,   u,   v
-    -1.0, -1.0, 0.0, 0.0,
-    1.0,  -1.0, 1.0, 0.0,
-    -1.0, 1.0,  0.0, 1.0,
+// Inside PixelBufferLayer
+const FullScreenQuad = [_]f32{
+    // x,    y,    u,   v
+    -1.0, -1.0, 0.0, 1.0,
+    1.0,  -1.0, 1.0, 1.0,
+    -1.0, 1.0,  0.0, 0.0,
 
-    -1.0, 1.0,  0.0, 1.0,
-    1.0,  -1.0, 1.0, 0.0,
-    1.0,  1.0,  1.0, 1.0,
+    -1.0, 1.0,  0.0, 0.0,
+    1.0,  -1.0, 1.0, 1.0,
+    1.0,  1.0,  1.0, 0.0,
 };

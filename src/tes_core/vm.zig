@@ -322,6 +322,7 @@ pub const TESVM = struct {
         const FPS = 30;
         const CyclesPerFrame = ClockSpeed / FPS;
         const NsPerCycle = std.time.ns_per_s / ClockSpeed;
+        const NsPerFrame = std.time.ns_per_s / FPS;
 
         var lastTime = std.Io.Timestamp.now(this.io, .awake);
         var ns_accum: i96 = 0;
@@ -337,6 +338,10 @@ pub const TESVM = struct {
 
             ns_accum += elapsed.nanoseconds;
 
+            if (ns_accum > NsPerFrame * 2) {
+                ns_accum = NsPerFrame;
+            }
+
             if (ns_accum >= NsPerCycle) {
                 const cyclesToRun = @as(u32, @intCast(@divFloor(ns_accum, NsPerCycle)));
                 ns_accum = @rem(ns_accum, NsPerCycle);
@@ -344,7 +349,7 @@ pub const TESVM = struct {
                 const wideRegs = this.registers.doubleRegisters();
                 const preClock = wideRegs[RGCL];
 
-                this.exec(cyclesToRun, isCoPro) catch |e| {
+                const status = this.exec(cyclesToRun, isCoPro) catch |e| {
                     if (e == error.AbruptProgramEOF) {
                         std.debug.print("IP {}/{} instructions\n", .{
                             this.registers.doubleRegisters()[doubleRegIndex(.IP)],
@@ -359,11 +364,26 @@ pub const TESVM = struct {
 
                 cyclesInFrame += consumed;
 
+                if (status == .Yield) {
+                    if (cyclesInFrame < CyclesPerFrame) {
+                        const remaining = CyclesPerFrame - cyclesInFrame;
+                        wideRegs[RFCL] += remaining;
+                        cyclesInFrame = CyclesPerFrame;
+                    }
+                }
+
                 while (cyclesInFrame >= CyclesPerFrame) {
                     try this.frameHook(this);
 
+                    lastTime = std.Io.Timestamp.now(this.io, .awake);
+                    ns_accum = 0;
+
                     cyclesInFrame -= CyclesPerFrame;
                     wideRegs[RFCL] = cyclesInFrame;
+                }
+
+                if (ns_accum >= NsPerCycle) {
+                    ns_accum = 0;
                 }
             }
 
@@ -373,7 +393,12 @@ pub const TESVM = struct {
         }
     }
 
-    pub fn exec(this: *@This(), totalCycles: u32, comptime isCoProcessor: bool) !void {
+    const Status = enum {
+        Ok,
+        Yield,
+    };
+
+    pub fn exec(this: *@This(), totalCycles: u32, comptime isCoProcessor: bool) !Status {
         @setRuntimeSafety(false);
         @setEvalBranchQuota(12000);
 
@@ -388,7 +413,7 @@ pub const TESVM = struct {
         DISPATCH: switch (@as(OpCode, @enumFromInt(instruction.opcode))) {
             .hlt => {
                 this.nonidxRegisters.flags.halted = true;
-                return;
+                return .Ok;
             },
             .resume_skip => {
                 if (comptime !isCoProcessor) {
@@ -397,17 +422,17 @@ pub const TESVM = struct {
                 }
                 this.nonidxRegisters.flags.policy = .resume_skip;
                 this.nonidxRegisters.flags.halted = true;
-                return;
+                return .Ok;
             },
             .resume_at => {
                 this.nonidxRegisters.flags.policy = .resume_at;
                 this.nonidxRegisters.flags.halted = true;
-                return;
+                return .Ok;
             },
             .retry => {
                 this.nonidxRegisters.flags.policy = .resume_retry;
                 this.nonidxRegisters.flags.halted = true;
-                return;
+                return .Ok;
             },
             .b => {
                 const decoded: InstructionDstSrc = @bitCast(instruction);
@@ -427,7 +452,7 @@ pub const TESVM = struct {
                 cycles -= 1;
                 if (cycles == 0) {
                     @branchHint(.unlikely);
-                    return;
+                    return .Ok;
                 }
 
                 if (doubles[IP] >= this.instructionBuffer.len) {
@@ -463,7 +488,7 @@ pub const TESVM = struct {
                 cycles -= 1;
                 if (cycles == 0) {
                     @branchHint(.unlikely);
-                    return;
+                    return .Ok;
                 }
 
                 if (doubles[IP] >= this.instructionBuffer.len) {
@@ -502,7 +527,7 @@ pub const TESVM = struct {
                 cycles -= 1;
                 if (cycles == 0) {
                     @branchHint(.unlikely);
-                    return;
+                    return .Ok;
                 }
 
                 instruction = this.instructionBuffer[doubles[IP]];
@@ -541,11 +566,26 @@ pub const TESVM = struct {
                 cycles -= 1;
                 if (cycles == 0) {
                     @branchHint(.unlikely);
-                    return;
+                    return .Ok;
                 }
 
                 instruction = this.instructionBuffer[doubles[IP]];
                 continue :DISPATCH @as(OpCode, @enumFromInt(instruction.opcode));
+            },
+            .yield_frame => {
+                this.nonidxRegisters.previousInstructionLength = 1;
+                const wideRegisters = this.registers.doubleRegisters();
+                wideRegisters[doubleRegIndex(.IP)] += 1;
+
+                var consumed = cycles;
+
+                while (consumed > 0) {
+                    const iterConsumed: u8 = @truncate(consumed);
+                    consumed -= iterConsumed;
+                    this.tickClock(iterConsumed);
+                    cycles = if (iterConsumed > cycles) 0 else cycles - iterConsumed;
+                }
+                return .Yield;
             },
             .lea => {
                 // lea [high] [low] | [32bit constant]
@@ -573,7 +613,7 @@ pub const TESVM = struct {
 
                 if (cycles == 0) {
                     @branchHint(.unlikely);
-                    return;
+                    return .Ok;
                 }
                 if (wideRegisters[doubleRegIndex(.IP)] >= this.instructionBuffer.len) {
                     @branchHint(.unlikely);
@@ -590,7 +630,7 @@ pub const TESVM = struct {
                     {
                         const code = InterruptToID(Interrupt.InvalidInstruction);
                         this.fireInterrupt(code);
-                        return;
+                        return .Ok;
                     }
                 }
 
@@ -617,7 +657,7 @@ pub const TESVM = struct {
                 cycles = if (consumed > cycles) 0 else cycles - consumed;
                 if (cycles == 0) {
                     @branchHint(.unlikely);
-                    return;
+                    return .Ok;
                 }
                 if (wideRegisters[IP] >= this.instructionBuffer.len) {
                     @branchHint(.unlikely);
@@ -1779,22 +1819,35 @@ fn VectorFactory(comptime op: VectorOp) InstructionInfo {
 }
 
 inline fn vb2vu8(vb: @Vector(2, bool)) @Vector(2, u8) {
-    const bools: [2]bool = @bitCast(vb);
-    const u8s: [2]u8 = .{
-        if (bools[0]) 1 else 0,
-        if (bools[1]) 1 else 0,
-    };
-    return @bitCast(u8s);
+    const trues: @Vector(2, u8) = .{ 1, 1 };
+    const falses: @Vector(2, u8) = .{ 0, 0 };
+    // Wherever the vector condition is true, pick from trues, else pick from falses
+    return @select(u8, vb, trues, falses);
 }
 
 inline fn vb2vi8(vb: @Vector(2, bool)) @Vector(2, i8) {
-    const bools: [2]bool = @bitCast(vb);
-    const i8s: [2]i8 = .{
-        if (bools[0]) 1 else 0,
-        if (bools[1]) 1 else 0,
-    };
-    return @bitCast(i8s);
+    const trues: @Vector(2, i8) = .{ 1, 1 };
+    const falses: @Vector(2, i8) = .{ 0, 0 };
+    return @select(i8, vb, trues, falses);
 }
+
+// inline fn vb2vu8(vb: @Vector(2, bool)) @Vector(2, u8) {
+//     const bools: [2]bool = @bitCast(vb);
+//     const u8s: [2]u8 = .{
+//         if (bools[0]) 1 else 0,
+//         if (bools[1]) 1 else 0,
+//     };
+//     return @bitCast(u8s);
+// }
+
+// inline fn vb2vi8(vb: @Vector(2, bool)) @Vector(2, i8) {
+//     const bools: [2]bool = @bitCast(vb);
+//     const i8s: [2]i8 = .{
+//         if (bools[0]) 1 else 0,
+//         if (bools[1]) 1 else 0,
+//     };
+//     return @bitCast(i8s);
+// }
 
 pub const MinimumStackSize = 256;
 

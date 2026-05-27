@@ -1,4 +1,5 @@
 #version 330 core
+//@Name: CompositerFragment.glsl
 in vec2 fUv;
 
 out vec4 fragColor;

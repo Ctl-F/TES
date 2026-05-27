@@ -794,19 +794,43 @@ pub const Parser = struct {
                 _ = self.advanceRaw();
                 const idx_tok = try self.expect(.Integer);
                 _ = try self.expect(.RBracket);
-                const elem_size = self.sym.resolveFieldElemSize(full.items) catch |e| return switch (e) {
-                    sym_mod.SymbolError.FieldNotFound   => ParseError.FieldNotFound,
-                    sym_mod.SymbolError.UndefinedSymbol => ParseError.UndefinedSymbol,
-                    else                                => ParseError.InvalidOperand,
+                const elem_size = self.sym.resolveFieldElemSize(full.items) catch |e| {
+                    switch (e) {
+                        sym_mod.SymbolError.FieldNotFound => {
+                            std.debug.print("{s}:{}:{}: error: $offsetOf: '{s}' is not an array field\n", .{ field_tok.source_file, field_tok.line, field_tok.col, full.items });
+                            self.printSourceContext(field_tok);
+                            return ParseError.FieldNotFound;
+                        },
+                        sym_mod.SymbolError.UndefinedSymbol => {
+                            std.debug.print("{s}:{}:{}: error: $offsetOf: undefined symbol '{s}'\n", .{ base_tok.source_file, base_tok.line, base_tok.col, full.items });
+                            self.printSourceContext(base_tok);
+                            return ParseError.UndefinedSymbol;
+                        },
+                        else => return ParseError.InvalidOperand,
+                    }
                 };
                 index_extra = @as(i64, @intCast(idx_tok.int_value)) * @as(i64, @intCast(elem_size));
             }
             _ = try self.expect(.RParen);
-            const off = self.sym.resolveFieldOffset(full.items) catch |e| return switch (e) {
-                sym_mod.SymbolError.UndefinedSymbol => ParseError.UndefinedSymbol,
-                sym_mod.SymbolError.FieldNotFound   => ParseError.FieldNotFound,
-                sym_mod.SymbolError.TypeMismatch    => ParseError.TypeMismatch,
-                else                                => ParseError.InvalidOperand,
+            const off = self.sym.resolveFieldOffset(full.items) catch |e| {
+                switch (e) {
+                    sym_mod.SymbolError.UndefinedSymbol => {
+                        std.debug.print("{s}:{}:{}: error: $offsetOf: undefined symbol '{s}'\n", .{ base_tok.source_file, base_tok.line, base_tok.col, full.items });
+                        self.printSourceContext(base_tok);
+                        return ParseError.UndefinedSymbol;
+                    },
+                    sym_mod.SymbolError.FieldNotFound => {
+                        std.debug.print("{s}:{}:{}: error: $offsetOf: field '{s}' not found\n", .{ field_tok.source_file, field_tok.line, field_tok.col, full.items });
+                        self.printSourceContext(field_tok);
+                        return ParseError.FieldNotFound;
+                    },
+                    sym_mod.SymbolError.TypeMismatch => {
+                        std.debug.print("{s}:{}:{}: error: $offsetOf: '{s}' is a label, not a struct\n", .{ base_tok.source_file, base_tok.line, base_tok.col, base_tok.text });
+                        self.printSourceContext(base_tok);
+                        return ParseError.TypeMismatch;
+                    },
+                    else => return ParseError.InvalidOperand,
+                }
             };
             return @as(i64, off) + index_extra;
         }

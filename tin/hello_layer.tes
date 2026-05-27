@@ -25,16 +25,74 @@ _start:
 
     bn _init_gpu;
 
+@{
+    @bind current_frame: r1; // Tracks the animation step
+    @bind screen_limit:  r2;
+    @bind pixel_idx:     r3;
+    @bind x_coord:       r4;
+    @bind condition:     r5;
+
+    @bind bar_color:     r6;
+    @bind bg_color:      r7;
+
+    @bind accum:         r8;
+    @bind imm:           r9;
+
+    xor current_frame, current_frame;
+    mov screen_limit, ${ WINDOW_WIDTH * WINDOW_HEIGHT };
+    mov bg_color, 0x1111;
+
 loop:
-    ; check if window should close
+    mov bar_color, 0xFFFF;
+
+    xor pixel_idx, pixel_idx;
+    xor x_coord, x_coord;
+    lea ra, rb, _PixelBuffer;
+
+_fill:
+    seteq condition, x_coord, current_frame;
+    bnt condition, _draw_bar;
+
+_draw_bg:
+    movi [ra, rb], bg_color;
+    bn _next_pixel;
+
+_draw_bar:
+    movi [ra, rb], bar_color;
+
+_next_pixel:
+    inc pixel_idx;
+    inc x_coord;
+
+    mov imm, $WINDOW_WIDTH;
+    xor accum, accum;
+    setge condition, x_coord, imm;
+    select x_coord, accum, x_coord, condition;
+
+
+    setge condition, pixel_idx, screen_limit;
+    bnf condition, _fill;
+
+_end_fill:
+    inc current_frame;
+
+    // wrap bar around
+    mov imm, $WINDOW_WIDTH;
+    setge condition, current_frame, imm;
+    bnf condition, _vsync;
+    xor current_frame, current_frame;
+}
+
+_vsync:
+    yield;
+; check if window should close
+_check_input:
     mov re, $MMIO_PAGE_ID;
     mov rf, $MMIO_HEADER_BASE;
-    mov r0, $offsetOf(MMIOMap, io);
+    mov r0, $offsetOf(MemIOMap, io);
     add rf, r0;
     mov ra, (byte)[re, (IOHeader.closeSignal)rf];
-
-
-    bnf loop;
+    bnf ra, loop;
 
 _end:
     hlt;
@@ -56,14 +114,14 @@ _init_gpu:
     add ptr, val;
 
     ; initialize gpu
-    mov val, true;
+    mov val, $true;
     mov (byte) [page, (GPUHeader.enable)ptr], val;
 
     ; save an instruction and write true to clear color also
-    mov (byte) [page, (GPUHeader.clearEnable)], val;
+    mov (byte) [page, (GPUHeader.clearEnable)ptr], val;
 
     ; configure screen
-    inc val; true is just 1 so incrementing gives us a value of 2 for our scale
+    mov val, 4;
     mov (byte) [page, (GPUHeader.screenScale)ptr], val;
 
     mov val, $WINDOW_WIDTH;
@@ -101,7 +159,7 @@ _init_gpu:
 
 
     ; push the config to the gpu
-    syscall cat_GFX, GFXSync;
+    syscall $cat_GFX, $GFXSync;
 
     pop jr;
     b jr;

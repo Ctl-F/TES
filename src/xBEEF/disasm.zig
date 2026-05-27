@@ -250,6 +250,34 @@ fn buildDataSymMap(allocator: std.mem.Allocator, tbf: *const TBF) DisasmError!Da
     return map;
 }
 
+// ── Hex-map prefix helper ─────────────────────────────────────────────────────
+
+/// In `--map` mode, emit the little-endian bytes for `count` instruction words,
+/// right-padded to a fixed column, then ` | `.
+/// Column width = 8 bytes × 3 chars = 24, plus 2 spaces = 26 total before `|`.
+fn emitHexPrefix(
+    w:      *Io.Writer,
+    instrs: []const u32,
+    idx:    u32,
+    count:  u32,
+) !void {
+    const hex_col: usize = 26; // accommodates 8-byte (2-word) instructions + padding
+    var written: usize = 0;
+    var wc: u32 = 0;
+    while (wc < count) : (wc += 1) {
+        const word: u32 = if (@as(usize, idx + wc) < instrs.len) instrs[idx + wc] else 0;
+        // 4 bytes, little-endian order (matches the on-disk byte order)
+        comptime var b: u5 = 0;
+        inline while (b < 4) : (b += 1) {
+            const byte: u8 = @truncate(word >> (b * 8));
+            try w.print("{X:0>2} ", .{byte});
+            written += 3;
+        }
+    }
+    while (written < hex_col) : (written += 1) try w.writeByte(' ');
+    try w.writeAll("| ");
+}
+
 // ── Main disassembly entry point ──────────────────────────────────────────────
 
 pub fn disassemble(
@@ -257,6 +285,7 @@ pub fn disassemble(
     io:        Io,
     tbf_path:  []const u8,
     writer:    *Io.Writer,
+    map_mode:  bool,
 ) !void {
     const raw = std.Io.Dir.cwd().readFileAlloc(io, tbf_path, allocator, .limited(64 * 1024 * 1024)) catch |e| {
         std.debug.print("Error: cannot read '{s}': {}\n", .{ tbf_path, e });
@@ -303,13 +332,23 @@ pub fn disassemble(
         const op: u8 = @truncate(w & 0xFF);
 
         if (findOpcodeByByte(op)) |info| {
-            try writer.writeAll("    ");
+            const word_count: u32 = 1 + extraWords(info.format);
+            if (map_mode) {
+                try emitHexPrefix(writer, tbf.instructions, i, @min(word_count, n - i));
+            } else {
+                try writer.writeAll("    ");
+            }
             try emitInstruction(writer, &tbf, info, w, i, n, &label_map);
             try writer.writeByte('\n');
-            i += 1 + extraWords(info.format);
+            i += word_count;
         } else {
             // Unknown opcode — emit as raw word
-            try writer.print("    ; raw 0x{X:0>8}\n", .{w});
+            if (map_mode) {
+                try emitHexPrefix(writer, tbf.instructions, i, 1);
+                try writer.print("; raw 0x{X:0>8}\n", .{w});
+            } else {
+                try writer.print("    ; raw 0x{X:0>8}\n", .{w});
+            }
             i += 1;
         }
     }
@@ -355,6 +394,7 @@ pub fn disassembleExtract(
     writer:    *Io.Writer,
     target:    u32,
     window:    u32,
+    map_mode:  bool,
 ) !void {
     const raw = std.Io.Dir.cwd().readFileAlloc(io, tbf_path, allocator, .limited(64 * 1024 * 1024)) catch |e| {
         std.debug.print("Error: cannot read '{s}': {}\n", .{ tbf_path, e });
@@ -426,11 +466,18 @@ pub fn disassembleExtract(
         try writer.print("{s} [{d:>6}]  ", .{ marker, ip });
 
         if (findOpcodeByByte(op)) |info| {
+            if (map_mode) {
+                const word_count: u32 = 1 + extraWords(info.format);
+                try emitHexPrefix(writer, tbf.instructions, ip, @min(word_count, n - ip));
+            }
             if (is_target and info.format == .LeaWide) {
                 try writer.writeAll("(address of) ");
             }
             try emitInstruction(writer, &tbf, info, w, ip, n, &label_map);
         } else {
+            if (map_mode) {
+                try emitHexPrefix(writer, tbf.instructions, ip, 1);
+            }
             try writer.print("raw 0x{X:0>8}", .{w});
         }
         try writer.writeByte('\n');
