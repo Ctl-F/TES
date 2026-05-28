@@ -78,9 +78,9 @@ pub const MMMap = extern struct {
     pub const IO_SOURCE_TEXT: u8 = 6;
 
     pub const IOSource = extern struct {
-        source: u8,
-        bufferHigh: u16,
-        bufferLow: u16,
+        source: u8 = 0,
+        bufferHigh: u16 = 0,
+        bufferLow: u16 = 0,
     };
 
     pub const IOBufferControllerSource = extern struct {
@@ -120,7 +120,7 @@ pub const MMMap = extern struct {
 
     pub const IOHeader = extern struct {
         closeSignal: u8 = 0,
-        sources: [4]IOSource,
+        sources: [4]IOSource = [_]IOSource{.{}} ** 4,
     };
 
     pub const PixelFormat = enum(u8) {

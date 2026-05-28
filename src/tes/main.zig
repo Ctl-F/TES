@@ -6,6 +6,7 @@ const native = @import("native");
 const SystemExtension = @import("extensions/System.zig");
 const GraphicsExtension = @import("extensions/Graphics.zig");
 const InputExtension = @import("extensions/Input.zig");
+const TracerExtension = @import("extensions/Tracer.zig");
 
 var mainIO: std.Io = undefined;
 
@@ -15,6 +16,7 @@ pub fn main(init: std.process.Init) !void {
     const sysExt = SystemExtension.extension(true);
     const gfxExt = GraphicsExtension.extension(true);
     const ioExt = InputExtension.extension(true);
+    const traceExt = TracerExtension.extension(true);
 
     const allocator = init.arena.allocator();
     var args = init.minimal.args.iterate();
@@ -52,6 +54,7 @@ pub fn main(init: std.process.Init) !void {
     try vm.extensions.put(SystemExtension.pool, sysExt);
     try vm.extensions.put(GraphicsExtension.pool, gfxExt);
     try vm.extensions.put(InputExtension.pool, ioExt);
+    try vm.extensions.put(TracerExtension.pool, traceExt);
 
     {
         var iter = vm.extensions.iterator();
@@ -59,11 +62,6 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("Extension: {s}\n", .{ext.value_ptr.getFriendlyName()});
         }
     }
-
-    // if (!native.SDL_Init(native.SDL_INIT_VIDEO)) {
-    //     return error.SDL_Init;
-    // }
-    // defer native.SDL_Quit();
 
     try vm.run();
 

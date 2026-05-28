@@ -146,8 +146,17 @@ struct MemIOMap {
 #define cat_GFX 1
 #define cat_IO 2
 
+#define SYSTEM 0
+#define GRAPHICS 1
+#define IO 2
+#define TRACE 3
+
+#define STOPWATCH 256
+#define REPORT 512
+
 ; cat_Sys
 #define SerialWrite 0
+#define SerialPrintf 1
 
 ; cat_GFX
 #define GFXSync 1

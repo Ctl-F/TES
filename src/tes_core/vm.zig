@@ -286,7 +286,7 @@ pub const TESVM = struct {
         @memset(pageBuffer[this.nonidxRegisters.interruptVectorTable .. this.nonidxRegisters.interruptVectorTable + IVTableSizeBytes], 0);
     }
 
-    inline fn doubleRegIndex(comptime id: RegisterID) u5 {
+    pub inline fn doubleRegIndex(comptime id: RegisterID) u5 {
         const raw: u5 = @intFromEnum(id);
         if (raw & 1 != 0) @compileError("Misaligned Register Id points to non-32 bit enabled register being reinterpreted");
         return raw / 2;

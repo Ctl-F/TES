@@ -8,7 +8,7 @@
 
 #define C_WHITE 0xFFFF
 #define C_BLACK 0x0000
-#define C_PAWN 0x387D39
+#define C_PAWN 0b1111100111100111;
 
 [Meta]
 struct Pawn {
@@ -25,6 +25,13 @@ _layerConfig: .GPUPixelLayerConfig .{ $STRUCT_LAYER_CONFIG_FRAMEBUFFER, $PIXEL_F
 _inputBuffer: .IOBufferControllerSource 0
 _player: .Pawn .{ ${BOARD_WIDTH / 2}, ${BOARD_HEIGHT / 2} }
 
+_debug_message_set: "Set Square: @{8}, @{9} --> @{c}\n"
+_debug_message_set_end: .u8 0
+
+_debug_message_begin_fill: "Filling Board [@{6}, @{7}]\n"
+_debug_message_begin_fill_end: .u8 0
+
+
 [Data(1:0)]
 _FrameBuffer: .u16[${BOARD_WIDTH * BOARD_HEIGHT}]
 
@@ -35,10 +42,13 @@ _start:
     stackset ra, rb;
 _main:
     bn _init_graphics;
+    bn _init_input;
 
 _loop:
+    bn _process_movement;
+    bn _render_board;
 
-
+    yield;
     ; poll for window close
     mov ra, $MMIO_PAGE_ID;
     mov rb, $MMIO_HEADER_BASE;
@@ -46,76 +56,215 @@ _loop:
     bnf rc, _loop;
 _end_loop:
 
+    syscall $TRACE, $REPORT;
+
 _end:
     hlt;
 
+@{
+    @bind tmp0 : r0;
+    @bind tmp1 : r1;
+    @bind velocity: r2;
+_process_movement:
+    push jr;
 
 
-    @{
-        @bind page : re;
-        @bind ptr : rf;
-        @bind val : rd;
-        @bind valPtrPage : rc;
-        @bind valPtr : rb;
-        @bind val2 : ra;
+    xor velocity, velocity;
 
-    _init_graphics:
-        push jr;
+    lea ra, rb, _inputBuffer;
+    mov tmp0, (byte)[ra, (IOBufferControllerSource.left)rb];
+    mov tmp1, (byte)[ra, (IOBufferControllerSource.right)rb];
+    isub tmp1, tmp0;
 
-        mov page, $MMIO_PAGE_ID;
-        mov ptr, $MMIO_HEADER_BASE;
-        mov val, $offsetOf(MemIOMap, gpu);
-        add ptr, val;
-
-        ; initialize gpu
-        mov val, $true;
-        mov (byte) [page, (GPUHeader.enable)ptr], val;
-
-        ; save an instruction and write true to clear color also
-        mov (byte) [page, (GPUHeader.clearEnable)ptr], val;
-
-        ; configure screen
-        mov val, $BOARD_SCALE;
-        mov (byte) [page, (GPUHeader.screenScale)ptr], val;
-
-        mov val, $BOARD_WIDTH;
-        mov [page, (GPUHeader.screenWidth)ptr], val;
-
-        mov val, $BOARD_HEIGHT;
-        mov [page, (GPUHeader.screenHeight)ptr], val;
+    mov velocity, tmp1;
+    mov tmp1, 8;
+    ror velocity, tmp1;
 
 
-        ; configure clear color
-        lea valPtrPage, valPtr, defaultClearColor;
-        mov val2, $offsetOf(GPUHeader, clearColor);
-        add ptr, val2;
-        mov val, $sizeOf(ColorRGB32);
+    mov tmp0, (byte)[ra, (IOBufferControllerSource.up)rb];
+    mov tmp1, (byte)[ra, (IOBufferControllerSource.down)rb];
+    isub tmp1, tmp0;
 
-        mcpy page, ptr, valPtrPage, valPtr, val;
+    xor velocity, tmp1;
 
-        sub ptr, val2;
+    // velocity should now have the x/y velocity from inputs
 
 
-        ; enable only layer 0
-        mov val, 0x0001;
-        mov [page, (GPUHeader.layerEnable)ptr], val;
+    pop jr;
+    b jr;
+}
+@{
+    @bind eof: rf;
+    @bind color: rc;
+    @bind mask : r5;
+    @bind player_x : r6;
+    @bind player_y : r7;
+    @bind cursor_x : r8;
+    @bind cursor_y : r9;
+    @bind condition0 : r3;
+    @bind condition1 : r2;
+    @bind tmp0 : r0;
+    @bind tmp1 : r1;
+_render_board:
+    push jr;
 
-        ; set the layer config data in the gpu header
-        mov val2, $offsetOf(GPUHeader, layers);
-        add ptr, val2;
+    syscall $TRACE, ${ STOPWATCH + 0 };
 
-        lea valPtrPage, valPtr, _layerConfig;
-        mov [page, (GPULayerConfig.configHigh)ptr], valPtrPage;
-        mov [page, (GPULayerConfig.configLow)ptr], valPtr;
+    mov ra, _player;
+    mov player_x, (byte)[ra];
+    mov player_y, (byte)[ra + 1];
 
-        lea valPtrPage, valPtr, _FrameBuffer;
-        mov [page, (GPULayerConfig.dataHigh)ptr], valPtrPage;
-        mov [page, (GPULayerConfig.dataLow)ptr], valPtr;
+    xor cursor_x, cursor_x;
+    xor cursor_y, cursor_y;
+
+    lea ra, rb, _FrameBuffer;
+    mov eof, ${BOARD_WIDTH * BOARD_HEIGHT * 2};
+    add eof, rb;
+
+    mov mask, 1;
+
+_fill:
+    seteq condition0, cursor_x, player_x;
+    seteq condition1, cursor_y, player_y;
+    and condition0, condition1;
+    bnt condition0, _set_pawn_square;
+_set_checker:
+    mov condition0, 2;
+    and condition0, rb;
+
+    mov tmp0, $C_BLACK;
+    mov tmp1, $C_WHITE;
+
+    bnt mask, _no_swap;
+    swap tmp0, tmp1;
+_no_swap:
+
+    select color, tmp1, tmp0, condition0;
+
+    bn _set_square;
+
+_set_pawn_square:
+    mov color, $C_PAWN;
+
+_set_square:
+    movi [ra, rb], color;
+
+_fill_continue_or_end:
+
+    ; condition0 is the wrap condition
+    inc cursor_x;
+    mov tmp1, $BOARD_WIDTH;
+    setge condition0, cursor_x, tmp1;
+
+    mov tmp0, cursor_y;
+    inc cursor_y;
+
+    select cursor_y, cursor_y, tmp0, condition0;
+    xor tmp0, tmp0;
+    select cursor_x, tmp0, cursor_x, condition0;
+
+    mov tmp0, mask;
+    lnot tmp0;
+    select mask, tmp0, mask, condition0;
+
+    setge condition0, rb, eof;
+    bnf condition0, _fill;
+_end_fill:
+
+    syscall $TRACE, ${ STOPWATCH + 0 };
 
 
-        ; push the config to the gpu
-        syscall $cat_GFX, $GFXSync;
+    pop jr;
+    b jr;
 
-        pop jr;
-        b jr;
-    }
+}
+
+_init_input:
+    push jr;
+
+    lea r0, r1, _inputBuffer;
+    mov ra, $MMIO_PAGE_ID;
+    mov rb, $MMIO_HEADER_BASE;
+    mov rc, $offsetOf(MemIOMap, io);
+    add rb, rc;
+    mov rc, $offsetOf(IOHeader, sources);
+    add rb, rc;
+
+    mov rc, $IO_SOURCE_CONTROLLER_0;
+    mov [ra, (IOSource.source)rb], (byte)rc;
+    mov [ra, (IOSource.bufferHigh)rb], r0
+    mov [ra, (IOSource.bufferLow)rb], r1;
+
+    syscall $cat_IO, $IOSync;
+
+    pop jr;
+    b jr;
+
+@{
+    @bind page : re;
+    @bind ptr : rf;
+    @bind val : rd;
+    @bind valPtrPage : rc;
+    @bind valPtr : rb;
+    @bind val2 : ra;
+
+_init_graphics:
+    push jr;
+
+    mov page, $MMIO_PAGE_ID;
+    mov ptr, $MMIO_HEADER_BASE;
+    mov val, $offsetOf(MemIOMap, gpu);
+    add ptr, val;
+
+    ; initialize gpu
+    mov val, $true;
+    mov (byte) [page, (GPUHeader.enable)ptr], val;
+
+    ; save an instruction and write true to clear color also
+    mov (byte) [page, (GPUHeader.clearEnable)ptr], val;
+
+    ; configure screen
+    mov val, $BOARD_SCALE;
+    mov (byte) [page, (GPUHeader.screenScale)ptr], val;
+
+    mov val, $BOARD_WIDTH;
+    mov [page, (GPUHeader.screenWidth)ptr], val;
+
+    mov val, $BOARD_HEIGHT;
+    mov [page, (GPUHeader.screenHeight)ptr], val;
+
+
+    ; configure clear color
+    lea valPtrPage, valPtr, defaultClearColor;
+    mov val2, $offsetOf(GPUHeader, clearColor);
+    add ptr, val2;
+    mov val, $sizeOf(ColorRGB32);
+
+    mcpy page, ptr, valPtrPage, valPtr, val;
+
+    sub ptr, val2;
+
+
+    ; enable only layer 0
+    mov val, 0x0001;
+    mov [page, (GPUHeader.layerEnable)ptr], val;
+
+    ; set the layer config data in the gpu header
+    mov val2, $offsetOf(GPUHeader, layers);
+    add ptr, val2;
+
+    lea valPtrPage, valPtr, _layerConfig;
+    mov [page, (GPULayerConfig.configHigh)ptr], valPtrPage;
+    mov [page, (GPULayerConfig.configLow)ptr], valPtr;
+
+    lea valPtrPage, valPtr, _FrameBuffer;
+    mov [page, (GPULayerConfig.dataHigh)ptr], valPtrPage;
+    mov [page, (GPULayerConfig.dataLow)ptr], valPtr;
+
+
+    ; push the config to the gpu
+    syscall $cat_GFX, $GFXSync;
+
+    pop jr;
+    b jr;
+}

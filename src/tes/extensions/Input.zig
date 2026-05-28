@@ -89,7 +89,7 @@ const InputSource = union(enum) {
     cursor: CursorSource,
     text: TextSource,
 
-    fn handleEvent(this: *@This(), event: native.SLD_Event) void {
+    fn handleEvent(this: *@This(), event: native.SDL_Event) void {
         switch (this.*) {
             .disabled => {},
             .controller => |*con| con.handleEvent(event),
@@ -109,7 +109,7 @@ const InputSource = union(enum) {
                     mmMap.IO_CONTROLLER_BTN0 => &this.buffer.sBtn0,
                     mmMap.IO_CONTROLLER_BTN1 => &this.buffer.sBtn1,
                     mmMap.IO_CONTROLLER_BTN2 => &this.buffer.sBtn2,
-                    mmMap.IO_CONTROLLER_BTN3 => &this.buffer.sBnt3,
+                    mmMap.IO_CONTROLLER_BTN3 => &this.buffer.sBtn3,
                     mmMap.IO_CONTROLLER_LEFT => &this.buffer.sLeft,
                     mmMap.IO_CONTROLLER_RIGHT => &this.buffer.sRight,
                     mmMap.IO_CONTROLLER_UP => &this.buffer.sUp,
@@ -208,7 +208,7 @@ pub fn IOSync(vm: *tes.TESVM) !void {
             const mappingIndex = source.source - mmMap.IO_SOURCE_CONTROLLER_0;
             std.debug.assert(mappingIndex < ControllerMappers.len);
 
-            const page: u8 = source.bufferHigh;
+            const page: u8 = @truncate(source.bufferHigh);
             const offset: u16 = source.bufferLow;
 
             const buffer = if (vm.getPage(page)) |nnp| BLK: {
@@ -226,7 +226,7 @@ pub fn IOSync(vm: *tes.TESVM) !void {
         }
 
         if (source.source == mmMap.IO_SOURCE_CURSOR) {
-            const page: u8 = source.bufferHigh;
+            const page: u8 = @truncate(source.bufferHigh);
             const offset: u16 = source.bufferLow;
 
             const buffer = if (vm.getPage(page)) |nnp| BLK: {
@@ -242,7 +242,7 @@ pub fn IOSync(vm: *tes.TESVM) !void {
         }
 
         if (source.source == mmMap.IO_SOURCE_TEXT) {
-            const page: u8 = source.bufferHigh;
+            const page: u8 = @truncate(source.bufferHigh);
             const offset: u16 = source.bufferLow;
 
             const buffer = if (vm.getPage(page)) |nnp| BLK: {

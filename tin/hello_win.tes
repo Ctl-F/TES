@@ -20,6 +20,10 @@ _start:
     mov rf, $MMIO_HEADER_BASE;
 
 _loop:
+    ; main logic goes here
+
+
+    yield; // needed for input and gpu synchronization
     ; poll close event
     mov ra, (byte)[re, (MemIOMap.io.closeSignal)rf];
     bnf ra, _loop;

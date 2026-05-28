@@ -38,6 +38,8 @@ pub const PassThroughLayer = struct {
     pub fn detach(_: *@This(), _: *gpu, _: u16) anyerror!void {}
 };
 
+var created: bool = false;
+
 pub const PixelBufferLayer = struct {
     context: struct {
         vao: u32 = 0,
@@ -149,6 +151,13 @@ pub const PixelBufferLayer = struct {
         )) {
             std.debug.print("Image Conversion Error: {s}\n", .{native.SDL_GetError()});
             return error.FormatConvert;
+        }
+
+        if (!created) {
+            const surface = native.SDL_CreateSurfaceFrom(width, height, sdlFormatDst, @ptrCast(dstBuffer.ptr), dstPitch);
+            _ = native.SDL_SaveBMP(surface, "frame.bmp");
+            native.SDL_DestroySurface(surface);
+            created = true;
         }
     }
 
