@@ -1,0 +1,211 @@
+// Snake clone
+#include "stddef.tes"
+[Meta]
+
+#define STACK_SIZE 0x800
+
+#define BOARD_WIDTH 48
+#define BOARD_HEIGHT 48
+#define BOARD_SCALE 10
+
+#define FOOD_COLOR 0b01111100000000000
+#define SNAKE_COLOR 0b0000001111100000
+
+#define MAX_SNAKE_SIZE 1024
+#define MAX_FOOD_SIZE 4
+
+#define NORTH 0
+#define SOUTH 1
+#define EAST 2
+#define WEST 3
+
+struct Point {
+    y: u8;
+    x: u8;
+}
+
+struct Snake {
+    direction: u16;
+    head: Point;
+    bodyCount: u16;
+    body: [$MAX_SNAKE_SIZE]Point;
+}
+
+struct Food {
+    count: u16;
+    food: [$MAX_FOOD_SIZE]Point;
+}
+
+[Data(0:0xF000)]
+_StackHead: .u8[$STACK_SIZE] 0
+
+[Data(0:0x400)]
+_ClearColor: .ColorRGB32 .{ 10, 10, 10, 255 }
+_FrameBufferConfig: .GPUPixelLayerConfig .{ $STRUCT_LAYER_CONFIG_FRAMEBUFFER, $PIXEL_FORMAT_RGB565, $BOARD_WIDTH, $BOARD_HEIGHT }
+_InputBuffer: .IOBufferControllerSource 0
+
+[Data(0:0x500)]
+_snake: .Snake 0
+_food: .Food 0
+
+[Data(1:0x0000)]
+_FrameBuffer: .u16[${BOARD_WIDTH * BOARD_HEIGHT}] 0
+
+[Data(2:0x0000)]
+_GameBuffer: .u16[${BOARD_WIDTH * BOARD_HEIGHT}] 0
+
+[Program]
+_start:
+    // initialize the stack
+    mov ra, _StackHead;
+    mov rb, $STACK_SIZE;
+    stackset ra, rb;
+_main:
+    // initialize hardware
+    bn _init_gpu;
+    bn _init_io;
+
+
+_main_loop:
+
+
+    yield;
+    mov ra, $MMIO_PAGE_ID;
+    mov rb, $MMIO_HEADER_BASE;
+    mov rc, (byte)[ra, (MemIOMap.io.closeSignal)rb];
+    bnf rc, _main_loop;
+
+_end:
+    hlt;
+
+_draw_gradient:
+    push jr;
+
+    lea ra, rb, _FrameBuffer;
+
+
+
+    pop jr;
+    b jr;
+
+
+// make_color(r: reg0, g: reg0, b: reg0) --> reg0
+@{
+#define MASK_5 0b11111
+#define MASK_6 0b111111
+
+_make_color:
+    push jr;
+    push ra, rb;
+    push rc, rd;
+
+
+
+
+    xor rc, rc;
+
+    mov ra, (byte)r0;
+    mov rb, $MASK_5;
+    and ra, rb;
+
+    xor rc, ra;
+
+
+
+
+    pop rc, rd;
+    pop ra, rb;
+    pop jr;
+    b jr;
+
+#undef MASK_5
+#undef MASK_6
+}
+
+; initialize gpu
+_init_gpu:
+    push jr;
+
+    ; load header address
+    mov ra, $MMIO_PAGE_ID;
+    mov rb, $MMIO_HEADER_BASE;
+
+    ; future-proof things. Technically this offset is zero
+    ; in the current version and we could safely use rb
+    ; with no modification. But if the field order ever changes
+    ; this should ensure that our code doesn't break
+    mov rc, $offsetOf(MemIOMap, gpu);
+    add rb, rc;
+
+    ; rb now holds the valid offset pointing to the gpu header
+
+    ; enable gpu
+    mov r0, $true;
+    mov (byte) [ra, (GPUHeader.enable)rb], r0;
+
+    ; enable clear
+    mov (byte)[ra, (GPUHeader.clearEnable)rb], r0;
+
+    ; set clear color
+    lea rc, rd, _ClearColor;
+    mov rf, $offsetOf(GPUHeader, clearColor);
+    add rb, rf;
+    mov re, $sizeOf(ColorRGB32);
+
+    mcpy ra, rb, rc, rd, re;
+
+    sub rb, rf;
+
+    ; set resolution
+    mov rc, $BOARD_WIDTH;
+    mov [ra, (GPUHeader.screenWidth)rb], rc;
+
+    mov rc, $BOARD_HEIGHT;
+    mov [ra, (GPUHeader.screenHeight)rb], rc;
+
+    mov rc, $BOARD_SCALE;
+    mov [ra, (GPUHeader.screenScale)rb], (byte)rc;
+
+    ; enable layers
+    mov rc, 0x0001;
+    mov [ra, (GPUHeader.layerEnable)rb], rc;
+
+    mov rc, $offsetOf(GPUHeader, layers);
+    add rb, rc;
+
+    lea rc, rd, _FrameBufferConfig;
+    mov [ra, (GPULayerConfig.configHigh)rb], rc;
+    mov [ra, (GPULayerConfig.configLow)rb], rd;
+
+    lea rc, rd, _FrameBuffer;
+    mov [ra, (GPULayerConfig.dataHigh)rb], rc;
+    mov [ra, (GPULayerConfig.dataLow)rb], rc;
+
+    syscall $GRAPHICS, $GFXSync;
+
+    pop jr;
+    b jr;
+
+_init_io:
+    push jr;
+
+    mov ra, $MMIO_PAGE_ID;
+    mov rb, $MMIO_HEADER_BASE;
+
+    mov rc, $offsetOf(MemIOMap, io);
+    add rb, rc;
+
+    mov rc, $offsetOf(IOHeader, sources);
+    add rb, rc;
+
+    mov rc, $IO_SOURCE_CONTROLLER_0
+    mov [ra, (IOSource.source)rb], (byte)rc;
+
+    lea rc, rd, _InputBuffer;
+    mov [ra, (IOSource.bufferHigh)rb], rc;
+    mov [ra, (IOSource.bufferLow)rb], rd;
+
+    syscall $IO, $IOSync;
+
+    pop jr;
+    b jr;

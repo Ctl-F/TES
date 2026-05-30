@@ -1216,7 +1216,11 @@ fn MovFactory(comptime instrType: type, comptime width: enum { full, half }, com
         InstructionDstSrc => struct {
             pub inline fn do(vm: *TESVM, instr: Instruction) Interrupt!void {
                 const decoded: InstructionDstSrc = @bitCast(instr);
-                vm.registers.registers()[decoded.dst] = vm.registers.registers()[decoded.src];
+                if (comptime width == .half) {
+                    vm.registers.registers()[decoded.dst] = @as(u8, @truncate(vm.registers.registers()[decoded.src]));
+                } else {
+                    vm.registers.registers()[decoded.dst] = vm.registers.registers()[decoded.src];
+                }
             }
         }.do,
         InstructionDstAddrSrc => struct {
@@ -1700,6 +1704,7 @@ const VectorOp = meta.Subset(OpCode, &.{
     .visub2,   .vimul2,   .visetlt2, .visetle2, .visetgt2,
     .visetge2, .vselect2, .vswap2,   .vsar2,    .vabs2,
     .vsign2,   .vmin2,    .vmax2,    .vrol2,    .vror2,
+    .vimin2,   .vimax2,
 });
 
 fn VectorFactory(comptime op: VectorOp) InstructionInfo {
@@ -1831,6 +1836,22 @@ fn VectorFactory(comptime op: VectorOp) InstructionInfo {
                     return @max(a, b);
                 }
             }.f,
+            .vimin2 => struct {
+                pub fn f(a: @Vector(2, u8), b: @Vector(2, u8)) @Vector(2, u8) {
+                    return @as(@Vector(2, u8), @bitCast(@min(
+                        @as(@Vector(2, i8), @bitCast(a)),
+                        @as(@Vector(2, i8), @bitCast(b)),
+                    )));
+                }
+            }.f,
+            .vimax2 => struct {
+                pub fn f(a: @Vector(2, u8), b: @Vector(2, u8)) @Vector(2, u8) {
+                    return @as(@Vector(2, u8), @bitCast(@max(
+                        @as(@Vector(2, i8), @bitCast(a)),
+                        @as(@Vector(2, i8), @bitCast(b)),
+                    )));
+                }
+            }.f,
 
             // Signed Math
             .viadd2 => struct {
@@ -1951,24 +1972,6 @@ inline fn vb2vi8(vb: @Vector(2, bool)) @Vector(2, i8) {
     const falses: @Vector(2, i8) = .{ 0, 0 };
     return @select(i8, vb, trues, falses);
 }
-
-// inline fn vb2vu8(vb: @Vector(2, bool)) @Vector(2, u8) {
-//     const bools: [2]bool = @bitCast(vb);
-//     const u8s: [2]u8 = .{
-//         if (bools[0]) 1 else 0,
-//         if (bools[1]) 1 else 0,
-//     };
-//     return @bitCast(u8s);
-// }
-
-// inline fn vb2vi8(vb: @Vector(2, bool)) @Vector(2, i8) {
-//     const bools: [2]bool = @bitCast(vb);
-//     const i8s: [2]i8 = .{
-//         if (bools[0]) 1 else 0,
-//         if (bools[1]) 1 else 0,
-//     };
-//     return @bitCast(i8s);
-// }
 
 pub const MinimumStackSize = 256;
 
@@ -2223,6 +2226,7 @@ const InstructionTable = init: {
 
     // basic mov
     table[@intFromEnum(OpCode.mov)] = MovFactory(InstructionDstSrc, .full, .none);
+    table[@intFromEnum(OpCode.mov_hreg)] = MovFactory(InstructionDstSrc, .half, .none);
     table[@intFromEnum(OpCode.mov_c)] = MovFactory(InstructionDst, .full, .none);
 
     // mov to memory (simple addr)

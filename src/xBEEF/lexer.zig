@@ -46,6 +46,7 @@ pub const Token = struct {
     int_value: u64 = 0,
     data_page: u8 = 0,
     data_offset: u16 = 0,
+    data_explicit: bool = false,
 };
 
 pub const LexError = error{
@@ -170,7 +171,9 @@ pub const Lexer = struct {
         if (std.ascii.eqlIgnoreCase(name, "Data")) {
             var page: u8 = 0;
             var offset: u16 = 0;
+            var had_parens = false;
             if (self.peek() == '(') {
+                had_parens = true;
                 _ = self.advance();
                 var pv: u64 = 0;
                 while (self.peek()) |c| { if (c >= '0' and c <= '9') { pv = pv*10+(c-'0'); _ = self.advance(); } else break; }
@@ -190,7 +193,7 @@ pub const Lexer = struct {
                 if (self.peek() == ')') _ = self.advance();
             }
             if (self.peek() == ']') _ = self.advance();
-            return Token{ .kind = .SectionData, .text = "Data", .line = sl, .col = sc, .source_file = sf, .data_page = page, .data_offset = offset };
+            return Token{ .kind = .SectionData, .text = "Data", .line = sl, .col = sc, .source_file = sf, .data_page = page, .data_offset = offset, .data_explicit = had_parens };
         }
 
         // Not a known section header — treat '[' as a plain bracket token.

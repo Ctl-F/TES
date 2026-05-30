@@ -30,6 +30,7 @@ pub const Format = enum {
     Bare, Dst, DstSrc,
     DstAddrSrc, DstAddrXSrc, DstSrcAddr, DstSrcAddrX,
     Dst2Src2, Dst2Src2Len, DstSrc2, DstSrc3,
+    DstConst2,  // opcode | (dst<<8) | (c0<<13) | (c1<<21)  — reg + two 8-bit constants
     LeaWide,
     BranchReg, BranchRegCond, BranchNear, BranchNearCond,
     Syscall,
@@ -132,7 +133,7 @@ pub const opcodes = [_]OpcodeInfo{
     .{.opcode=0x55,.format=.DstSrc,       .mnemonic="vsetge2"},
     .{.opcode=0x56,.format=.VReduce,      .mnemonic="vreduce2"},
     .{.opcode=0x57,.format=.Dst,          .mnemonic="vsplat2"},
-    .{.opcode=0x58,.format=.Dst,          .mnemonic="vldc2"},
+    .{.opcode=0x58,.format=.DstConst2,    .mnemonic="vldc2"},
     .{.opcode=0x59,.format=.Bare,         .mnemonic="trap"},
     .{.opcode=0x5A,.format=.DstSrc,       .mnemonic="iadd"},
     .{.opcode=0x5B,.format=.DstSrc,       .mnemonic="isub"},
@@ -176,6 +177,9 @@ pub const opcodes = [_]OpcodeInfo{
     .{.opcode=0x81,.format=.DstSrc,        .mnemonic="push32"},
     .{.opcode=0x82,.format=.DstSrc,        .mnemonic="pop32"},
     .{.opcode=0x83,.format=.Dst2Src2,     .mnemonic="ivs"},
+    .{.opcode=0x84,.format=.DstSrc,       .mnemonic="mov_b"},
+    .{.opcode=0x85,.format=.DstSrc,       .mnemonic="vimin2"},
+    .{.opcode=0x86,.format=.DstSrc,       .mnemonic="vimax2"},
 };
 
 pub const reduce_codes = [_]struct { name: []const u8, code: u4 }{

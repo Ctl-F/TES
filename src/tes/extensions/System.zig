@@ -83,48 +83,29 @@ fn printf(vm: *tes.TESVM) tes.EventResult {
 
         while (true) {
             const nxt = std.mem.find(u8, fmt[cursor..], "@{");
-            if (nxt == null) {
-                break;
-            }
+            if (nxt == null) break;
             const next = cursor + nxt.?;
 
             const aftr = std.mem.find(u8, fmt[next..], "}");
-            if (aftr == null) {
-                break;
-            }
+            if (aftr == null) break;
             const after = next + aftr.?;
 
-            // @{X} is 4 chars: '@'=next+0, '{'=next+1, 'X'=next+2, '}'=next+3
-            if (after - next != 3) {
-                break;
+            // @{n}   → after - next == 3 (1 char between braces)
+            // @{n:s} → after - next == 5 (3 chars between braces)
+            const content_len = after - next - 2;
+            if (content_len != 1 and content_len != 3) break;
+
+            const reg_idx = parsePrintfReg(fmt[next + 2]) orelse break;
+
+            var specifier: u8 = 0;
+            if (content_len == 3) {
+                if (fmt[next + 3] != ':') break;
+                specifier = fmt[next + 4];
             }
 
             std.debug.print("{s}", .{fmt[cursor..next]});
-
-            const indexChar = fmt[next + 2];
-
-            if ('0' <= indexChar and indexChar <= '9') {
-                const index = indexChar - '0';
-                std.debug.print("{}", .{registers[index]});
-                cursor = after + 1;
-                continue;
-            }
-
-            if ('a' <= indexChar and indexChar <= 'f') {
-                const index = 10 + (indexChar - 'a');
-                std.debug.print("{}", .{registers[index]});
-                cursor = after + 1;
-                continue;
-            }
-
-            if ('A' <= indexChar and indexChar <= 'F') {
-                const index = 10 + (indexChar - 'A');
-                std.debug.print("{}", .{registers[index]});
-                cursor = after + 1;
-                continue;
-            }
-
-            break;
+            printfReg(vm, registers[reg_idx], specifier);
+            cursor = after + 1;
         }
 
         std.debug.print("{s}", .{fmt[cursor..]});
@@ -138,6 +119,45 @@ fn printf(vm: *tes.TESVM) tes.EventResult {
             .panic = false,
         },
     };
+}
+
+fn parsePrintfReg(c: u8) ?u8 {
+    if ('0' <= c and c <= '9') return c - '0';
+    if ('a' <= c and c <= 'f') return 10 + (c - 'a');
+    if ('A' <= c and c <= 'F') return 10 + (c - 'A');
+    return null;
+}
+
+fn printfReg(vm: *tes.TESVM, val: u16, specifier: u8) void {
+    switch (specifier) {
+        0   => std.debug.print("{d}", .{@as(i16, @bitCast(val))}),
+        'u' => std.debug.print("{d}", .{val}),
+        'x' => std.debug.print("{x}", .{val}),
+        'X' => std.debug.print("{X}", .{val}),
+        'b' => std.debug.print("{b}", .{val}),
+        'v' => {
+            const lo: i8 = @bitCast(@as(u8, @truncate(val)));
+            const hi: i8 = @bitCast(@as(u8, @truncate(val >> 8)));
+            std.debug.print("({d}, {d})", .{ lo, hi });
+        },
+        'w' => {
+            const lo: u8 = @truncate(val);
+            const hi: u8 = @truncate(val >> 8);
+            std.debug.print("({d}, {d})", .{ lo, hi });
+        },
+        's' => {
+            if (vm.getPage(0)) |p0| {
+                const offset: usize = val;
+                if (offset < p0.len) {
+                    const ptr: [*]const u8 = @ptrCast(&p0[offset]);
+                    var slen: usize = 0;
+                    while (offset + slen < p0.len and ptr[slen] != 0) slen += 1;
+                    std.debug.print("{s}", .{ptr[0..slen]});
+                }
+            }
+        },
+        else => {},
+    }
 }
 
 fn write(vm: *tes.TESVM) tes.EventResult {

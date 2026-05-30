@@ -28,56 +28,38 @@ fn crashDump(_: *tes.TESVM) void {
     report();
 }
 
+const sep = "+" ++ "-" ** 78 ++ "+";
+
 fn report() void {
-    std.debug.print("Trace Results:\n", .{});
-    std.debug.print("=" ** 80, .{});
+    printSection("Continuous", &continuousSlots);
     std.debug.print("\n", .{});
-    std.debug.print(("-" ** 30) ++ "[ Continuous ]" ++ ("-" ** 30), .{});
-    std.debug.print("\n", .{});
+    printSection("Stopwatch", &stopwatchSlots);
+}
 
-    for (continuousSlots, 0..) |slot, idx| {
+fn printSection(title: []const u8, slots: []const Slot) void {
+    std.debug.print("{s}\n", .{sep});
+    std.debug.print("|{s: ^78}|\n", .{title});
+    std.debug.print("{s}\n", .{sep});
+    for (slots, 0..) |slot, idx| {
         if (slot.hit == 0) continue;
         const avg = slot.total_elapsed / slot.hit;
-
-        std.debug.print("{: >3}: Total {}\n" ++
-            "          Avg {}\n" ++
-            "          Min {}\n" ++
-            "          Max {}\n" ++
-            "         Hits {}\n", .{
-            idx,
-            slot.total_elapsed,
-            avg,
-            slot.min,
-            slot.max,
-            slot.hit,
-        });
+        printSlot(idx, slot.total_elapsed, avg, slot.min, slot.max, slot.hit);
+        std.debug.print("{s}\n", .{sep});
     }
+}
 
-    std.debug.print("=" ** 80, .{});
-    std.debug.print("\n", .{});
-    std.debug.print(("-" ** 30) ++ "[ Stopwatch ]" ++ ("-" ** 30), .{});
-    std.debug.print("\n", .{});
-
-    for (stopwatchSlots, 0..) |slot, idx| {
-        if (slot.hit == 0) continue;
-        const avg = slot.total_elapsed / slot.hit;
-
-        std.debug.print("{: >3}: Total {}\n" ++
-            "          Avg {}\n" ++
-            "          Min {}\n" ++
-            "          Max {}\n" ++
-            "         Hits {}\n", .{
-            idx,
-            slot.total_elapsed,
-            avg,
-            slot.min,
-            slot.max,
-            slot.hit,
-        });
-    }
-
-    std.debug.print("=" ** 80, .{});
-    std.debug.print("\n", .{});
+fn printSlot(idx: usize, total: u64, avg: u64, min: u64, max: u64, hits: u64) void {
+    var buf: [78]u8 = undefined;
+    var s = std.fmt.bufPrint(&buf, " {d:0>3}: Total  {d}", .{ idx, total }) catch buf[0..];
+    std.debug.print("|{s: <78}|\n", .{s});
+    s = std.fmt.bufPrint(&buf, "        Avg  {d}", .{avg}) catch buf[0..];
+    std.debug.print("|{s: <78}|\n", .{s});
+    s = std.fmt.bufPrint(&buf, "        Min  {d}", .{min}) catch buf[0..];
+    std.debug.print("|{s: <78}|\n", .{s});
+    s = std.fmt.bufPrint(&buf, "        Max  {d}", .{max}) catch buf[0..];
+    std.debug.print("|{s: <78}|\n", .{s});
+    s = std.fmt.bufPrint(&buf, "       Hits  {d}", .{hits}) catch buf[0..];
+    std.debug.print("|{s: <78}|\n", .{s});
 }
 
 const Slot = struct {
@@ -102,8 +84,13 @@ fn log(vm: *tes.TESVM, slotIdx: u15, comptime stopwatch: bool) tes.EventResult {
         tes.TESVM.doubleRegIndex(.GCL)
     ];
 
-    slot.hit += 1;
-
+    if (comptime stopwatch) {
+        if (slot.timestamp != null) {
+            slot.hit += 1;
+        }
+    } else {
+        slot.hit += 1;
+    }
     if (slot.timestamp == null) {
         slot.timestamp = counter;
         return .ok;

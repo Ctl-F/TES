@@ -527,6 +527,8 @@ fn emitInstruction(
                 } else {
                     try w.print("pop {s}, {s}", .{ regName(dst), regName(src) });
                 }
+            } else if (info.opcode == 0x84) { // mov_b
+                try w.print("mov {s}, (byte){s}", .{ regName(dst), regName(src) });
             } else {
                 try w.print("{s} {s}, {s}", .{ info.mnemonic, regName(dst), regName(src) });
             }
@@ -626,6 +628,13 @@ fn emitInstruction(
             const s1  = r.reg(word, 18);
             const s2  = r.reg(word, 23);
             try w.print("{s} {s}, {s}, {s}, {s}", .{ info.mnemonic, regName(dst), regName(s0), regName(s1), regName(s2) });
+        },
+
+        .DstConst2 => {
+            const dst = r.reg(word, 8);
+            const c0  = (word >> 13) & 0xFF;
+            const c1  = (word >> 21) & 0xFF;
+            try w.print("{s} {s}, {d}, {d}", .{ info.mnemonic, regName(dst), c0, c1 });
         },
 
         .LeaWide => {

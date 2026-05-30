@@ -39,9 +39,19 @@ pub const ParseError = error{
     UndefinedStruct,
     InvalidInitializer,
     BranchTooFar,
+    PageOverflow,
+    SectionOverlap,
 };
 
 const BranchKind = enum { Near, NearCond };
+
+const SectionRange = struct {
+    page: u8,
+    start: u16,
+    end: u16,
+    source_file: []const u8,
+    line: u32,
+};
 
 const ForwardRef = struct {
     instr_idx:   u32,
@@ -68,6 +78,10 @@ pub const Parser = struct {
     data_buf: std.AutoHashMapUnmanaged(u8, std.ArrayList(u8)),
     /// Next free byte offset per page
     page_cursors: std.AutoHashMapUnmanaged(u8, u16),
+    /// High-water mark (max cursor ever reached) per page — used to start implicit [Data] sections
+    page_high_water: std.AutoHashMapUnmanaged(u8, u16),
+    /// Recorded ranges of all data sections for overlap detection
+    section_ranges: std.ArrayList(SectionRange),
 
     emit_debug: bool,
 
@@ -94,9 +108,11 @@ pub const Parser = struct {
             .sym          = SymbolTable.init(allocator),
             .tbfWriter    = tbf.TBFWriter.init(allocator),
             .forward_refs = .empty,
-            .data_buf     = .{},
-            .page_cursors = .{},
-            .emit_debug   = emit_debug,
+            .data_buf       = .{},
+            .page_cursors   = .{},
+            .page_high_water = .{},
+            .section_ranges = .empty,
+            .emit_debug     = emit_debug,
             .alias_stack  = .empty,
             .source_map   = source_map,
         };
@@ -156,6 +172,8 @@ pub const Parser = struct {
         while (it.next()) |buf| buf.deinit(self.allocator);
         self.data_buf.deinit(self.allocator);
         self.page_cursors.deinit(self.allocator);
+        self.page_high_water.deinit(self.allocator);
+        self.section_ranges.deinit(self.allocator);
         for (self.alias_stack.items) |*scope| {
             var kit = scope.keyIterator();
             while (kit.next()) |k| self.allocator.free(k.*);
@@ -288,7 +306,7 @@ pub const Parser = struct {
             switch (t.kind) {
                 .Eof            => break,
                 .SectionMeta    => { _ = self.advanceRaw(); try self.parseMeta(); },
-                .SectionData    => { const st = self.advanceRaw(); try self.parseData(st.data_page, st.data_offset); },
+                .SectionData    => { const st = self.advanceRaw(); try self.parseData(st.data_page, st.data_offset, st.data_explicit, st.source_file, st.line); },
                 .SectionProgram => { _ = self.advanceRaw(); try self.parseProgram(); },
                 .Newline        => self.pos += 1,
                 else => {
@@ -413,9 +431,14 @@ pub const Parser = struct {
 
     // ── [Data] ────────────────────────────────────────────────────────────
 
-    fn parseData(self: *@This(), page: u8, section_offset: u16) ParseError!void {
-        const cur = self.page_cursors.get(page) orelse 0;
-        self.page_cursors.put(self.allocator, page, @max(cur, section_offset)) catch return ParseError.OutOfMemory;
+    fn parseData(self: *@This(), page: u8, section_offset: u16, explicit: bool, sec_source_file: []const u8, sec_line: u32) ParseError!void {
+        if (explicit) {
+            self.page_cursors.put(self.allocator, page, section_offset) catch return ParseError.OutOfMemory;
+        } else {
+            const hw = self.page_high_water.get(page) orelse 0;
+            self.page_cursors.put(self.allocator, page, hw) catch return ParseError.OutOfMemory;
+        }
+        const section_start = self.page_cursors.get(page) orelse section_offset;
 
         while (true) {
             self.skipNewlines();
@@ -431,6 +454,33 @@ pub const Parser = struct {
             }
             try self.parseDataDecl(page);
         }
+
+        const section_end = self.page_cursors.get(page) orelse section_start;
+
+        // Update high-water mark
+        const cur_hw = self.page_high_water.get(page) orelse 0;
+        if (section_end > cur_hw)
+            self.page_high_water.put(self.allocator, page, section_end) catch return ParseError.OutOfMemory;
+
+        // Validate overlaps with previously-recorded sections
+        if (section_end > section_start) {
+            for (self.section_ranges.items) |prev| {
+                if (prev.page != page) continue;
+                if (section_start < prev.end and section_end > prev.start) {
+                    std.debug.print("{s}:{}: error: data section [Data({d}:0x{X:0>4})] (0x{X:0>4}..0x{X:0>4}) overlaps with section at {s}:{} (0x{X:0>4}..0x{X:0>4})\n", .{
+                        sec_source_file, sec_line, page, section_start,
+                        section_start, section_end,
+                        prev.source_file, prev.line, prev.start, prev.end,
+                    });
+                    return ParseError.SectionOverlap;
+                }
+            }
+        }
+
+        self.section_ranges.append(self.allocator, .{
+            .page = page, .start = section_start, .end = section_end,
+            .source_file = sec_source_file, .line = sec_line,
+        }) catch return ParseError.OutOfMemory;
     }
 
     fn pageDataBuf(self: *@This(), page: u8) ParseError!*std.ArrayList(u8) {
@@ -507,8 +557,16 @@ pub const Parser = struct {
                 catch return ParseError.OutOfMemory;
 
         const buf = try self.pageDataBuf(page);
-        while (buf.items.len < sym_offset)
-            buf.append(self.allocator, 0) catch return ParseError.OutOfMemory;
+        const buf_saved = buf.items.len;
+        if (sym_offset > buf.items.len) {
+            buf.ensureTotalCapacity(self.allocator, sym_offset) catch return ParseError.OutOfMemory;
+            const gap_start = buf.items.len;
+            buf.items.len = sym_offset;
+            @memset(buf.items[gap_start..], 0);
+        } else if (sym_offset < buf.items.len) {
+            buf.ensureTotalCapacity(self.allocator, sym_offset + type_size) catch return ParseError.OutOfMemory;
+            buf.items.len = sym_offset;
+        }
 
         // No initializer = zero-fill (arrays with no init, or optional omission)
         const next = self.peek();
@@ -541,7 +599,19 @@ pub const Parser = struct {
                 buf.append(self.allocator, 0) catch return ParseError.OutOfMemory;
         }
 
-        self.page_cursors.put(self.allocator, page, sym_offset + type_size) catch return ParseError.OutOfMemory;
+        if (buf.items.len < buf_saved) buf.items.len = buf_saved;
+
+        const new_cursor = @addWithOverflow(sym_offset, type_size);
+        if (new_cursor[1] != 0) {
+            std.debug.print("{s}:{}:{}: error: symbol '{s}' overflows page {d} (offset 0x{X:0>4} + size {} = 0x{X} exceeds 64KB)\n", .{
+                name_tok.source_file, name_tok.line, name_tok.col,
+                name_tok.text, page, sym_offset, type_size,
+                @as(u32, sym_offset) + @as(u32, type_size),
+            });
+            self.printSourceContext(name_tok);
+            return ParseError.PageOverflow;
+        }
+        self.page_cursors.put(self.allocator, page, new_cursor[0]) catch return ParseError.OutOfMemory;
         _ = self.tryConsume(.Semicolon);
     }
 
@@ -565,12 +635,20 @@ pub const Parser = struct {
 
         const sym_offset = self.page_cursors.get(page) orelse 0;
         const buf = try self.pageDataBuf(page);
-        while (buf.items.len < sym_offset)
-            buf.append(self.allocator, 0) catch return ParseError.OutOfMemory;
+        const buf_saved = buf.items.len;
+        if (sym_offset > buf.items.len) {
+            buf.ensureTotalCapacity(self.allocator, sym_offset) catch return ParseError.OutOfMemory;
+            const gap_start = buf.items.len;
+            buf.items.len = sym_offset;
+            @memset(buf.items[gap_start..], 0);
+        } else if (sym_offset < buf.items.len) {
+            buf.items.len = sym_offset;
+        }
 
         const before = buf.items.len;
         try self.emitStringBytes(buf, str);
         const str_size: u16 = @truncate(buf.items.len - before);
+        if (buf.items.len < buf_saved) buf.items.len = buf_saved;
 
         self.sym.defineData(name_tok.text, DataSymbol{
             .page = page, .offset = sym_offset, .size = str_size,
@@ -1150,6 +1228,13 @@ pub const Parser = struct {
                 try self.emitWord(pDstSrc3(info.opcode, dst, s0, s1, s2));
             },
 
+            .DstConst2 => {
+                const dst = try self.parseReg(line); _ = self.tryConsume(.Comma);
+                const c0: u32 = @truncate(@as(u64, @bitCast(try self.parseImm(line)))); _ = self.tryConsume(.Comma);
+                const c1: u32 = @truncate(@as(u64, @bitCast(try self.parseImm(line))));
+                try self.emitWord(pDst(info.opcode, dst, (c0 & 0xFF) | ((c1 & 0xFF) << 8)));
+            },
+
             .LeaWide => {
                 const hi = try self.parseReg(line); _ = self.tryConsume(.Comma);
                 const lo = try self.parseReg(line); _ = self.tryConsume(.Comma);
@@ -1372,9 +1457,10 @@ pub const Parser = struct {
                         }
                     }
                 }
-                // Register to register: mov r_dst, r_src
+                // Register to register: mov r_dst, r_src  /  mov r_dst, (byte)r_src
                 const src = try self.parseReg(line);
-                try self.emitWord(pDstSrc(0x01, dst, src, 0));
+                const opcode: u8 = if (byte_right) 0x84 else 0x01;
+                try self.emitWord(pDstSrc(opcode, dst, src, 0));
             }
         }
     }

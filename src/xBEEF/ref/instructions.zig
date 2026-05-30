@@ -141,6 +141,9 @@ pub const InstructionCode = enum(u8) {
     push32 = 0x81,
     pop32 = 0x82,
     ivs = 0x83,
+    mov_hreg = 0x84, // mov reg, (byte)reg
+    vimin2 = 0x85,
+    vimax2 = 0x86,
 };
 
 // TODO: Separate saturiting and wrapping variants

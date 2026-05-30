@@ -1,0 +1,13 @@
+#once
+[Meta]
+struct MMMap {
+    gpu: extensions.mmioHeader.MMMap.GPUHeader;
+    io: extensions.mmioHeader.MMMap.IOHeader;
+};
+
+#define ColorRGB565_Mask_R 63488
+#define ColorRGB565_Mask_G 2016
+#define ColorRGB565_Mask_B 31
+#define ColorRGB565_ShiftToR 11
+#define ColorRGB565_ShiftToG 5
+#define ColorRGB565_ShiftToB 0

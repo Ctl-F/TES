@@ -6,7 +6,7 @@
 #define BOARD_HEIGHT 64
 #define BOARD_SCALE 8
 
-#define C_WHITE 0xFFFF
+#define C_WHITE 0xb596
 #define C_BLACK 0x0000
 #define C_PAWN 0b1111100111100111;
 
@@ -25,18 +25,18 @@ _layerConfig: .GPUPixelLayerConfig .{ $STRUCT_LAYER_CONFIG_FRAMEBUFFER, $PIXEL_F
 _inputBuffer: .IOBufferControllerSource 0
 _player: .Pawn .{ ${BOARD_WIDTH / 2}, ${BOARD_HEIGHT / 2} }
 
-_debug_message_set: "Set Square: @{8}, @{9} --> @{c}\n"
-_debug_message_set_end: .u8 0
-
-_debug_message_begin_fill: "Filling Board [@{6}, @{7}]\n"
-_debug_message_begin_fill_end: .u8 0
-
+_input_message: "lrud: @{5}, @{6}, @{7}, @{8}\n"
+_velocity_message: "Velocity: @{2:b}\n"
+_velocity_message_end: .u8 0
+_position_message: "Position: @{3:v}\n"
 
 [Data(1:0)]
 _FrameBuffer: .u16[${BOARD_WIDTH * BOARD_HEIGHT}]
 
 [Program]
 _start:
+    syscall $TRACE, ${STOPWATCH + 1}
+
     mov ra, _StackHead;
     mov rb, $STACK_SIZE;
     stackset ra, rb;
@@ -56,8 +56,9 @@ _loop:
     bnf rc, _loop;
 _end_loop:
 
-    syscall $TRACE, $REPORT;
 
+    syscall $TRACE, ${STOPWATCH + 1}
+    syscall $TRACE, $REPORT;
 _end:
     hlt;
 
@@ -65,34 +66,59 @@ _end:
     @bind tmp0 : r0;
     @bind tmp1 : r1;
     @bind velocity: r2;
+    @bind position: r3;
+
+    @bind left : r5;
+    @bind right : r6;
+    @bind up : r7;
+    @bind down : r8;
+
 _process_movement:
     push jr;
-
 
     xor velocity, velocity;
 
     lea ra, rb, _inputBuffer;
-    mov tmp0, (byte)[ra, (IOBufferControllerSource.left)rb];
-    mov tmp1, (byte)[ra, (IOBufferControllerSource.right)rb];
-    isub tmp1, tmp0;
 
-    mov velocity, tmp1;
-    mov tmp1, 8;
-    ror velocity, tmp1;
+    ; allow escape to close the window
+    mov tmp0, (byte)[ra, (IOBufferControllerSource.menu)rb];
+    bnt tmp0, _end_loop;
 
-
+    // calculate vertical inputs
     mov tmp0, (byte)[ra, (IOBufferControllerSource.up)rb];
     mov tmp1, (byte)[ra, (IOBufferControllerSource.down)rb];
     isub tmp1, tmp0;
+    // apply to vertical velocity
+    mov velocity, (byte)tmp1;
 
-    xor velocity, tmp1;
+    mov tmp1, 8;
+    ror velocity, tmp1;
+
+    mov tmp0, (byte)[ra, (IOBufferControllerSource.left)rb];
+    mov tmp1, (byte)[ra, (IOBufferControllerSource.right)rb];
+    isub tmp1, tmp0;
+    truncz tmp1;
+    or velocity, tmp1;
 
     // velocity should now have the x/y velocity from inputs
+    mov ra, _player;
+    mov position, [ra];
 
+    viadd2 position, velocity;
+
+    vldc2 tmp0, 0, 0;
+    vldc2 tmp1, ${BOARD_WIDTH - 1}, ${BOARD_HEIGHT - 1};
+
+
+    vimin2 position, tmp1;
+    vimax2 position, tmp0;
+
+    mov [ra], position;
 
     pop jr;
     b jr;
 }
+
 @{
     @bind eof: rf;
     @bind color: rc;
