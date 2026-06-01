@@ -139,6 +139,14 @@ pub const PixelBufferLayer = struct {
         const sourcePitch = @as(c_int, @intCast(width)) * @as(c_int, @intCast(getFormatWidth(srcFormat)));
         const dstPitch = @as(c_int, @intCast(width)) * @as(c_int, @intCast(getFormatWidth(dstFormat)));
 
+        if (!created) {
+            const surface = native.SDL_CreateSurfaceFrom(width, height, sdlFormatSrc, @ptrCast(@constCast(srcBuffer.ptr)), sourcePitch);
+            if (!native.SDL_SaveBMP(surface, "preframe.bmp")) {
+                std.debug.print("Error saving preframe: {s}\n", .{native.SDL_GetError()});
+            }
+            native.SDL_DestroySurface(surface);
+        }
+
         if (!native.SDL_ConvertPixels(
             width,
             height,

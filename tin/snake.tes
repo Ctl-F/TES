@@ -2,7 +2,7 @@
 #include "stddef.tes"
 [Meta]
 
-#define STACK_SIZE 0x800
+#define STACK_SIZE 0x1FFE
 
 #define BOARD_WIDTH 48
 #define BOARD_HEIGHT 48
@@ -14,10 +14,12 @@
 #define MAX_SNAKE_SIZE 1024
 #define MAX_FOOD_SIZE 4
 
-#define NORTH 0
-#define SOUTH 1
-#define EAST 2
-#define WEST 3
+enum Dir {
+    North = 0;
+    East;
+    South;
+    West;
+}
 
 struct Point {
     y: u8;
@@ -36,12 +38,12 @@ struct Food {
     food: [$MAX_FOOD_SIZE]Point;
 }
 
-[Data(0:0xF000)]
+[Data(0:0xE000)]
 _StackHead: .u8[$STACK_SIZE] 0
 
 [Data(0:0x400)]
 _ClearColor: .ColorRGB32 .{ 10, 10, 10, 255 }
-_FrameBufferConfig: .GPUPixelLayerConfig .{ $STRUCT_LAYER_CONFIG_FRAMEBUFFER, $PIXEL_FORMAT_RGB565, $BOARD_WIDTH, $BOARD_HEIGHT }
+_FrameBufferConfig: .GPUPixelLayerConfig .{ $STRUCT_LAYER_CONFIG_FRAMEBUFFER, $PIXEL_FORMAT_RGBA5551, $BOARD_WIDTH, $BOARD_HEIGHT }
 _InputBuffer: .IOBufferControllerSource 0
 
 [Data(0:0x500)]
@@ -49,7 +51,7 @@ _snake: .Snake 0
 _food: .Food 0
 
 [Data(1:0x0000)]
-_FrameBuffer: .u16[${BOARD_WIDTH * BOARD_HEIGHT}] 0
+_FrameBuffer: .u16[${BOARD_WIDTH * BOARD_HEIGHT}] 0xFFFF //0b1111100000000001
 
 [Data(2:0x0000)]
 _GameBuffer: .u16[${BOARD_WIDTH * BOARD_HEIGHT}] 0
@@ -60,66 +62,234 @@ _start:
     mov ra, _StackHead;
     mov rb, $STACK_SIZE;
     stackset ra, rb;
-_main:
+_main: @{
     // initialize hardware
     bn _init_gpu;
     bn _init_io;
 
-
-_main_loop:
-
-
+    ;bn _draw_gradient;
+@loop:
     yield;
     mov ra, $MMIO_PAGE_ID;
     mov rb, $MMIO_HEADER_BASE;
     mov rc, (byte)[ra, (MemIOMap.io.closeSignal)rb];
-    bnf rc, _main_loop;
-
+    bnf rc, @loop;
+}
 _end:
     hlt;
 
-_draw_gradient:
-    push jr;
+// _draw_gradient: @{
+//     @const start : 10;
+//     @const step : 15;
+//     @const iterations : 8;
 
+//     @bind cursor: r7;
+//     @bind counter: rc;
+//     @bind colorCounter : rd;
+//     @bind tmp : re;
+//     @bind edge : r8;
+//     @bind condition : rf;
+//     @bind bufferStart : r9;
+//     push jr;
+//     push rb, rc;
+//     push re, rf;
+//     push ra, rd;
+//     push r9, r7;
+//     push r8;
+
+//     ; grab the famebuffer pointers
+//     lea ra, rb, _FrameBuffer;
+
+//     ; allocate on the stack room for the row
+//     bump ${ -(BOARD_WIDTH * 2) };
+//     mov bufferStart, sp;
+
+//     xor cursor, cursor;
+//     mov colorCounter, @start;
+//     mov edge, ${ BOARD_WIDTH * 2 };
+
+//     ; this should run 8 times
+// @fillLoop:
+//     mov tmp, @iterations;
+//     setge condition, cursor, tmp;
+//     bnt condition, @endFillLoop;
+
+//     // here we build the color that will be used for the next 8 rows
+//     mov r0, colorCounter;
+//     mov r1, colorCounter;
+//     mov r2, colorCounter;
+//     bn _make_color565;
+
+//     mov tmp, @step;
+//     add colorCounter, tmp;
+
+//     // r0 now holds the color for the row
+//     // we want to write it to the row allocated on the stack
+//     push cursor;
+//     add edge, bufferStart;
+//     mov cursor, bufferStart;
+
+//     // we'll use our tmp as a page0 selector so we can use the auto-incrementing
+//     // instructions
+//     xor tmp, tmp;
+// @fillRow:
+//     movi [tmp, cursor], r0;
+//     setlt condition, cursor, edge;
+//     bnt condition, @fillRow;
+// @endFillRow:
+
+//     sub edge, bufferStart;
+//     pop cursor;
+
+//     // now we memcopy the whole row 8 times to the frame buffer
+//     @repeat(8, i){
+//         mcpy ra, rb, tmp, bufferStart, edge;
+//         add rb, edge;
+//     }
+
+//     inc cursor;
+//     bn @fillLoop;
+// @endFillLoop:
+
+//     bump ${ (BOARD_WIDTH * 2) }
+
+//     pop r8;
+//     pop r9, r7;
+//     pop ra, rd;
+//     pop re, rf;
+//     pop rb, rc;
+//     pop jr;
+//     b jr;
+// }
+
+_draw_gradient: @{
+    @const start : 10;
+    @const step : 15;
+    @const iterations : 8;
+
+    @bind cursor: r7;
+    @bind colorCounter : rd;
+    @bind tmp : re;
+    @bind edge : r8;
+    @bind condition : rf;
+    @bind bufferStart : r9;
+    @bind rowWritePtr : rc;  ; Dedicated pointer for the auto-incrementing write
+
+    push jr;
+    push rb, rc;
+    push re, rf;
+    push ra, rd;
+    push r9, r7;
+    push r8;
+
+    ; Grab the framebuffer base pointers (Page 1)
     lea ra, rb, _FrameBuffer;
 
+    ; Safely reserve space on the stack for our temporary row buffer
+    bump ${ -(BOARD_WIDTH * 2) };
+    mov bufferStart, sp;
 
+    xor cursor, cursor;
+    mov colorCounter, @start;
 
+@fillLoop:
+    mov tmp, @iterations;
+    setge condition, cursor, tmp;
+    bnt condition, @endFillLoop;     ; Branch Near if True (Exit loop when cursor >= 8)
+
+    // Build the RGB565 color for this iteration
+    mov r0, colorCounter;
+    mov r1, colorCounter;
+    mov r2, colorCounter;
+    bn _make_color;
+
+    mov tmp, @step;
+    add colorCounter, tmp;
+
+    // Set up bounds to fill the row scratchpad
+    mov rowWritePtr, bufferStart;    ; Use a dedicated register so we don't mutate cursor
+    mov edge, ${ BOARD_WIDTH * 2 };
+    add edge, bufferStart;          ; edge = end address of our stack row buffer
+    xor tmp, tmp;                   ; Page 0 selector for memory operations
+
+@fillRow:
+    movi [tmp, rowWritePtr], r0;     ; movi auto-increments rowWritePtr by 2
+    setlt condition, rowWritePtr, edge;
+    bnt condition, @fillRow;        ; Keep writing until rowWritePtr >= edge
+@endFillRow:
+
+    ; Get the raw width in bytes for the blit operation
+    mov edge, ${ BOARD_WIDTH * 2 };
+
+    // Blit the completed row 8 times sequentially down into the FrameBuffer
+    @repeat(8, i){
+        mcpy ra, rb, tmp, bufferStart, edge;
+        add rb, edge;               ; Advance the framebuffer pointer by one row width
+    }
+
+    inc cursor;
+    bn @fillLoop;                   ; Unconditional branch back to the top
+@endFillLoop:
+
+    ; Free the temporary row buffer space from the stack
+    bump ${ (BOARD_WIDTH * 2) };
+
+    pop r8;
+    pop r9, r7;
+    pop ra, rd;
+    pop re, rf;
+    pop rb, rc;
     pop jr;
     b jr;
+}
 
 
-// make_color(r: reg0, g: reg0, b: reg0) --> reg0
+// make_color(r: reg0, g: reg1, b: reg2) --> reg0
+// takes r, g, b and packs into RGBA5551
 @{
-#define MASK_5 0b11111
-#define MASK_6 0b111111
+    @const MASK_5 : 0b11111;
+    @const SHIFT_R : 11;
+    @const SHIFT_G : 6;
+    @const SHIFT_B : 1;      ; Blue only needs to step left by 1 bit to clear Alpha (bit 0)
+
+    @bind result : r0;     ; Input Red / Output Packed Color
+    @bind color : rc;
+    @bind green : r1;      ; Input Green
+    @bind blue : r2;       ; Input Blue
+
+    @bind temp : ra;
 
 _make_color:
     push jr;
-    push ra, rb;
-    push rc, rd;
+    push ra;
 
+    ; --- 1. Position Red (Bits 15-11) ---
+    mov temp, @MASK_5;
+    and result, temp;
+    mov temp, @SHIFT_R;
+    shl result, temp;
 
+    ; --- 2. Position Green (Bits 10-6) ---
+    mov temp, @MASK_5;
+    and green, temp;
+    mov temp, @SHIFT_G;
+    shl green, temp;
+    or result, green;      ; Safely merge Green
 
+    ; --- 3. Position Blue (Bits 5-1) ---
+    mov temp, @MASK_5;
+    and blue, temp;
+    mov temp, @SHIFT_B;    ; Shift blue independently by 1
+    shl blue, temp;        ; Now blue sits at bits 5-1 safely
+    or result, blue;       ; Safely merge Blue (leaves bit 0 as 0)
 
-    xor rc, rc;
+    ; --- 4. Set Opaque Alpha Flag (Bit 0) ---
+    mov temp, 1;
+    or result, temp;       ; Result layout is now perfectly: RRRRRGGGGGBBBBBA
 
-    mov ra, (byte)r0;
-    mov rb, $MASK_5;
-    and ra, rb;
-
-    xor rc, ra;
-
-
-
-
-    pop rc, rd;
-    pop ra, rb;
+    pop ra;
     pop jr;
     b jr;
-
-#undef MASK_5
-#undef MASK_6
 }
 
 ; initialize gpu

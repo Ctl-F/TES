@@ -33,6 +33,8 @@ pub const TokenKind = enum {
     SectionData,
     SectionProgram,
     KwStruct,
+    KwEnum,
+    Equals,
     Newline,
     Eof,
 };
@@ -296,7 +298,9 @@ pub const Lexer = struct {
             const s = self.pos;
             while (self.peek()) |ch| { if (std.ascii.isAlphanumeric(ch) or ch == '_') { _ = self.advance(); } else break; }
             const text = self.src[s..self.pos];
-            const kind: TokenKind = if (std.mem.eql(u8, text, "struct")) .KwStruct else .Identifier;
+            const kind: TokenKind = if (std.mem.eql(u8, text, "struct")) .KwStruct
+                               else if (std.mem.eql(u8, text, "enum"))   .KwEnum
+                               else                                        .Identifier;
             return Token{ .kind = kind, .text = text, .line = sl, .col = sc, .source_file = sf };
         }
         _ = self.advance();
@@ -323,6 +327,7 @@ pub const Lexer = struct {
             '|' => Token{ .kind = .Pipe,       .text = "|",  .line = sl, .col = sc, .source_file = sf },
             '^' => Token{ .kind = .Caret,      .text = "^",  .line = sl, .col = sc, .source_file = sf },
             '~' => Token{ .kind = .Tilde,      .text = "~",  .line = sl, .col = sc, .source_file = sf },
+            '=' => Token{ .kind = .Equals,     .text = "=",  .line = sl, .col = sc, .source_file = sf },
             '<' => if (self.peek() == '<') blk: { _ = self.advance(); break :blk Token{ .kind = .ShiftLeft,  .text = "<<", .line = sl, .col = sc, .source_file = sf }; }
                    else Token{ .kind = .Identifier, .text = "<", .line = sl, .col = sc, .source_file = sf },
             '>' => if (self.peek() == '>') blk: { _ = self.advance(); break :blk Token{ .kind = .ShiftRight, .text = ">>", .line = sl, .col = sc, .source_file = sf }; }

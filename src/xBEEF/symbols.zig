@@ -52,6 +52,27 @@ pub const StructDef = struct {
     }
 };
 
+pub const EnumField = struct {
+    name: []const u8,  // heap-allocated
+    value: i64,
+};
+
+pub const EnumDef = struct {
+    name: []const u8,              // heap-allocated, owned by enums map
+    fields: std.ArrayList(EnumField),
+    count: u32,
+    max: i64,
+
+    pub fn findField(self: *const @This(), field_name: []const u8) ?i64 {
+        if (std.mem.eql(u8, field_name, "count")) return @intCast(self.count);
+        if (std.mem.eql(u8, field_name, "max"))   return self.max;
+        for (self.fields.items) |*f| {
+            if (std.mem.eql(u8, f.name, field_name)) return f.value;
+        }
+        return null;
+    }
+};
+
 pub const DataSymbol = struct {
     page: u8,
     offset: u16,
@@ -80,16 +101,27 @@ pub const SymbolTable = struct {
     allocator: std.mem.Allocator,
     symbols: std.StringHashMapUnmanaged(Symbol),
     structs: std.StringHashMapUnmanaged(StructDef),
+    enums: std.StringHashMapUnmanaged(EnumDef),
 
     pub fn init(allocator: std.mem.Allocator) @This() {
         return .{
             .allocator = allocator,
             .symbols = .{},
             .structs = .{},
+            .enums   = .{},
         };
     }
 
     pub fn deinit(self: *@This()) void {
+        // Free enum fields
+        var eit = self.enums.valueIterator();
+        while (eit.next()) |ed| {
+            for (ed.fields.items) |f| self.allocator.free(f.name);
+            ed.fields.deinit(self.allocator);
+            self.allocator.free(ed.name);
+        }
+        self.enums.deinit(self.allocator);
+
         // Free struct fields
         var sit = self.structs.valueIterator();
         while (sit.next()) |sd| {
@@ -122,6 +154,37 @@ pub const SymbolTable = struct {
         self.structs.put(self.allocator, key, owned) catch return SymbolError.OutOfMemory;
     }
 
+    pub fn defineEnum(self: *@This(), ed: EnumDef) SymbolError!void {
+        if (self.enums.contains(ed.name)) return SymbolError.DuplicateSymbol;
+        const key = self.allocator.dupe(u8, ed.name) catch return SymbolError.OutOfMemory;
+        var owned = ed;
+        owned.name = key;
+        self.enums.put(self.allocator, key, owned) catch return SymbolError.OutOfMemory;
+    }
+
+    pub fn getEnum(self: *@This(), name: []const u8) ?*EnumDef {
+        return self.enums.getPtr(name);
+    }
+
+    pub fn removeEnum(self: *@This(), name: []const u8) void {
+        const kv = self.enums.fetchRemove(name) orelse return;
+        for (kv.value.fields.items) |f| self.allocator.free(f.name);
+        var fields = kv.value.fields;
+        fields.deinit(self.allocator);
+        self.allocator.free(kv.key);
+    }
+
+    /// Resolve EnumName.field → integer value (i64), or null if not found.
+    /// Also handles the implicit EnumName.count and EnumName.max fields.
+    pub fn resolveEnumField(self: *@This(), path: []const u8) ?i64 {
+        var parts = std.mem.splitScalar(u8, path, '.');
+        const base_name = parts.next() orelse return null;
+        const ed = self.enums.getPtr(base_name) orelse return null;
+        const field_name = parts.next() orelse return null;
+        if (parts.next() != null) return null; // too many dots
+        return ed.findField(field_name);
+    }
+
     pub fn defineLabel(self: *@This(), name: []const u8, instr_idx: u32) SymbolError!void {
         if (self.symbols.contains(name)) return SymbolError.DuplicateSymbol;
         const key = self.allocator.dupe(u8, name) catch return SymbolError.OutOfMemory;
@@ -145,6 +208,18 @@ pub const SymbolTable = struct {
 
     pub fn getStruct(self: *@This(), name: []const u8) ?*StructDef {
         return self.structs.getPtr(name);
+    }
+
+    /// Remove a struct from the table and free all its owned memory.
+    pub fn removeStruct(self: *@This(), name: []const u8) void {
+        const kv = self.structs.fetchRemove(name) orelse return;
+        for (kv.value.fields.items) |f| {
+            self.allocator.free(f.name);
+            if (f.struct_name) |sn| self.allocator.free(sn);
+        }
+        var fields = kv.value.fields;
+        fields.deinit(self.allocator);
+        self.allocator.free(kv.key);
     }
 
     pub fn resolveStructRefs(self: *@This()) SymbolError!void {

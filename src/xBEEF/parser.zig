@@ -45,6 +45,14 @@ pub const ParseError = error{
 
 const BranchKind = enum { Near, NearCond };
 
+const TempLabelEntry = struct {
+    /// Globally-unique internal name (e.g. "__tmp_3_loop"); heap-allocated,
+    /// tracked in Parser.temp_label_strings for deallocation.
+    internal_name: []const u8,
+    /// False until @name: is actually declared (may start as a forward-ref reservation).
+    defined: bool,
+};
+
 const SectionRange = struct {
     page: u8,
     start: u16,
@@ -88,6 +96,20 @@ pub const Parser = struct {
     /// Stack of register alias scopes opened by @{ ... }.
     /// Each entry maps alias name (heap-allocated) → RegID.
     alias_stack: std.ArrayList(std.StringHashMapUnmanaged(RegID)),
+    /// Stack of scoped-constant scopes. Each entry maps bare name (heap-allocated) → i64 value.
+    const_stack: std.ArrayList(std.StringHashMapUnmanaged(i64)),
+    /// Stack of temp-label scopes. Each entry maps bare name (heap-allocated) → TempLabelEntry.
+    temp_label_stack: std.ArrayList(std.StringHashMapUnmanaged(TempLabelEntry)),
+    /// All internal_name strings ever allocated for temp labels; freed in deinit.
+    temp_label_strings: std.ArrayList([]u8),
+    /// Counter for generating unique temp-label internal names.
+    temp_label_counter: u32,
+    /// Stack of scoped-struct name lists. Each entry holds the names of structs
+    /// defined with @struct in that scope; they are removed from sym on scope close.
+    struct_scope_stack: std.ArrayList(std.ArrayList([]u8)),
+    /// Stack of scoped-enum name lists. Each entry holds the names of enums
+    /// defined with @enum in that scope; they are removed from sym on scope close.
+    enum_scope_stack: std.ArrayList(std.ArrayList([]u8)),
 
     /// Optional map from source filename → original source text, used to
     /// display the source line and a caret underline in error messages.
@@ -112,9 +134,15 @@ pub const Parser = struct {
             .page_cursors   = .{},
             .page_high_water = .{},
             .section_ranges = .empty,
-            .emit_debug     = emit_debug,
-            .alias_stack  = .empty,
-            .source_map   = source_map,
+            .emit_debug          = emit_debug,
+            .alias_stack         = .empty,
+            .const_stack         = .empty,
+            .temp_label_stack    = .empty,
+            .temp_label_strings  = .empty,
+            .temp_label_counter  = 0,
+            .struct_scope_stack  = .empty,
+            .enum_scope_stack    = .empty,
+            .source_map          = source_map,
         };
     }
 
@@ -180,6 +208,30 @@ pub const Parser = struct {
             scope.deinit(self.allocator);
         }
         self.alias_stack.deinit(self.allocator);
+        for (self.const_stack.items) |*scope| {
+            var kit = scope.keyIterator();
+            while (kit.next()) |k| self.allocator.free(k.*);
+            scope.deinit(self.allocator);
+        }
+        self.const_stack.deinit(self.allocator);
+        for (self.temp_label_stack.items) |*scope| {
+            var kit = scope.keyIterator();
+            while (kit.next()) |k| self.allocator.free(k.*);
+            scope.deinit(self.allocator);
+        }
+        self.temp_label_stack.deinit(self.allocator);
+        for (self.temp_label_strings.items) |s| self.allocator.free(s);
+        self.temp_label_strings.deinit(self.allocator);
+        for (self.struct_scope_stack.items) |*list| {
+            for (list.items) |name| self.allocator.free(name);
+            list.deinit(self.allocator);
+        }
+        self.struct_scope_stack.deinit(self.allocator);
+        for (self.enum_scope_stack.items) |*list| {
+            for (list.items) |name| self.allocator.free(name);
+            list.deinit(self.allocator);
+        }
+        self.enum_scope_stack.deinit(self.allocator);
     }
 
     // ── Token helpers ──────────────────────────────────────────────────────
@@ -327,6 +379,7 @@ pub const Parser = struct {
             if (isSection(t.kind) or t.kind == .Eof) break;
             if (t.kind == .Newline) { self.pos += 1; continue; }
             if (t.kind == .KwStruct) { try self.parseStruct(); continue; }
+            if (t.kind == .KwEnum)   { try self.parseEnum();   continue; }
             std.debug.print("{s}:{}:{}: warning: unexpected token in [Meta]: '{s}'\n", .{ t.source_file, t.line, t.col, t.text });
             self.printSourceContext(t);
             self.skipToEOL();
@@ -337,6 +390,10 @@ pub const Parser = struct {
     fn parseStruct(self: *@This()) ParseError!void {
         _ = self.advance(); // 'struct'
         const name_tok = try self.expectIdent();
+        try self.parseStructCore(name_tok);
+    }
+
+    fn parseStructCore(self: *@This(), name_tok: Token) ParseError!void {
         _ = try self.expect(.LBrace);
 
         var fields: std.ArrayList(FieldDef) = .empty;
@@ -427,6 +484,149 @@ pub const Parser = struct {
         };
         // fields is now owned by the StructDef in the symbol table; don't deinit it here
         // (errdefer above won't fire on success)
+    }
+
+    /// Parse `@struct Name { ... };` — caller has already consumed `@` and `struct`.
+    /// Defines the struct in the symbol table for the duration of the current scope,
+    /// then removes it when the scope closes.
+    fn parseAtStruct(self: *@This()) ParseError!void {
+        if (self.struct_scope_stack.items.len == 0) {
+            const t = self.peek();
+            std.debug.print("{s}:{}:{}: error: @struct used outside of a '@{{' scope\n",
+                .{ t.source_file, t.line, t.col });
+            self.printSourceContext(t);
+            self.skipToEOL();
+            return ParseError.UnexpectedToken;
+        }
+        const name_tok = try self.expectIdent();
+        // Shadowing check: no existing struct or symbol with this name.
+        if (self.sym.getStruct(name_tok.text) != null) {
+            std.debug.print("{s}:{}:{}: error: '@struct {s}' shadows an existing struct\n",
+                .{ name_tok.source_file, name_tok.line, name_tok.col, name_tok.text });
+            self.printSourceContext(name_tok);
+            return ParseError.DuplicateSymbol;
+        }
+        if (self.sym.getSymbol(name_tok.text) != null) {
+            std.debug.print("{s}:{}:{}: error: '@struct {s}' shadows existing symbol '{s}'\n",
+                .{ name_tok.source_file, name_tok.line, name_tok.col, name_tok.text, name_tok.text });
+            self.printSourceContext(name_tok);
+            return ParseError.DuplicateSymbol;
+        }
+        try self.parseStructCore(name_tok);
+        // Resolve any within-scope forward struct refs (e.g. Outer referencing Inner).
+        self.sym.resolveForwardStructRefs();
+        // Track this struct name so it can be removed when the scope closes.
+        const name_copy = self.allocator.dupe(u8, name_tok.text) catch return ParseError.OutOfMemory;
+        const top = &self.struct_scope_stack.items[self.struct_scope_stack.items.len - 1];
+        top.append(self.allocator, name_copy) catch {
+            self.allocator.free(name_copy);
+            return ParseError.OutOfMemory;
+        };
+    }
+
+    // ── enum parsing ──────────────────────────────────────────────────────
+
+    /// Parse `enum Name { ... };` body. Caller has already consumed `enum`.
+    /// Defines the enum globally (for use in [Meta] sections).
+    fn parseEnum(self: *@This()) ParseError!void {
+        _ = self.advance(); // 'enum'
+        const name_tok = try self.expectIdent();
+        try self.parseEnumCore(name_tok, false);
+    }
+
+    /// Parse `@enum Name { ... };` body. Caller has already consumed `@` and `enum`.
+    /// Defines the enum for the duration of the current scope.
+    fn parseAtEnum(self: *@This()) ParseError!void {
+        if (self.enum_scope_stack.items.len == 0) {
+            const t = self.peek();
+            std.debug.print("{s}:{}:{}: error: @enum used outside of a '@{{' scope\n",
+                .{ t.source_file, t.line, t.col });
+            self.printSourceContext(t);
+            self.skipToEOL();
+            return ParseError.UnexpectedToken;
+        }
+        const name_tok = try self.expectIdent();
+        // Shadowing check
+        if (self.sym.getEnum(name_tok.text) != null) {
+            std.debug.print("{s}:{}:{}: error: '@enum {s}' shadows an existing enum\n",
+                .{ name_tok.source_file, name_tok.line, name_tok.col, name_tok.text });
+            self.printSourceContext(name_tok);
+            return ParseError.DuplicateSymbol;
+        }
+        if (self.sym.getStruct(name_tok.text) != null or self.sym.getSymbol(name_tok.text) != null) {
+            std.debug.print("{s}:{}:{}: error: '@enum {s}' shadows an existing symbol\n",
+                .{ name_tok.source_file, name_tok.line, name_tok.col, name_tok.text });
+            self.printSourceContext(name_tok);
+            return ParseError.DuplicateSymbol;
+        }
+        try self.parseEnumCore(name_tok, true);
+        // Track so it can be removed when the scope closes.
+        const name_copy = self.allocator.dupe(u8, name_tok.text) catch return ParseError.OutOfMemory;
+        const top = &self.enum_scope_stack.items[self.enum_scope_stack.items.len - 1];
+        top.append(self.allocator, name_copy) catch {
+            self.allocator.free(name_copy);
+            return ParseError.OutOfMemory;
+        };
+    }
+
+    /// Shared body for both parseEnum and parseAtEnum.
+    /// Expects the name token to already be consumed; parses `{ field; field = val; ... }`.
+    fn parseEnumCore(self: *@This(), name_tok: Token, is_scoped: bool) ParseError!void {
+        _ = is_scoped;
+        _ = try self.expect(.LBrace);
+
+        var fields: std.ArrayList(sym_mod.EnumField) = .empty;
+        errdefer {
+            for (fields.items) |f| self.allocator.free(f.name);
+            fields.deinit(self.allocator);
+        }
+
+        var cur_val: i64 = 0;
+        var max_val: i64 = 0;
+        var first = true;
+
+        while (true) {
+            self.skipNewlines();
+            if (self.peek().kind == .RBrace) { _ = self.advance(); break; }
+            if (self.peek().kind == .Eof) return ParseError.UnexpectedEof;
+
+            const fname_tok = try self.expectIdent();
+            // Reject reserved implicit field names
+            if (std.mem.eql(u8, fname_tok.text, "count") or std.mem.eql(u8, fname_tok.text, "max")) {
+                std.debug.print("{s}:{}:{}: error: '{s}' is a reserved enum field name\n",
+                    .{ fname_tok.source_file, fname_tok.line, fname_tok.col, fname_tok.text });
+                self.printSourceContext(fname_tok);
+                return ParseError.DuplicateSymbol;
+            }
+
+            // Optional `= value`
+            if (self.peek().kind == .Equals) {
+                _ = self.advance(); // consume '='
+                cur_val = try self.parseConstExpr();
+            }
+
+            const fname = self.allocator.dupe(u8, fname_tok.text) catch return ParseError.OutOfMemory;
+            fields.append(self.allocator, .{ .name = fname, .value = cur_val }) catch {
+                self.allocator.free(fname);
+                return ParseError.OutOfMemory;
+            };
+
+            if (first or cur_val > max_val) max_val = cur_val;
+            first = false;
+            cur_val += 1;
+        }
+
+        const count: u32 = @intCast(fields.items.len);
+        self.sym.defineEnum(.{
+            .name   = name_tok.text,
+            .fields = fields,
+            .count  = count,
+            .max    = max_val,
+        }) catch |e| return switch (e) {
+            sym_mod.SymbolError.DuplicateSymbol => ParseError.DuplicateSymbol,
+            else => ParseError.OutOfMemory,
+        };
+        // fields is now owned by the EnumDef in the symbol table
     }
 
     // ── [Data] ────────────────────────────────────────────────────────────
@@ -760,6 +960,14 @@ pub const Parser = struct {
                 const name_tok = try self.expectIdent();
                 break :blk try self.parseBuiltinConst(name_tok);
             },
+            .At => blk: {
+                const name_tok = try self.expectIdent();
+                if (self.lookupScopedConst(name_tok.text)) |v| break :blk v;
+                std.debug.print("{s}:{}:{}: error: '@{s}' is not a scoped constant\n",
+                    .{ name_tok.source_file, name_tok.line, name_tok.col, name_tok.text });
+                self.printSourceContext(name_tok);
+                return ParseError.UndefinedSymbol;
+            },
             .Identifier => blk: {
                 var full: std.ArrayList(u8) = .empty;
                 defer full.deinit(self.allocator);
@@ -770,6 +978,8 @@ pub const Parser = struct {
                     full.append(self.allocator, '.') catch return ParseError.OutOfMemory;
                     full.appendSlice(self.allocator, f.text) catch return ParseError.OutOfMemory;
                 }
+                // Try enum first (EnumName.field)
+                if (self.sym.resolveEnumField(full.items)) |ev| break :blk ev;
                 break :blk @intCast(self.sym.resolveAddress(full.items) catch {
                     std.debug.print("{s}:{}:{}: error: undefined symbol '{s}'\n", .{ t.source_file, t.line, t.col, full.items });
                     self.printSourceContext(t);
@@ -932,22 +1142,59 @@ pub const Parser = struct {
     // ── [Program] ─────────────────────────────────────────────────────────
 
     fn parseProgram(self: *@This()) ParseError!void {
-        while (true) {
-            self.skipNewlines();
-            const t = self.peekRaw();
-            if (isSection(t.kind) or t.kind == .Eof) {
-                if (self.alias_stack.items.len > 0) {
-                    std.debug.print("warning: {} unclosed '@{{' scope(s) at end of [Program]\n",
-                        .{self.alias_stack.items.len});
-                    while (self.alias_stack.items.len > 0) {
-                        var scope = self.alias_stack.pop().?;
-                        var kit = scope.keyIterator();
-                        while (kit.next()) |k| self.allocator.free(k.*);
-                        scope.deinit(self.allocator);
-                    }
-                }
-                break;
+        try self.parseProgramInner(self.tokens.len);
+        if (self.alias_stack.items.len > 0) {
+            std.debug.print("warning: {} unclosed '@{{' scope(s) at end of [Program]\n",
+                .{self.alias_stack.items.len});
+            while (self.alias_stack.items.len > 0) {
+                var scope = self.alias_stack.pop().?;
+                var kit = scope.keyIterator();
+                while (kit.next()) |k| self.allocator.free(k.*);
+                scope.deinit(self.allocator);
             }
+            while (self.const_stack.items.len > 0) {
+                var scope = self.const_stack.pop().?;
+                var kit = scope.keyIterator();
+                while (kit.next()) |k| self.allocator.free(k.*);
+                scope.deinit(self.allocator);
+            }
+            while (self.temp_label_stack.items.len > 0) {
+                var scope = self.temp_label_stack.pop().?;
+                var kit = scope.keyIterator();
+                while (kit.next()) |k| self.allocator.free(k.*);
+                scope.deinit(self.allocator);
+            }
+            while (self.struct_scope_stack.items.len > 0) {
+                var sscope = self.struct_scope_stack.pop().?;
+                for (sscope.items) |name| {
+                    self.sym.removeStruct(name);
+                    self.allocator.free(name);
+                }
+                sscope.deinit(self.allocator);
+            }
+            while (self.enum_scope_stack.items.len > 0) {
+                var escope = self.enum_scope_stack.pop().?;
+                for (escope.items) |name| {
+                    self.sym.removeEnum(name);
+                    self.allocator.free(name);
+                }
+                escope.deinit(self.allocator);
+            }
+        }
+    }
+
+    /// Inner program parsing loop. Processes tokens from self.pos up to (not including)
+    /// stop_pos, handling labels, scope directives, and instructions. Does not clean up
+    /// unclosed scopes — the caller is responsible for that.
+    fn parseProgramInner(self: *@This(), stop_pos: usize) ParseError!void {
+        while (true) {
+            // Skip newlines, but don't advance past stop_pos
+            while (self.pos < stop_pos and self.pos < self.tokens.len and
+                   self.tokens[self.pos].kind == .Newline)
+                self.pos += 1;
+            if (self.pos >= stop_pos) break;
+            const t = self.peekRaw();
+            if (isSection(t.kind) or t.kind == .Eof) break;
             if (t.kind == .Newline) { self.pos += 1; continue; }
 
             if (t.kind == .Identifier and self.isLabelDecl()) {
@@ -970,6 +1217,10 @@ pub const Parser = struct {
                 _ = self.advanceRaw(); // consume '@'
                 _ = self.advanceRaw(); // consume '{'
                 self.alias_stack.append(self.allocator, .{}) catch return ParseError.OutOfMemory;
+                self.const_stack.append(self.allocator, .{}) catch return ParseError.OutOfMemory;
+                self.temp_label_stack.append(self.allocator, .{}) catch return ParseError.OutOfMemory;
+                self.struct_scope_stack.append(self.allocator, .empty) catch return ParseError.OutOfMemory;
+                self.enum_scope_stack.append(self.allocator, .empty) catch return ParseError.OutOfMemory;
                 self.consumeEOL();
                 continue;
             }
@@ -982,12 +1233,44 @@ pub const Parser = struct {
                 if (next.kind == .LBrace) {
                     _ = self.advanceRaw();
                     self.alias_stack.append(self.allocator, .{}) catch return ParseError.OutOfMemory;
+                    self.const_stack.append(self.allocator, .{}) catch return ParseError.OutOfMemory;
+                    self.temp_label_stack.append(self.allocator, .{}) catch return ParseError.OutOfMemory;
+                    self.struct_scope_stack.append(self.allocator, .empty) catch return ParseError.OutOfMemory;
+                    self.enum_scope_stack.append(self.allocator, .empty) catch return ParseError.OutOfMemory;
                     self.consumeEOL();
                     continue;
                 }
                 if (next.kind == .Identifier and std.mem.eql(u8, next.text, "bind")) {
                     _ = self.advanceRaw();
                     try self.parseAtBind();
+                    continue;
+                }
+                if (next.kind == .Identifier and std.mem.eql(u8, next.text, "const")) {
+                    _ = self.advanceRaw();
+                    try self.parseAtConst();
+                    continue;
+                }
+                if (next.kind == .KwStruct) {
+                    _ = self.advanceRaw();
+                    try self.parseAtStruct();
+                    continue;
+                }
+                if (next.kind == .KwEnum) {
+                    _ = self.advanceRaw();
+                    try self.parseAtEnum();
+                    continue;
+                }
+                if (next.kind == .Identifier and std.mem.eql(u8, next.text, "repeat")) {
+                    _ = self.advanceRaw();
+                    try self.parseAtRepeat();
+                    continue;
+                }
+                // @name: — temp label declaration
+                if (next.kind == .Identifier and self.isLabelDecl()) {
+                    _ = self.advanceRaw(); // consume identifier
+                    self.skipNewlines();
+                    _ = self.advanceRaw(); // consume ':'
+                    try self.defineTempLabel(next);
                     continue;
                 }
                 std.debug.print("{s}:{}:{}: warning: unknown '@' directive '{s}'\n",
@@ -1011,6 +1294,40 @@ pub const Parser = struct {
                 var kit = scope.keyIterator();
                 while (kit.next()) |k| self.allocator.free(k.*);
                 scope.deinit(self.allocator);
+                // Pop const scope
+                var cscope = self.const_stack.pop().?;
+                var ckit = cscope.keyIterator();
+                while (ckit.next()) |k| self.allocator.free(k.*);
+                cscope.deinit(self.allocator);
+                // Pop temp-label scope; validate every entry was actually declared
+                var tscope = self.temp_label_stack.pop().?;
+                var had_unresolved = false;
+                var tit = tscope.iterator();
+                while (tit.next()) |entry| {
+                    if (!entry.value_ptr.defined) {
+                        std.debug.print("error: '@{s}' was referenced but never declared in its '@{{...}}' scope\n",
+                            .{entry.key_ptr.*});
+                        had_unresolved = true;
+                    }
+                    self.allocator.free(entry.key_ptr.*);
+                    // internal_name lives in temp_label_strings; freed in deinit
+                }
+                tscope.deinit(self.allocator);
+                if (had_unresolved) return ParseError.LabelNotFound;
+                // Pop scoped-struct scope: remove each struct from the symbol table.
+                var sscope = self.struct_scope_stack.pop().?;
+                for (sscope.items) |name| {
+                    self.sym.removeStruct(name);
+                    self.allocator.free(name);
+                }
+                sscope.deinit(self.allocator);
+                // Pop scoped-enum scope: remove each enum from the symbol table.
+                var escope = self.enum_scope_stack.pop().?;
+                for (escope.items) |name| {
+                    self.sym.removeEnum(name);
+                    self.allocator.free(name);
+                }
+                escope.deinit(self.allocator);
                 // Consume optional same-line }@label (must be on the same line — no newline between)
                 if (self.peekRaw().kind == .At) {
                     _ = self.advanceRaw();
@@ -1022,6 +1339,115 @@ pub const Parser = struct {
 
             try self.parseInstruction();
         }
+    }
+
+    /// Parse `@repeat(count, iter) { body }`.
+    /// Caller has already consumed `@` and `repeat`.
+    /// Repeats body `count` times; `@iter` is a scoped constant holding the current
+    /// iteration index (0-based, upper bound excluded).
+    fn parseAtRepeat(self: *@This()) ParseError!void {
+        _ = try self.expect(.LParen);
+        const count_val = try self.parseConstExpr();
+        if (count_val < 0) {
+            const t = self.peek();
+            std.debug.print("{s}:{}:{}: error: @repeat count must be non-negative, got {}\n",
+                .{ t.source_file, t.line, t.col, count_val });
+            return ParseError.InvalidOperand;
+        }
+        const count: usize = @intCast(count_val);
+        _ = try self.expect(.Comma);
+        const iter_tok = try self.expectIdent();
+        _ = try self.expect(.RParen);
+        _ = try self.expect(.LBrace);
+        self.consumeEOL();
+
+        const body_start = self.pos;
+
+        // Scan for the matching '}' by tracking brace nesting depth.
+        var depth: usize = 1;
+        var scan: usize = self.pos;
+        while (scan < self.tokens.len and depth > 0) {
+            switch (self.tokens[scan].kind) {
+                .LBrace => depth += 1,
+                .RBrace => {
+                    depth -= 1;
+                    if (depth == 0) break;
+                },
+                else => {},
+            }
+            scan += 1;
+        }
+        if (depth != 0) {
+            std.debug.print("{s}:{}:{}: error: @repeat body is missing closing '}}'\n",
+                .{ iter_tok.source_file, iter_tok.line, iter_tok.col });
+            return ParseError.UnexpectedEof;
+        }
+        const body_end = scan; // index of the closing '}'
+
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            self.pos = body_start;
+
+            // Push fresh scopes for this iteration
+            self.alias_stack.append(self.allocator, .{}) catch return ParseError.OutOfMemory;
+            self.const_stack.append(self.allocator, .{}) catch return ParseError.OutOfMemory;
+            self.temp_label_stack.append(self.allocator, .{}) catch return ParseError.OutOfMemory;
+            self.struct_scope_stack.append(self.allocator, .empty) catch return ParseError.OutOfMemory;
+            self.enum_scope_stack.append(self.allocator, .empty) catch return ParseError.OutOfMemory;
+
+            // Inject iteration variable into the const scope
+            const iter_key = self.allocator.dupe(u8, iter_tok.text) catch return ParseError.OutOfMemory;
+            const top_const = &self.const_stack.items[self.const_stack.items.len - 1];
+            top_const.put(self.allocator, iter_key, @intCast(i)) catch {
+                self.allocator.free(iter_key);
+                return ParseError.OutOfMemory;
+            };
+
+            try self.parseProgramInner(body_end);
+
+            // Pop and clean up all iteration scopes
+            var scope = self.alias_stack.pop().?;
+            var kit = scope.keyIterator();
+            while (kit.next()) |k| self.allocator.free(k.*);
+            scope.deinit(self.allocator);
+
+            var cscope = self.const_stack.pop().?;
+            var ckit = cscope.keyIterator();
+            while (ckit.next()) |k| self.allocator.free(k.*);
+            cscope.deinit(self.allocator);
+
+            var tscope = self.temp_label_stack.pop().?;
+            var had_unresolved = false;
+            var tit = tscope.iterator();
+            while (tit.next()) |entry| {
+                if (!entry.value_ptr.defined) {
+                    std.debug.print("error: '@{s}' was referenced but never declared in @repeat body (iteration {})\n",
+                        .{ entry.key_ptr.*, i });
+                    had_unresolved = true;
+                }
+                self.allocator.free(entry.key_ptr.*);
+            }
+            tscope.deinit(self.allocator);
+            if (had_unresolved) return ParseError.LabelNotFound;
+
+            var sscope = self.struct_scope_stack.pop().?;
+            for (sscope.items) |name| {
+                self.sym.removeStruct(name);
+                self.allocator.free(name);
+            }
+            sscope.deinit(self.allocator);
+
+            var escope = self.enum_scope_stack.pop().?;
+            for (escope.items) |name| {
+                self.sym.removeEnum(name);
+                self.allocator.free(name);
+            }
+            escope.deinit(self.allocator);
+        }
+
+        // Advance past the closing '}'
+        self.pos = body_end + 1;
+        self.consumeEOL();
     }
 
     fn parseAtBind(self: *@This()) ParseError!void {
@@ -1066,6 +1492,155 @@ pub const Parser = struct {
             if (self.alias_stack.items[i].get(name)) |reg| return reg;
         }
         return null;
+    }
+
+    fn lookupScopedConst(self: *const @This(), name: []const u8) ?i64 {
+        var i = self.const_stack.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.const_stack.items[i].get(name)) |val| return val;
+        }
+        return null;
+    }
+
+    /// Walk temp_label_stack top-to-bottom for `name`.  If found, return its
+    /// internal name (resolved or reserved for a forward ref).  If not found
+    /// and we are inside at least one scope, reserve the name in the current
+    /// scope (enabling forward references) and return the freshly-generated
+    /// internal name.  If not found and not inside any scope, return null so
+    /// the caller can produce a targeted error.
+    fn lookupOrReserveTempLabel(self: *@This(), name_tok: Token) ParseError!?[]const u8 {
+        const name = name_tok.text;
+        var i = self.temp_label_stack.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.temp_label_stack.items[i].get(name)) |entry| return entry.internal_name;
+        }
+        if (self.temp_label_stack.items.len == 0) return null;
+        // Reserve in current scope for a forward reference.
+        const internal_name = std.fmt.allocPrint(
+            self.allocator, "__tmp_{d}_{s}", .{ self.temp_label_counter, name },
+        ) catch return ParseError.OutOfMemory;
+        self.temp_label_counter += 1;
+        self.temp_label_strings.append(self.allocator, internal_name) catch {
+            self.allocator.free(internal_name);
+            return ParseError.OutOfMemory;
+        };
+        const key = self.allocator.dupe(u8, name) catch return ParseError.OutOfMemory;
+        const top = &self.temp_label_stack.items[self.temp_label_stack.items.len - 1];
+        top.put(self.allocator, key, .{ .internal_name = internal_name, .defined = false }) catch {
+            self.allocator.free(key);
+            return ParseError.OutOfMemory;
+        };
+        return internal_name;
+    }
+
+    /// Error if `name` already exists in a parent temp-label scope or as a
+    /// global symbol (shadowing is forbidden).  `check_up_to` is the number
+    /// of parent scopes to check (i.e. all scopes with index < check_up_to).
+    fn checkTempLabelShadowing(self: *@This(), name_tok: Token, check_up_to: usize) ParseError!void {
+        const name = name_tok.text;
+        var i: usize = 0;
+        while (i < check_up_to) : (i += 1) {
+            if (self.temp_label_stack.items[i].contains(name)) {
+                std.debug.print("{s}:{}:{}: error: '@{s}' shadows a temp label in an outer '@{{...}}' scope\n",
+                    .{ name_tok.source_file, name_tok.line, name_tok.col, name });
+                self.printSourceContext(name_tok);
+                return ParseError.DuplicateSymbol;
+            }
+        }
+        if (self.sym.getSymbol(name) != null) {
+            std.debug.print("{s}:{}:{}: error: '@{s}' shadows existing symbol '{s}'\n",
+                .{ name_tok.source_file, name_tok.line, name_tok.col, name, name });
+            self.printSourceContext(name_tok);
+            return ParseError.DuplicateSymbol;
+        }
+    }
+
+    /// Declare a temp label from `@name:` syntax.
+    /// If the name was already reserved by a forward reference in this scope,
+    /// reuse the internal name; otherwise generate a fresh one.
+    fn defineTempLabel(self: *@This(), name_tok: Token) ParseError!void {
+        const name = name_tok.text;
+        if (self.temp_label_stack.items.len == 0) {
+            std.debug.print("{s}:{}:{}: error: temp label '@{s}' declared outside of any '@{{...}}' scope\n",
+                .{ name_tok.source_file, name_tok.line, name_tok.col, name });
+            self.printSourceContext(name_tok);
+            return ParseError.UnexpectedToken;
+        }
+        const top_idx = self.temp_label_stack.items.len - 1;
+        const top = &self.temp_label_stack.items[top_idx];
+
+        if (top.getPtr(name)) |entry| {
+            if (entry.defined) {
+                std.debug.print("{s}:{}:{}: error: '@{s}' already declared in this scope\n",
+                    .{ name_tok.source_file, name_tok.line, name_tok.col, name });
+                self.printSourceContext(name_tok);
+                return ParseError.DuplicateSymbol;
+            }
+            // Forward-reserved — check parent scopes for shadowing, then confirm.
+            try self.checkTempLabelShadowing(name_tok, top_idx);
+            entry.defined = true;
+            const instr_idx: u32 = @intCast(self.tbfWriter.instructions.items.len);
+            self.sym.defineLabel(entry.internal_name, instr_idx) catch |e| return switch (e) {
+                sym_mod.SymbolError.DuplicateSymbol => ParseError.DuplicateSymbol,
+                else => ParseError.OutOfMemory,
+            };
+            if (self.emit_debug)
+                self.tbfWriter.addDebugSymbol(instr_idx, entry.internal_name)
+                    catch return ParseError.OutOfMemory;
+            return;
+        }
+
+        // First time seeing this name — shadow-check all parent scopes and globals.
+        try self.checkTempLabelShadowing(name_tok, top_idx);
+
+        const internal_name = std.fmt.allocPrint(
+            self.allocator, "__tmp_{d}_{s}", .{ self.temp_label_counter, name },
+        ) catch return ParseError.OutOfMemory;
+        self.temp_label_counter += 1;
+        self.temp_label_strings.append(self.allocator, internal_name) catch {
+            self.allocator.free(internal_name);
+            return ParseError.OutOfMemory;
+        };
+        const key = self.allocator.dupe(u8, name) catch return ParseError.OutOfMemory;
+        top.put(self.allocator, key, .{ .internal_name = internal_name, .defined = true }) catch {
+            self.allocator.free(key);
+            return ParseError.OutOfMemory;
+        };
+        const instr_idx: u32 = @intCast(self.tbfWriter.instructions.items.len);
+        self.sym.defineLabel(internal_name, instr_idx) catch |e| return switch (e) {
+            sym_mod.SymbolError.DuplicateSymbol => ParseError.DuplicateSymbol,
+            else => ParseError.OutOfMemory,
+        };
+        if (self.emit_debug)
+            self.tbfWriter.addDebugSymbol(instr_idx, internal_name)
+                catch return ParseError.OutOfMemory;
+    }
+
+    /// Parse `@const name : expr;` — caller has already consumed `@` and `const`.
+    fn parseAtConst(self: *@This()) ParseError!void {
+        if (self.const_stack.items.len == 0) {
+            const t = self.peek();
+            std.debug.print("{s}:{}:{}: error: @const used outside of a '@{{' scope\n",
+                .{ t.source_file, t.line, t.col });
+            self.printSourceContext(t);
+            self.skipToEOL();
+            return ParseError.UnexpectedToken;
+        }
+        const name_tok = try self.expectIdent();
+        _ = try self.expect(.Colon);
+        const val = try self.parseConstExpr();
+        _ = self.tryConsume(.Semicolon);
+
+        const top = &self.const_stack.items[self.const_stack.items.len - 1];
+        const key = self.allocator.dupe(u8, name_tok.text) catch return ParseError.OutOfMemory;
+        const gop = top.getOrPut(self.allocator, key) catch {
+            self.allocator.free(key);
+            return ParseError.OutOfMemory;
+        };
+        if (gop.found_existing) self.allocator.free(key);
+        gop.value_ptr.* = val;
     }
 
     fn isLabelDecl(self: *const @This()) bool {
@@ -1345,6 +1920,41 @@ pub const Parser = struct {
             const v = try self.parseBuiltinConst(name_tok);
             return if (negate) -v else v;
         }
+        if (t.kind == .At) {
+            const name_tok = try self.expectIdent();
+            if (self.lookupScopedConst(name_tok.text)) |val| {
+                return if (negate) -val else val;
+            }
+            std.debug.print("{s}:{}:{}: error: '@{s}' is not a scoped constant\n",
+                .{ name_tok.source_file, name_tok.line, name_tok.col, name_tok.text });
+            self.printSourceContext(name_tok);
+            return ParseError.UndefinedSymbol;
+        }
+        if (t.kind == .Identifier) {
+            // EnumName.field — resolve at parse time
+            var full: std.ArrayList(u8) = .empty;
+            defer full.deinit(self.allocator);
+            full.appendSlice(self.allocator, t.text) catch return ParseError.OutOfMemory;
+            while (self.peekRaw().kind == .Dot) {
+                _ = self.advanceRaw();
+                const f = self.advanceRaw();
+                if (f.kind != .Identifier) {
+                    std.debug.print("{s}:{}:{}: error: expected field name after '.'\n",
+                        .{ f.source_file, f.line, f.col });
+                    self.printSourceContext(f);
+                    return ParseError.InvalidOperand;
+                }
+                full.append(self.allocator, '.') catch return ParseError.OutOfMemory;
+                full.appendSlice(self.allocator, f.text) catch return ParseError.OutOfMemory;
+            }
+            if (self.sym.resolveEnumField(full.items)) |ev| {
+                return if (negate) -ev else ev;
+            }
+            std.debug.print("{s}:{}:{}: error: '{s}' is not an enum field\n",
+                .{ t.source_file, t.line, t.col, full.items });
+            self.printSourceContext(t);
+            return ParseError.UndefinedSymbol;
+        }
         if (t.kind != .Integer) {
             std.debug.print("{s}:{}:{}: error: expected integer, got '{s}'\n", .{ t.source_file, t.line, t.col, t.text });
             self.printSourceContext(t);
@@ -1357,7 +1967,17 @@ pub const Parser = struct {
 
     fn peekIsImm(self: *const @This()) bool {
         const k = self.peek().kind;
-        return k == .Integer or k == .Minus or k == .Dollar;
+        if (k == .Integer or k == .Minus or k == .Dollar or k == .At) return true;
+        // EnumName.field — identifier followed by a dot
+        if (k == .Identifier) {
+            var i = self.pos;
+            while (i < self.tokens.len and self.tokens[i].kind == .Newline) i += 1;
+            if (i >= self.tokens.len) return false;
+            i += 1; // skip the identifier token
+            while (i < self.tokens.len and self.tokens[i].kind == .Newline) i += 1;
+            return i < self.tokens.len and self.tokens[i].kind == .Dot;
+        }
+        return false;
     }
 
     /// Consume `(qual)` — e.g. `(byte)` or `(dword)` — if present. Returns true if consumed.
@@ -1676,6 +2296,29 @@ pub const Parser = struct {
                 return ParseError.BranchTooFar;
             }
             return LabelOrImm{ .resolved = @intCast(v) };
+        }
+        if (t.kind == .At) {
+            _ = self.advance(); // consume '@'
+            const name_tok = try self.expectIdent();
+            // Temp label (forward or backward reference within scope).
+            if (try self.lookupOrReserveTempLabel(name_tok)) |internal_name| {
+                const owned = self.allocator.dupe(u8, internal_name) catch return ParseError.OutOfMemory;
+                return LabelOrImm{ .unresolved = owned };
+            }
+            // Scoped constant used as a compile-time branch offset.
+            if (self.lookupScopedConst(name_tok.text)) |val| {
+                if (val < -8192 or val > 8191) {
+                    std.debug.print("{s}:{}:{}: error: '@{s}' value {} out of i14 range [-8192, 8191]\n",
+                        .{ name_tok.source_file, name_tok.line, name_tok.col, name_tok.text, val });
+                    self.printSourceContext(name_tok);
+                    return ParseError.BranchTooFar;
+                }
+                return LabelOrImm{ .resolved = @intCast(val) };
+            }
+            std.debug.print("{s}:{}:{}: error: '@{s}' is not defined in any current scope\n",
+                .{ name_tok.source_file, name_tok.line, name_tok.col, name_tok.text });
+            self.printSourceContext(name_tok);
+            return ParseError.LabelNotFound;
         }
         if (t.kind == .Identifier) {
             _ = self.advance();
