@@ -14,6 +14,12 @@ const InstructionDst2Src2 = instructions.InstructionDst2Src2;
 const InstructionDstSrc2 = instructions.InstructionDstSrc2;
 const InstructionDstSrc3 = instructions.InstructionDstSrc3;
 
+pub const AccessMode = enum { read, write };
+pub const Hooks = struct {
+    onMemoryAccess: ?*const fn (vm: *TESVM, page: u8, offset: u16, mode: AccessMode, value: u16) void,
+    onRegisterModify: ?*const fn (vm: *TESVM, register: u5, oldValue: u16, newValue: u16) void,
+};
+
 pub const RegisterID = enum(u5) {
     R0 = 0,
     R1 = 1,
@@ -309,15 +315,15 @@ pub const TESVM = struct {
         return (high << 16) | low;
     }
 
-    pub fn runCoProcessor(this: *@This()) !void {
-        try this.runImpl(true);
+    pub fn runCoProcessor(this: *@This(), comptime hooks: ?Hooks) !void {
+        try this.runImpl(true, hooks);
     }
 
-    pub fn run(this: *@This()) !void {
-        try this.runImpl(false);
+    pub fn run(this: *@This(), comptime hooks: ?Hooks) !void {
+        try this.runImpl(false, hooks);
     }
 
-    fn runImpl(this: *@This(), comptime isCoPro: bool) !void {
+    fn runImpl(this: *@This(), comptime isCoPro: bool, comptime hooks: ?Hooks) !void {
         const ClockSpeed = 12_510_000;
         const FPS = 30;
         const CyclesPerFrame = ClockSpeed / FPS; // 166,666
@@ -359,7 +365,7 @@ pub const TESVM = struct {
                 if (!yielded_frame) {
                     const preClock = wideRegs[RGCL];
 
-                    const status = this.exec(cyclesToRun, isCoPro) catch |e| {
+                    const status = this.exec(cyclesToRun, isCoPro, hooks) catch |e| {
                         if (e == error.AbruptProgramEOF) {
                             std.debug.print("IP {}/{} instructions\n", .{
                                 this.registers.doubleRegisters()[doubleRegIndex(.IP)],
@@ -522,7 +528,7 @@ pub const TESVM = struct {
         Yield,
     };
 
-    pub fn exec(this: *@This(), totalCycles: u32, comptime isCoProcessor: bool) !Status {
+    pub fn exec(this: *@This(), totalCycles: u32, comptime isCoProcessor: bool, comptime hooks: ?Hooks) !Status {
         @setRuntimeSafety(false);
         @setEvalBranchQuota(12000);
 
@@ -750,8 +756,106 @@ pub const TESVM = struct {
                         op == .sync_write or op == .sync_hwrite or op == .sync_read or op == .sync_hread)
                     {
                         const code = InterruptToID(Interrupt.InvalidInstruction);
-                        this.fireInterrupt(code);
+                        this.fireInterrupt(code, hooks);
                         return .Ok;
+                    }
+                }
+
+                if (comptime hooks) |h| {
+                    switch (comptime op) {
+                        .mov, .mov_c, .mov_hreg => {
+                            const dstReg = @as(InstructionDst, @bitCast(instruction)).dst;
+                            const srcVal: u16 = switch (comptime op) {
+                                .mov => this.registers.registers()[@as(InstructionDstSrc, @bitCast(instruction)).src],
+                                .mov_c => @truncate(@as(InstructionDst, @bitCast(instruction)).payload),
+                                .mov_hreg => @as(u8, @truncate(this.registers.registers()[@as(InstructionDstSrc, @bitCast(instruction)).src])),
+                                else => unreachable,
+                            };
+                            h.onRegisterModify(this, dstReg, this.registers.registers()[dstReg], srcVal);
+                        },
+                        .mov_av, .mov_aev, .mov_hav, .mov_haev, .mov_aevi, .mov_haevi, .mov_aevd, .mov_haevd => {
+                            const psr: u8, const por: u16, const val: u16 = switch (comptime op) {
+                                .mov_av => blk: {
+                                    const decoded: InstructionDstAddrSrc = @bitCast(instruction);
+                                    const psr = 0;
+                                    const por = this.registers.registers()[decoded.dPOR];
+                                    const val = this.registers.registers()[@as(InstructionDstSrc, @bitCast(instruction)).src];
+                                    break :blk .{ psr, por, val };
+                                },
+                                .mov_aev, .mov_aevi, .mov_aevd => blk: {
+                                    const decoded: InstructionDstAddrXSrc = @bitCast(instruction);
+                                    const psr = this.registers.registers()[decoded.dPSR];
+                                    const por = this.registers.registers()[decoded.dPOR];
+                                    const val = this.registers.registers()[decoded.src];
+                                    break :blk .{ psr, por, val };
+                                },
+                                .mov_hav => blk: {
+                                    const decoded: InstructionDstAddrSrc = @bitCast(instruction);
+                                    const psr = 0;
+                                    const por = this.registers.registers()[decoded.dPOR];
+                                    const val = @as(u8, @truncate(this.registers.registers()[decoded.src]));
+                                    break :blk .{ psr, por, @as(u16, val) };
+                                },
+                                .mov_haev, .mov_haevi, .mov_haevd => blk: {
+                                    const decoded: InstructionDstAddrXSrc = @bitCast(instruction);
+                                    const psr = this.registers.registers()[decoded.dPSR];
+                                    const por = this.registers.registers()[decoded.dPOR];
+                                    const val = @as(u8, @truncate(this.registers.registers()[decoded.src]));
+                                    break :blk .{ psr, por, @as(u16, val) };
+                                },
+                                else => unreachable,
+                            };
+
+                            h.onMemoryAccess(this, psr, por, .write, val);
+                        },
+                        .mov_ra, .mov_rae, .mov_hra, .mov_hrae, .mov_raei, .mov_hraei, .mov_raed, .mov_hraed => {
+                            switch (comptime op) {
+                                // Simple (page-0) reads — buffer is always non-null
+                                .mov_ra, .mov_hra => {
+                                    const decoded: InstructionDstSrcAddr = @bitCast(instruction);
+                                    const base: isize = @intCast(this.registers.registers()[decoded.sPOR]);
+                                    const offset: isize = @intCast(decoded.offset);
+                                    const addr = base + offset;
+                                    const sz: isize = if (comptime op == .mov_ra) 2 else 1;
+                                    if (addr >= 0 and addr + sz <= PageSize) {
+                                        const val: u16 = if (comptime op == .mov_ra)
+                                            std.mem.readInt(u16, this.mmu.pages[0].buffer.?[@as(usize, @intCast(addr))..][0..2], .little)
+                                        else
+                                            this.mmu.pages[0].buffer.?[@as(usize, @intCast(addr))];
+                                        h.onMemoryAccess(this, 0, @truncate(@as(u32, @intCast(addr))), .read, val);
+                                        h.onRegisterModify(this, decoded.dst, this.registers.registers()[decoded.dst], val);
+                                    }
+                                },
+                                // Extended (full-word) reads
+                                .mov_rae, .mov_raei, .mov_raed => {
+                                    const decoded: InstructionDstSrcAddrX = @bitCast(instruction);
+                                    const pageID: u8 = @truncate(this.registers.registers()[decoded.sPSR]);
+                                    const base: isize = @intCast(this.registers.registers()[decoded.sPOR]);
+                                    const offset: isize = @intCast(decoded.offset);
+                                    const addr = base + offset;
+                                    if (this.mmu.pages[pageID].buffer != null and addr >= 0 and addr + 2 <= PageSize) {
+                                        const val = std.mem.readInt(u16, this.mmu.pages[pageID].buffer.?[@as(usize, @intCast(addr))..][0..2], .little);
+                                        h.onMemoryAccess(this, pageID, @truncate(@as(u32, @intCast(addr))), .read, val);
+                                        h.onRegisterModify(this, decoded.dst, this.registers.registers()[decoded.dst], val);
+                                    }
+                                },
+                                // Extended (byte) reads
+                                .mov_hrae, .mov_hraei, .mov_hraed => {
+                                    const decoded: InstructionDstSrcAddrX = @bitCast(instruction);
+                                    const pageID: u8 = @truncate(this.registers.registers()[decoded.sPSR]);
+                                    const base: isize = @intCast(this.registers.registers()[decoded.sPOR]);
+                                    const offset: isize = @intCast(decoded.offset);
+                                    const addr = base + offset;
+                                    if (this.mmu.pages[pageID].buffer != null and addr >= 0 and addr + 1 <= PageSize) {
+                                        const val: u16 = this.mmu.pages[pageID].buffer.?[@as(usize, @intCast(addr))];
+                                        h.onMemoryAccess(this, pageID, @truncate(@as(u32, @intCast(addr))), .read, val);
+                                        h.onRegisterModify(this, decoded.dst, this.registers.registers()[decoded.dst], val);
+                                    }
+                                },
+                                else => unreachable,
+                            }
+                        },
+                        else => {},
                     }
                 }
 
@@ -769,7 +873,7 @@ pub const TESVM = struct {
                     else
                         InterruptToID(e);
 
-                    this.fireInterrupt(code);
+                    this.fireInterrupt(code, hooks);
                     // I'm not sure if this should continue or not...
                 };
 
@@ -791,7 +895,7 @@ pub const TESVM = struct {
         }
     }
 
-    fn fireInterrupt(this: *@This(), code: u8) void {
+    fn fireInterrupt(this: *@This(), code: u8, comptime hooks: ?Hooks) void {
         if (comptime @import("builtin").mode == .Debug) {
             const _ip = this.registers.doubleRegisters()[doubleRegIndex(.IP)];
 
@@ -861,11 +965,7 @@ pub const TESVM = struct {
 
         // TODO: fix cycles handling here and have proper timing
         while (!this.nonidxRegisters.flags.halted) {
-            // this.exec(5000, true) catch {
-            //     this.dumpContext();
-            //     @panic("Unrecoverable fault happend in co-processor");
-            // };
-            this.runCoProcessor() catch {
+            this.runCoProcessor(hooks) catch {
                 this.dumpContext();
                 @panic("Unrecoverable fault happened in co-processor");
             };

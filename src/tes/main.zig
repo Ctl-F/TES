@@ -40,6 +40,11 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    var hooks: bool = false;
+    if (std.mem.eql(u8, binaryPath, "--enable-hooks")) {
+        hooks = true;
+    }
+
     const blob = try readFile(init.io, allocator, binaryPath);
     defer allocator.free(blob);
     var binary = try Binary.parseBinary(blob, allocator);
@@ -63,7 +68,14 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    try vm.run();
+    if (!hooks) {
+        try vm.run();
+    } else {
+        try vm.run(.{
+            .onMemoryAccess = TracerExtension.onMemoryAccess,
+            .onRegisterModify = TracerExtension.onRegisterModify,
+        });
+    }
 
     std.debug.print("Exited(0)\n", .{});
 }

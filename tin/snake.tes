@@ -66,10 +66,17 @@ _main: @{
     // initialize hardware
     bn _init_gpu;
     bn _init_io;
+    // bn _draw_gradient;
+    lea r0, r1, _FrameBuffer;
+    mov r2, ${ BOARD_WIDTH * 2 };
+    mov r3, 0b0111100000111111;
+    bn _fillHLine;
 
-    ;bn _draw_gradient;
 @loop:
     yield;
+
+    trap;
+
     mov ra, $MMIO_PAGE_ID;
     mov rb, $MMIO_HEADER_BASE;
     mov rc, (byte)[ra, (MemIOMap.io.closeSignal)rb];
@@ -78,171 +85,37 @@ _main: @{
 _end:
     hlt;
 
-// _draw_gradient: @{
-//     @const start : 10;
-//     @const step : 15;
-//     @const iterations : 8;
 
-//     @bind cursor: r7;
-//     @bind counter: rc;
-//     @bind colorCounter : rd;
-//     @bind tmp : re;
-//     @bind edge : r8;
-//     @bind condition : rf;
-//     @bind bufferStart : r9;
-//     push jr;
-//     push rb, rc;
-//     push re, rf;
-//     push ra, rd;
-//     push r9, r7;
-//     push r8;
 
-//     ; grab the famebuffer pointers
-//     lea ra, rb, _FrameBuffer;
-
-//     ; allocate on the stack room for the row
-//     bump ${ -(BOARD_WIDTH * 2) };
-//     mov bufferStart, sp;
-
-//     xor cursor, cursor;
-//     mov colorCounter, @start;
-//     mov edge, ${ BOARD_WIDTH * 2 };
-
-//     ; this should run 8 times
-// @fillLoop:
-//     mov tmp, @iterations;
-//     setge condition, cursor, tmp;
-//     bnt condition, @endFillLoop;
-
-//     // here we build the color that will be used for the next 8 rows
-//     mov r0, colorCounter;
-//     mov r1, colorCounter;
-//     mov r2, colorCounter;
-//     bn _make_color565;
-
-//     mov tmp, @step;
-//     add colorCounter, tmp;
-
-//     // r0 now holds the color for the row
-//     // we want to write it to the row allocated on the stack
-//     push cursor;
-//     add edge, bufferStart;
-//     mov cursor, bufferStart;
-
-//     // we'll use our tmp as a page0 selector so we can use the auto-incrementing
-//     // instructions
-//     xor tmp, tmp;
-// @fillRow:
-//     movi [tmp, cursor], r0;
-//     setlt condition, cursor, edge;
-//     bnt condition, @fillRow;
-// @endFillRow:
-
-//     sub edge, bufferStart;
-//     pop cursor;
-
-//     // now we memcopy the whole row 8 times to the frame buffer
-//     @repeat(8, i){
-//         mcpy ra, rb, tmp, bufferStart, edge;
-//         add rb, edge;
-//     }
-
-//     inc cursor;
-//     bn @fillLoop;
-// @endFillLoop:
-
-//     bump ${ (BOARD_WIDTH * 2) }
-
-//     pop r8;
-//     pop r9, r7;
-//     pop ra, rd;
-//     pop re, rf;
-//     pop rb, rc;
-//     pop jr;
-//     b jr;
-// }
-
-_draw_gradient: @{
-    @const start : 10;
-    @const step : 15;
-    @const iterations : 8;
-
-    @bind cursor: r7;
-    @bind colorCounter : rd;
-    @bind tmp : re;
-    @bind edge : r8;
-    @bind condition : rf;
-    @bind bufferStart : r9;
-    @bind rowWritePtr : rc;  ; Dedicated pointer for the auto-incrementing write
+// fillHLine(dst_psr: r0, dst_por: r1, len: r2, color: r3) void
+_fillHLine: @{
+    @bind page : r0;
+    @bind start : r1;
+    @bind end : r2; // inputed as length
+    @bind color : r3;
+    @bind cond : rf;
 
     push jr;
-    push rb, rc;
-    push re, rf;
-    push ra, rd;
-    push r9, r7;
-    push r8;
+    push cond;
 
-    ; Grab the framebuffer base pointers (Page 1)
-    lea ra, rb, _FrameBuffer;
+    // convert end from a relative length to an absolute address
+    add end, start;
 
-    ; Safely reserve space on the stack for our temporary row buffer
-    bump ${ -(BOARD_WIDTH * 2) };
-    mov bufferStart, sp;
+    syscall $TRACE, ${STOPWATCH + 0}
 
-    xor cursor, cursor;
-    mov colorCounter, @start;
+@hLoop:
+    movi [page, start], color;
+    setlt cond, start, end;
+    bnt cond, @hLoop;
 
-@fillLoop:
-    mov tmp, @iterations;
-    setge condition, cursor, tmp;
-    bnt condition, @endFillLoop;     ; Branch Near if True (Exit loop when cursor >= 8)
+    syscall $TRACE, ${STOPWATCH + 0}
+    syscall $TRACE, $REPORT
 
-    // Build the RGB565 color for this iteration
-    mov r0, colorCounter;
-    mov r1, colorCounter;
-    mov r2, colorCounter;
-    bn _make_color;
 
-    mov tmp, @step;
-    add colorCounter, tmp;
-
-    // Set up bounds to fill the row scratchpad
-    mov rowWritePtr, bufferStart;    ; Use a dedicated register so we don't mutate cursor
-    mov edge, ${ BOARD_WIDTH * 2 };
-    add edge, bufferStart;          ; edge = end address of our stack row buffer
-    xor tmp, tmp;                   ; Page 0 selector for memory operations
-
-@fillRow:
-    movi [tmp, rowWritePtr], r0;     ; movi auto-increments rowWritePtr by 2
-    setlt condition, rowWritePtr, edge;
-    bnt condition, @fillRow;        ; Keep writing until rowWritePtr >= edge
-@endFillRow:
-
-    ; Get the raw width in bytes for the blit operation
-    mov edge, ${ BOARD_WIDTH * 2 };
-
-    // Blit the completed row 8 times sequentially down into the FrameBuffer
-    @repeat(8, i){
-        mcpy ra, rb, tmp, bufferStart, edge;
-        add rb, edge;               ; Advance the framebuffer pointer by one row width
-    }
-
-    inc cursor;
-    bn @fillLoop;                   ; Unconditional branch back to the top
-@endFillLoop:
-
-    ; Free the temporary row buffer space from the stack
-    bump ${ (BOARD_WIDTH * 2) };
-
-    pop r8;
-    pop r9, r7;
-    pop ra, rd;
-    pop re, rf;
-    pop rb, rc;
+    pop cond;
     pop jr;
     b jr;
 }
-
 
 // make_color(r: reg0, g: reg1, b: reg2) --> reg0
 // takes r, g, b and packs into RGBA5551

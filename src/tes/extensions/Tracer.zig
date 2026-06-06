@@ -7,8 +7,21 @@ pub const ErrorCodes = enum(u8) {
     UnknownEventCode = 0,
 };
 
+const Address = struct {
+    page: u8,
+    offset: u16,
+};
+
+const MemoryTrap = struct {
+    address: Address,
+    mode: tes.AccessMode,
+};
+
+var memoryTraps = std.AutoHashMap(Address, MemoryTrap).init(std.heap.PageAllocator);
+
 pub const EventCodes = enum(u15) {
     Report = 512,
+    RegisterMemoryTrap = 513,
     _,
 };
 
@@ -114,6 +127,30 @@ fn handle(vm: *tes.TESVM, evCode: tes.EventID) tes.EventResult {
             report();
             return .ok;
         },
+        @intFromEnum(EventCodes.RegisterMemoryTrap) => {
+            const page: u8 = @truncate(vm.registers.registers()[
+                @as(usize, @intFromEnum(tes.RegisterID.R0))
+            ]);
+            const offset: u16 = vm.registers.registers()[
+                @as(usize, @intFromEnum(tes.RegisterID.R1))
+            ];
+            const mode: u8 = @truncate(vm.registers.registers()[
+                @as(usize, @intFromEnum(tes.RegisterID.R2))
+            ]);
+            const accessMode: tes.AccessMode = switch (mode) {
+                1 => .read,
+                else => .write,
+            };
+
+            const address = Address{
+                .page = page,
+                .offset = offset,
+            };
+            memoryTraps.put(address, .{
+                .address = address,
+                .mode = accessMode,
+            }) catch unreachable;
+        },
         else => {},
     }
     return .{
@@ -124,3 +161,6 @@ fn handle(vm: *tes.TESVM, evCode: tes.EventID) tes.EventResult {
         },
     };
 }
+
+pub fn onMemoryAccess(vm: *tes.TESVM, page: u8, offset: u16, mode: tes.AccessMode, value: u16) void {}
+pub fn onRegisterModify(vm: *tes.TESVM, register: u5, oldValue: u16, newValue: u16) void {}
