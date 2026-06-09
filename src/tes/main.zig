@@ -3,6 +3,8 @@ const tes_core = @import("tes_core");
 const builtin = @import("builtin");
 const native = @import("native");
 
+const conn = @import("conn");
+
 const SystemExtension = @import("extensions/System.zig");
 const GraphicsExtension = @import("extensions/Graphics.zig");
 const InputExtension = @import("extensions/Input.zig");
@@ -12,6 +14,8 @@ var mainIO: std.Io = undefined;
 
 pub fn main(init: std.process.Init) !void {
     mainIO = init.io;
+
+    const mainLog = conn.log.init(mainIO, "Host");
 
     const sysExt = SystemExtension.extension(true);
     const gfxExt = GraphicsExtension.extension(true);
@@ -24,25 +28,30 @@ pub fn main(init: std.process.Init) !void {
     // ignore the application path argument
     _ = args.next();
 
-    const binaryPath = args.next() orelse {
-        std.debug.print("Expected input binary file\n", .{});
+    var binaryPath = args.next() orelse {
+        mainLog.fatal("Expected input binary file\n", .{});
         return;
     };
 
     if (std.mem.eql(u8, binaryPath, "--emit-headers")) {
         const headerPath = args.next() orelse {
-            std.debug.print("Expected header output path\n", .{});
+            mainLog.fatal("Expected header output path\n", .{});
             return;
         };
 
         try generateHeaders(headerPath);
-        std.debug.print("Headers were generated to: {s}\n", .{headerPath});
+        mainLog.info("Headers were generated to: {s}\n", .{headerPath});
         return;
     }
 
     var hooks: bool = false;
     if (std.mem.eql(u8, binaryPath, "--enable-hooks")) {
         hooks = true;
+
+        binaryPath = args.next() orelse {
+            mainLog.fatal("Expected binary file path after --enable-hooks\n", .{});
+            return;
+        };
     }
 
     const blob = try readFile(init.io, allocator, binaryPath);
@@ -64,21 +73,25 @@ pub fn main(init: std.process.Init) !void {
     {
         var iter = vm.extensions.iterator();
         while (iter.next()) |ext| {
-            std.debug.print("Extension: {s}\n", .{ext.value_ptr.getFriendlyName()});
+            mainLog.info("Extension: {s}\n", .{ext.value_ptr.getFriendlyName()});
         }
     }
 
     if (!hooks) {
-        try vm.run();
+        try vm.run(null);
     } else {
+        mainLog.info("Debug Hooks are enabled\n", .{});
+
         try vm.run(.{
             .onMemoryAccess = TracerExtension.onMemoryAccess,
             .onRegisterModify = TracerExtension.onRegisterModify,
         });
     }
 
-    std.debug.print("Exited(0)\n", .{});
+    mainLog.trace("Exited(0)\n", .{});
 }
+
+// TODO: extension logs
 
 pub fn frameBarrier(vm: *tes_core.vm.TESVM) anyerror!void {
     try InputExtension.IOPoll(vm);

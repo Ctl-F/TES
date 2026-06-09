@@ -17,11 +17,17 @@ const MemoryTrap = struct {
     mode: tes.AccessMode,
 };
 
-var memoryTraps = std.AutoHashMap(Address, MemoryTrap).init(std.heap.PageAllocator);
+const RegisterTrap = struct {
+    regid: u5,
+};
+
+var memoryTraps = std.AutoHashMap(Address, MemoryTrap).init(std.heap.page_allocator);
+var registerTraps = std.AutoHashMap(u5, void).init(std.heap.page_allocator);
 
 pub const EventCodes = enum(u15) {
     Report = 512,
     RegisterMemoryTrap = 513,
+    RegisterRegisterTrap = 514,
     _,
 };
 
@@ -150,6 +156,14 @@ fn handle(vm: *tes.TESVM, evCode: tes.EventID) tes.EventResult {
                 .address = address,
                 .mode = accessMode,
             }) catch unreachable;
+            return .ok;
+        },
+        @intFromEnum(EventCodes.RegisterRegisterTrap) => {
+            const regID: u5 = @truncate(vm.registers.registers()[
+                @as(usize, @intFromEnum(tes.RegisterID.R0))
+            ]);
+            registerTraps.put(regID, void{}) catch unreachable;
+            return .ok;
         },
         else => {},
     }
@@ -162,5 +176,48 @@ fn handle(vm: *tes.TESVM, evCode: tes.EventID) tes.EventResult {
     };
 }
 
-pub fn onMemoryAccess(vm: *tes.TESVM, page: u8, offset: u16, mode: tes.AccessMode, value: u16) void {}
-pub fn onRegisterModify(vm: *tes.TESVM, register: u5, oldValue: u16, newValue: u16) void {}
+fn pause(io: std.Io) void {
+    const stdout = std.Io.File.stdout();
+    var writer = stdout.writer(io, &.{});
+
+    var stdin_buffer: [1024]u8 = undefined;
+    var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);
+    writer.interface.writeAll("Press enter to continue.") catch {};
+    _ = stdin_reader.interface.takeDelimiterExclusive('\n') catch {};
+}
+
+pub fn onMemoryAccess(vm: *tes.TESVM, page: u8, offset: u16, mode: tes.AccessMode, value: u16) void {
+    const address = Address{
+        .page = page,
+        .offset = offset,
+    };
+
+    if (memoryTraps.get(address)) |val| {
+        if (val.mode == .readwrite or val.mode == mode) {
+            reportMemoryAccess(vm, page, offset, mode, value);
+        }
+    }
+}
+pub fn onRegisterModify(vm: *tes.TESVM, register: u5, oldValue: u16, newValue: u16) void {
+    if (registerTraps.contains(register)) {
+        reportRegisterModify(vm, register, oldValue, newValue);
+    }
+}
+
+fn reportMemoryAccess(vm: *tes.TESVM, page: u8, offset: u16, mode: tes.AccessMode, value: u16) void {
+    std.debug.print("Memory Trap at address {}:{}\n  mode: {}\n  value: {}\n\n", .{
+        page, offset,
+        mode, value,
+    });
+    pause(vm.io);
+}
+
+fn reportRegisterModify(vm: *tes.TESVM, register: u5, oldValue: u16, newValue: u16) void {
+    std.debug.print("Register {} modified at IP: {}\n  {} --> {}\n\n", .{
+        @as(tes.RegisterID, @enumFromInt(register)),
+        vm.registers.doubleRegisters()[tes.TESVM.doubleRegIndex(.IP)],
+        oldValue,
+        newValue,
+    });
+    pause(vm.io);
+}

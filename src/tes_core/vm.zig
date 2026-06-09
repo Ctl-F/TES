@@ -1,6 +1,7 @@
 const std = @import("std");
 const instructions = @import("instructions.zig");
 const meta = @import("meta.zig");
+const conn = @import("conn");
 
 pub const OpCode = instructions.InstructionCode;
 pub const Instruction = instructions.Instruction;
@@ -14,7 +15,7 @@ const InstructionDst2Src2 = instructions.InstructionDst2Src2;
 const InstructionDstSrc2 = instructions.InstructionDstSrc2;
 const InstructionDstSrc3 = instructions.InstructionDstSrc3;
 
-pub const AccessMode = enum { read, write };
+pub const AccessMode = enum(u8) { readwrite = 0, read = 1, write = 2 };
 pub const Hooks = struct {
     onMemoryAccess: ?*const fn (vm: *TESVM, page: u8, offset: u16, mode: AccessMode, value: u16) void,
     onRegisterModify: ?*const fn (vm: *TESVM, register: u5, oldValue: u16, newValue: u16) void,
@@ -185,7 +186,7 @@ pub const Extension = struct {
     }
 
     fn crash(this: *@This(), vm: *TESVM, code: EventID, message: ?[]const u8) noreturn {
-        std.debug.print("Extension fired but was not enabled:\n - {s}\n - {}\n\n", .{
+        std.debug.print("Exception has occurred in Driver\n - {s}\n - {}\n\n", .{
             this.getFriendlyName(),
             code,
         });
@@ -204,6 +205,7 @@ pub const TESVM = struct {
     instructionBuffer: []const Instruction,
     allocator: std.mem.Allocator, // realistically should only ever be the page allocator!!!
     io: std.Io,
+    log: conn.log.Log,
 
     frameHook: *const fn (*@This()) anyerror!void,
 
@@ -228,6 +230,7 @@ pub const TESVM = struct {
             .instructionBuffer = &.{Instruction{ .opcode = @intFromEnum(OpCode.hlt), .payload = 0 }},
             .mmu = mmu,
             .io = io,
+            .log = conn.log.init(io, "tes"),
             .frameHook = hook,
             .page0BackBuffer = page0BackBuffer[0..PageSize],
             .allocator = allocator,
@@ -272,12 +275,14 @@ pub const TESVM = struct {
         var pageBuffer: PageBuffer = undefined;
 
         if (!this.mmu.tryGetPage(page, &pageBuffer)) {
-            @panic("Misconfigured IVTable! Page requested does not exist");
+            this.log.fatal("Misconfigured IVTable! Page requested does not exist", .{});
+            @trap();
         }
 
         const tablePtrAddress = @as(usize, @intFromPtr(pageBuffer)) + base;
         if (tablePtrAddress % @sizeOf(u32) != 0) {
-            @panic("IVTable base is not aligned");
+            this.log.fatal("IVTable base is not aligned", .{});
+            @trap();
         }
 
         const tablePtr: [*]align(@alignOf(u32)) u32 = @as([*]align(@alignOf(u32)) u32, @ptrFromInt(tablePtrAddress));
@@ -367,7 +372,7 @@ pub const TESVM = struct {
 
                     const status = this.exec(cyclesToRun, isCoPro, hooks) catch |e| {
                         if (e == error.AbruptProgramEOF) {
-                            std.debug.print("IP {}/{} instructions\n", .{
+                            this.log.err("IP {}/{} instructions\n", .{
                                 this.registers.doubleRegisters()[doubleRegIndex(.IP)],
                                 this.instructionBuffer.len,
                             });
@@ -420,109 +425,6 @@ pub const TESVM = struct {
         }
     }
 
-    // fn runImpl(this: *@This(), comptime isCoPro: bool) !void {
-    //     const ClockSpeed = 5000000; //1_170_000;
-    //     const FPS = 30;
-    //     const CyclesPerFrame = ClockSpeed / FPS;
-    //     const NsPerCycle = std.time.ns_per_s / ClockSpeed;
-    //     const NsPerFrame = std.time.ns_per_s / FPS;
-
-    //     var lastTime = std.Io.Timestamp.now(this.io, .awake);
-    //     var ns_accum: i96 = 0;
-    //     var cyclesInFrame: u32 = 0;
-
-    //     const RFCL = doubleRegIndex(.FCL);
-    //     const RGCL = doubleRegIndex(.GCL);
-
-    //     var frame_cycle_total: u64 = 0;
-    //     var yielded_frame: bool = false;
-
-    //     while (!this.nonidxRegisters.flags.halted) {
-    //         const currentTime = std.Io.Timestamp.now(this.io, .awake);
-    //         const elapsed = lastTime.durationTo(currentTime);
-    //         lastTime = currentTime;
-
-    //         ns_accum += elapsed.nanoseconds;
-
-    //         if (ns_accum > NsPerFrame * 2) {
-    //             ns_accum = NsPerFrame;
-    //         }
-
-    //         if (ns_accum >= NsPerCycle) {
-    //             var cyclesToRun = @as(u32, @intCast(@divFloor(ns_accum, NsPerCycle)));
-    //             ns_accum = @rem(ns_accum, NsPerCycle);
-
-    //             const wideRegs = this.registers.doubleRegisters();
-    //             const preClock = wideRegs[RGCL];
-
-    //             if (cyclesToRun > CyclesPerFrame) {
-    //                 cyclesToRun = CyclesPerFrame;
-    //             }
-
-    //             frame_cycle_total += cyclesToRun;
-
-    //             const status = this.exec(cyclesToRun, isCoPro) catch |e| {
-    //                 if (e == error.AbruptProgramEOF) {
-    //                     std.debug.print("IP {}/{} instructions\n", .{
-    //                         this.registers.doubleRegisters()[doubleRegIndex(.IP)],
-    //                         this.instructionBuffer.len,
-    //                     });
-    //                 }
-    //                 return e;
-    //             };
-
-    //             const postClock = wideRegs[RGCL];
-    //             const consumed = postClock -% preClock;
-
-    //             cyclesInFrame += consumed;
-
-    //             if (status == .Yield) {
-    //                 std.debug.print("Frame Cycles Total (Yielded): {}\n", .{frame_cycle_total});
-    //                 frame_cycle_total = 0;
-    //                 yielded_frame = true;
-
-    //                 lastTime = std.Io.Timestamp.now(this.io, .awake);
-    //                 ns_accum = 0;
-    //                 cyclesInFrame = 0;
-
-    //                 // if (cyclesInFrame < CyclesPerFrame) {
-    //                 //     const remaining = CyclesPerFrame - cyclesInFrame;
-    //                 //     wideRegs[RFCL] += remaining;
-    //                 //     cyclesInFrame = CyclesPerFrame;
-    //                 // }
-    //             }
-
-    //             if (yielded_frame) {
-    //                 while (cyclesInFrame >= CyclesPerFrame) {
-    //                     std.debug.print("Frame Cycles Total: {}\n", .{frame_cycle_total});
-    //                     frame_cycle_total = 0;
-
-    //                     try this.frameHook(this);
-    //                     yielded_frame = false;
-    //                     lastTime = std.Io.Timestamp.now(this.io, .awake);
-    //                     ns_accum = 0;
-
-    //                     cyclesInFrame -= CyclesPerFrame;
-    //                     wideRegs[RFCL] = cyclesInFrame;
-    //                 }
-
-    //                 if (ns_accum >= NsPerCycle) {
-    //                     ns_accum = 0;
-    //                 }
-    //             }
-    //         }
-
-    //         // if (ns_accum < NsPerCycle) {
-    //         //     try std.Thread.yield();
-    //         // }
-    //         if (ns_accum < NsPerCycle) {
-    //             //const duration = std.Io.Duration.fromNanoseconds(NsPerCycle - ns_accum);
-    //             const duration = std.Io.Duration.fromMilliseconds(1);
-    //             _ = try this.io.sleep(duration, .awake);
-    //         }
-    //     }
-    // }
-
     const Status = enum {
         Ok,
         Yield,
@@ -548,7 +450,7 @@ pub const TESVM = struct {
             .resume_skip => {
                 if (comptime !isCoProcessor) {
                     const code = InterruptToID(Interrupt.InvalidInstruction);
-                    this.fireInterrupt(code);
+                    this.fireInterrupt(code, hooks);
                 }
                 this.nonidxRegisters.flags.policy = .resume_skip;
                 this.nonidxRegisters.flags.halted = true;
@@ -771,9 +673,11 @@ pub const TESVM = struct {
                                 .mov_hreg => @as(u8, @truncate(this.registers.registers()[@as(InstructionDstSrc, @bitCast(instruction)).src])),
                                 else => unreachable,
                             };
-                            h.onRegisterModify(this, dstReg, this.registers.registers()[dstReg], srcVal);
+                            if (h.onRegisterModify) |onRegisterModify| {
+                                onRegisterModify(this, dstReg, this.registers.registers()[dstReg], srcVal);
+                            }
                         },
-                        .mov_av, .mov_aev, .mov_hav, .mov_haev, .mov_aevi, .mov_haevi, .mov_aevd, .mov_haevd => {
+                        .mov_av, .mov_aev, .mov_hav, .mov_heav, .mov_aevi, .mov_haevi, .mov_aevd, .mov_haevd => {
                             const psr: u8, const por: u16, const val: u16 = switch (comptime op) {
                                 .mov_av => blk: {
                                     const decoded: InstructionDstAddrSrc = @bitCast(instruction);
@@ -784,29 +688,30 @@ pub const TESVM = struct {
                                 },
                                 .mov_aev, .mov_aevi, .mov_aevd => blk: {
                                     const decoded: InstructionDstAddrXSrc = @bitCast(instruction);
-                                    const psr = this.registers.registers()[decoded.dPSR];
+                                    const psr: u8 = @truncate(this.registers.registers()[decoded.dPSR]);
                                     const por = this.registers.registers()[decoded.dPOR];
                                     const val = this.registers.registers()[decoded.src];
                                     break :blk .{ psr, por, val };
                                 },
                                 .mov_hav => blk: {
                                     const decoded: InstructionDstAddrSrc = @bitCast(instruction);
-                                    const psr = 0;
+                                    const psr: u8 = 0;
                                     const por = this.registers.registers()[decoded.dPOR];
                                     const val = @as(u8, @truncate(this.registers.registers()[decoded.src]));
                                     break :blk .{ psr, por, @as(u16, val) };
                                 },
-                                .mov_haev, .mov_haevi, .mov_haevd => blk: {
+                                .mov_heav, .mov_haevi, .mov_haevd => blk: {
                                     const decoded: InstructionDstAddrXSrc = @bitCast(instruction);
-                                    const psr = this.registers.registers()[decoded.dPSR];
+                                    const psr: u8 = @truncate(this.registers.registers()[decoded.dPSR]);
                                     const por = this.registers.registers()[decoded.dPOR];
                                     const val = @as(u8, @truncate(this.registers.registers()[decoded.src]));
                                     break :blk .{ psr, por, @as(u16, val) };
                                 },
                                 else => unreachable,
                             };
-
-                            h.onMemoryAccess(this, psr, por, .write, val);
+                            if (h.onMemoryAccess) |onMemoryAccess| {
+                                onMemoryAccess(this, psr, por, .write, val);
+                            }
                         },
                         .mov_ra, .mov_rae, .mov_hra, .mov_hrae, .mov_raei, .mov_hraei, .mov_raed, .mov_hraed => {
                             switch (comptime op) {
@@ -822,8 +727,11 @@ pub const TESVM = struct {
                                             std.mem.readInt(u16, this.mmu.pages[0].buffer.?[@as(usize, @intCast(addr))..][0..2], .little)
                                         else
                                             this.mmu.pages[0].buffer.?[@as(usize, @intCast(addr))];
-                                        h.onMemoryAccess(this, 0, @truncate(@as(u32, @intCast(addr))), .read, val);
-                                        h.onRegisterModify(this, decoded.dst, this.registers.registers()[decoded.dst], val);
+
+                                        if (h.onMemoryAccess != null and h.onRegisterModify != null) {
+                                            h.onMemoryAccess.?(this, 0, @truncate(@as(u32, @intCast(addr))), .read, val);
+                                            h.onRegisterModify.?(this, decoded.dst, this.registers.registers()[decoded.dst], val);
+                                        }
                                     }
                                 },
                                 // Extended (full-word) reads
@@ -835,8 +743,11 @@ pub const TESVM = struct {
                                     const addr = base + offset;
                                     if (this.mmu.pages[pageID].buffer != null and addr >= 0 and addr + 2 <= PageSize) {
                                         const val = std.mem.readInt(u16, this.mmu.pages[pageID].buffer.?[@as(usize, @intCast(addr))..][0..2], .little);
-                                        h.onMemoryAccess(this, pageID, @truncate(@as(u32, @intCast(addr))), .read, val);
-                                        h.onRegisterModify(this, decoded.dst, this.registers.registers()[decoded.dst], val);
+
+                                        if (h.onMemoryAccess != null and h.onRegisterModify != null) {
+                                            h.onMemoryAccess.?(this, pageID, @truncate(@as(u32, @intCast(addr))), .read, val);
+                                            h.onRegisterModify.?(this, decoded.dst, this.registers.registers()[decoded.dst], val);
+                                        }
                                     }
                                 },
                                 // Extended (byte) reads
@@ -848,8 +759,11 @@ pub const TESVM = struct {
                                     const addr = base + offset;
                                     if (this.mmu.pages[pageID].buffer != null and addr >= 0 and addr + 1 <= PageSize) {
                                         const val: u16 = this.mmu.pages[pageID].buffer.?[@as(usize, @intCast(addr))];
-                                        h.onMemoryAccess(this, pageID, @truncate(@as(u32, @intCast(addr))), .read, val);
-                                        h.onRegisterModify(this, decoded.dst, this.registers.registers()[decoded.dst], val);
+
+                                        if (h.onMemoryAccess != null and h.onRegisterModify != null) {
+                                            h.onMemoryAccess.?(this, pageID, @truncate(@as(u32, @intCast(addr))), .read, val);
+                                            h.onRegisterModify.?(this, decoded.dst, this.registers.registers()[decoded.dst], val);
+                                        }
                                     }
                                 },
                                 else => unreachable,
@@ -899,7 +813,7 @@ pub const TESVM = struct {
         if (comptime @import("builtin").mode == .Debug) {
             const _ip = this.registers.doubleRegisters()[doubleRegIndex(.IP)];
 
-            std.debug.print("Interrupt {} fired at:\n IP: {}/{}\n Op: {}\n", .{
+            this.log.trace("Interrupt {} fired at:\n IP: {}/{}\n Op: {}\n", .{
                 code,
                 _ip,
                 this.instructionBuffer.len,
@@ -912,7 +826,8 @@ pub const TESVM = struct {
 
         if (handlerAddress == 0) {
             this.dumpContext();
-            @panic("Unhandled interrupt/fault has occurred.");
+            this.log.fatal("Unhandled interrupt/fault has occurred.", .{});
+            @trap();
         }
 
         const mainToCoBoundryCross = !this.nonidxRegisters.flags.isCoProcessor;
@@ -967,7 +882,8 @@ pub const TESVM = struct {
         while (!this.nonidxRegisters.flags.halted) {
             this.runCoProcessor(hooks) catch {
                 this.dumpContext();
-                @panic("Unrecoverable fault happened in co-processor");
+                this.log.fatal("Unrecoverable fault happened in co-processor", .{});
+                @trap();
             };
         }
 
@@ -999,6 +915,83 @@ pub const TESVM = struct {
         }
     }
 
+    // pub fn dumpContext(this: *@This()) void {
+    //     // 1. Compute MMU details succinctly
+    //     var total_pages: usize = 0;
+    //     for (this.mmu.pages) |page| {
+    //         if (page.buffer != null) total_pages += 1;
+    //     }
+
+    //     const ip_idx = doubleRegIndex(.IP);
+    //     const ip_val = this.registers.doubleRegisters()[ip_idx];
+
+    //     // 2. High-level Context Header
+    //     this.log.info("--- Core Context Dump ---", .{});
+    //     this.log.info("MainCore: [{} Pages, {} Bytes]", .{ total_pages, total_pages * PageSize });
+    //     this.log.info("Instruction Count: {} | IP: 0x{X:0>4}", .{ this.instructionBuffer.len, ip_val });
+
+    //     // 3. Conditional Core Topography Ordering
+    //     if (this.nonidxRegisters.flags.isCoProcessor) {
+    //         this.log.trace("[Active Core: Back Buffer]", .{});
+    //         dumpCoreRegisters(this.log, &this.registerBackBuffer, &this.nonidxRegisterBackBuffer);
+
+    //         this.log.trace("[Secondary Core: Main Registers]", .{});
+    //         dumpCoreRegisters(this.log, &this.registers, &this.nonidxRegisters);
+    //     } else {
+    //         this.log.trace("[Active Core: Main Registers]", .{});
+    //         dumpCoreRegisters(this.log, &this.registers, &this.nonidxRegisters);
+
+    //         this.log.trace("[Secondary Core: Back Buffer]", .{});
+    //         dumpCoreRegisters(this.log, &this.registerBackBuffer, &this.nonidxRegisterBackBuffer);
+    //     }
+
+    //     // 4. MMU Page Details
+    //     const mmio = &this.mmu.pages[MMU.MMIOPage];
+    //     const mmio_ptr = if (mmio.buffer) |b| @intFromPtr(b) else 0;
+    //     this.log.info("MMIO Page: 0x{X} | Permissions [R/W/M]: {}/{}/{}", .{
+    //         mmio_ptr,
+    //         mmio.permissions.read,
+    //         mmio.permissions.write,
+    //         mmio.permissions.isMapped,
+    //     });
+
+    //     this.dumpExtensionContext();
+    // }
+
+    // /// Consolidated helper to dump a complete core structural context cleanly
+    // fn dumpCoreRegisters(logger: conn.log.Log, regs: *Registers, nonidx: *NonIndexableRegisters) void {
+    //     const r = regs.registers();
+
+    //     // Print 16 registers cleanly inside balanced groups of 4
+    //     logger.info("  GPR 0-3:  {X:0>4}  {X:0>4}  {X:0>4}  {X:0>4}", .{ r[0], r[1], r[2], r[3] });
+    //     logger.info("  GPR 4-7:  {X:0>4}  {X:0>4}  {X:0>4}  {X:0>4}", .{ r[4], r[5], r[6], r[7] });
+    //     logger.info("  GPR 8-B:  {X:0>4}  {X:0>4}  {X:0>4}  {X:0>4}", .{ r[8], r[9], r[10], r[11] });
+    //     logger.info("  GPR C-F:  {X:0>4}  {X:0>4}  {X:0>4}  {X:0>4}", .{ r[12], r[13], r[14], r[15] });
+
+    //     // Internal timing cycles
+    //     const gcl = regs.doubleRegisters()[doubleRegIndex(.GCL)];
+    //     const fcl = regs.doubleRegisters()[doubleRegIndex(.FCL)];
+    //     logger.info("  Cycles -> Global: {} | Frame: {}", .{ gcl, fcl });
+
+    //     // Stack metrics
+    //     const sh = r[@intFromEnum(RegisterID.SH)];
+    //     const sp = r[@intFromEnum(RegisterID.SP)];
+    //     const sb = r[@intFromEnum(RegisterID.SB)];
+    //     logger.info("  Stack  -> Used/Total: {}/{} bytes [SH: {X:0>4} SP: {X:0>4} SB: {X:0>4}]", .{
+    //         sb - sp, sb - sh, sh, sp, sb,
+    //     });
+
+    //     // Subsystem status flags
+    //     logger.info("  Flags  -> Halt: {} | IRQ: {} | CoProc/Policy: {}, {} | IVT: 0x{X:0>4} | LastSz: {}", .{
+    //         nonidx.flags.halted,
+    //         nonidx.flags.interruptCode,
+    //         nonidx.flags.isCoProcessor,
+    //         nonidx.flags.policy,
+    //         nonidx.interruptVectorTable,
+    //         nonidx.previousInstructionLength,
+    //     });
+    // }
+
     pub fn dumpContext(this: *@This()) void {
         const totalPagesAllocated, const totalMemAllocated = blk: {
             var tpa: usize = 0;
@@ -1017,10 +1010,14 @@ pub const TESVM = struct {
         std.debug.print(
             \\MainCore: [{} Pages, {} Bytes]
             \\Instruction Count: {}
+            \\Instruction Pointer: {}
             \\
         , .{
             totalPagesAllocated,        totalMemAllocated,
             this.instructionBuffer.len,
+            this.registers.doubleRegisters()[
+                doubleRegIndex(.IP)
+            ],
         });
 
         if (this.nonidxRegisters.flags.isCoProcessor) {

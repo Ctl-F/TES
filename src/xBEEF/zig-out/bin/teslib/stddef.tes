@@ -151,9 +151,6 @@ struct MemIOMap {
 #define IO 2
 #define TRACE 3
 
-#define STOPWATCH 256
-#define REPORT 512
-
 ; cat_Sys
 #define SerialWrite 0
 #define SerialPrintf 1
@@ -168,3 +165,36 @@ struct MemIOMap {
 
 #define MMIO_PAGE_ID 255
 #define MMIO_HEADER_BASE 0
+
+; cat_Trace
+#define STOPWATCH 256
+#define REPORT 512
+
+; r0: page to look at
+; r1: offset to look at
+; r2: mode to trigger on
+#define REG_MEMORY_TRAP 513
+
+; r0: registerID to trigger on
+#define REG_REGISTER_TRAP 514
+
+#define MEMMODE_READWRITE 0
+#define MEMMODE_READ 1
+#define MEMMODE_WRITE 2
+
+#define REG_R0 0
+#define REG_R1 1
+#define REG_R2 2
+#define REG_R3 3
+#define REG_R4 4
+#define REG_R5 5
+#define REG_R6 6
+#define REG_R7 7
+#define REG_R8 8
+#define REG_R9 9
+#define REG_RA 10
+#define REG_RB 11
+#define REG_RC 12
+#define REG_RD 13
+#define REG_RE 14
+#define REG_RF 15

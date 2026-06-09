@@ -68,6 +68,10 @@ _main: @{
     bn _init_io;
     // bn _draw_gradient;
     lea r0, r1, _FrameBuffer;
+
+    mov r2, $MEMMODE_WRITE;
+    syscall $TRACE, $REG_MEMORY_TRAP;
+
     mov r2, ${ BOARD_WIDTH * 2 };
     mov r3, 0b0111100000111111;
     bn _fillHLine;

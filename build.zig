@@ -130,10 +130,19 @@ pub fn build(b: *std.Build) void {
 
 /// Helper to create a TES executable (native or web) with the tes_core module
 fn buildTES(b: *std.Build, name: []const u8, glad: ?*std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
+    const conn = b.createModule(.{
+        .root_source_file = b.path("src/conn/conn.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const tes_core = b.createModule(.{
         .root_source_file = b.path("src/tes_core/tes.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "conn", .module = conn },
+        },
     });
 
     const exe = b.addExecutable(.{
@@ -144,7 +153,7 @@ fn buildTES(b: *std.Build, name: []const u8, glad: ?*std.Build.Module, target: s
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "tes_core", .module = tes_core },
-                //.{ .name = "glad", .module = glad },
+                .{ .name = "conn", .module = conn },
             },
         }),
     });
