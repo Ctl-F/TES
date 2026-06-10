@@ -17,9 +17,30 @@ const InstructionDstSrc3 = instructions.InstructionDstSrc3;
 
 pub const AccessMode = enum(u8) { readwrite = 0, read = 1, write = 2 };
 pub const Hooks = struct {
-    onMemoryAccess: ?*const fn (vm: *TESVM, page: u8, offset: u16, mode: AccessMode, value: u16) void,
-    onRegisterModify: ?*const fn (vm: *TESVM, register: u5, oldValue: u16, newValue: u16) void,
+    frameHook: ?*const fn (*TESVM) anyerror!void = null,
+    onMemoryAccess: ?*const fn (vm: *TESVM, page: u8, offset: u16, mode: AccessMode, value: u16) void = null,
+    onRegisterModify: ?*const fn (vm: *TESVM, register: u5, oldValue: u16, newValue: u16) void = null,
+    onInstructionBegin: ?*const fn (vm: *TESVM, opcode: OpCode, ip: u32, fc: u32, gc: u32) void = null,
+    onInstructionEnd: ?*const fn (vm: *TESVM, opcode: OpCode, ip: u32, fc: u32, gc: u32) void = null,
+    onSyscall: ?*const fn (vm: *TESVM, pool: PoolID, event: EventID) void = null,
+    onEnterCoProcessor: ?*const fn (vm: *TESVM) void = null,
+    onExitCoProcessor: ?*const fn (vm: *TESVM) void = null,
+
+    pub inline fn complete(this: @This()) bool {
+        return this.frameHook != null;
+    }
+    pub inline fn hasAnyDebug(this: @This()) bool {
+        return (this.onMemoryAccess != null) or
+            (this.onRegisterModify != null) or
+            (this.onInstructionBegin != null) or
+            (this.onInstructionEnd != null) or
+            (this.onSyscall != null) or
+            (this.onEnterCoProcessor != null) or
+            (this.onExitCoProcessor != null);
+    }
 };
+
+pub const TESVM = tes(.{});
 
 pub const RegisterID = enum(u5) {
     R0 = 0,
@@ -198,936 +219,969 @@ pub const Extension = struct {
     }
 };
 
-pub const TESVM = struct {
-    registers: Registers,
-    nonidxRegisters: NonIndexableRegisters = .{},
-    mmu: MMU,
-    instructionBuffer: []const Instruction,
-    allocator: std.mem.Allocator, // realistically should only ever be the page allocator!!!
-    io: std.Io,
-    log: conn.log.Log,
+pub fn tes(comptime hooks: Hooks) type {
+    const InstructionTable = comptime init: {
+        var table = [_]InstructionInfo{.{ .handler = InvalidHandler, .cycles = 0 }} ** 256;
 
-    frameHook: *const fn (*@This()) anyerror!void,
+        table[@intFromEnum(OpCode.nop)] = .{ .handler = struct {
+            pub inline fn do(_: *TESVM, _: Instruction) Interrupt!void {}
+        }.do, .cycles = 1 };
 
-    registerBackBuffer: Registers = .{},
-    nonidxRegisterBackBuffer: NonIndexableRegisters = .{},
-    page0BackBuffer: PageBuffer,
-    extensions: std.AutoHashMap(PoolID, Extension),
+        // basic mov
+        table[@intFromEnum(OpCode.mov)] = MovFactory(InstructionDstSrc, .full, .none);
+        table[@intFromEnum(OpCode.mov_hreg)] = MovFactory(InstructionDstSrc, .half, .none);
+        table[@intFromEnum(OpCode.mov_c)] = MovFactory(InstructionDst, .full, .none);
 
-    /// Creates the default VM using the page allocator. I know this breaks zig api
-    /// slightly, and I'll provide an actual allocator receiving initializer function also
-    /// but the page allocator really is all that's necessary for this.
-    pub fn defaultWithPageAllocator(io: std.Io, hook: *const fn (*@This()) anyerror!void) !@This() {
-        const allocator = std.heap.page_allocator;
-        var mmu = try MMU.init(allocator);
-        errdefer mmu.deinit();
+        // mov to memory (simple addr)
+        table[@intFromEnum(OpCode.mov_av)] = MovFactory(InstructionDstAddrSrc, .full, .none);
+        table[@intFromEnum(OpCode.mov_ra)] = MovFactory(InstructionDstSrcAddr, .full, .none);
+        table[@intFromEnum(OpCode.mov_aev)] = MovFactory(InstructionDstAddrXSrc, .full, .none);
+        table[@intFromEnum(OpCode.mov_rae)] = MovFactory(InstructionDstSrcAddrX, .full, .none);
 
-        const page0BackBuffer = try mmu.allocatePageSlice();
-        errdefer allocator.free(page0BackBuffer);
+        // mov to memory (full addr)
+        table[@intFromEnum(OpCode.mov_hav)] = MovFactory(InstructionDstAddrSrc, .half, .none);
+        table[@intFromEnum(OpCode.mov_hra)] = MovFactory(InstructionDstSrcAddr, .half, .none);
+        table[@intFromEnum(OpCode.mov_heav)] = MovFactory(InstructionDstAddrXSrc, .half, .none);
+        table[@intFromEnum(OpCode.mov_hrae)] = MovFactory(InstructionDstSrcAddrX, .half, .none);
 
-        return .{
-            .registers = .{},
-            .instructionBuffer = &.{Instruction{ .opcode = @intFromEnum(OpCode.hlt), .payload = 0 }},
-            .mmu = mmu,
-            .io = io,
-            .log = conn.log.init(io, "tes"),
-            .frameHook = hook,
-            .page0BackBuffer = page0BackBuffer[0..PageSize],
-            .allocator = allocator,
-            .extensions = std.AutoHashMap(PoolID, Extension).init(allocator),
-        };
-    }
+        // streaming mov
+        table[@intFromEnum(OpCode.mov_aevi)] = MovFactory(InstructionDstAddrXSrc, .full, .inc);
+        table[@intFromEnum(OpCode.mov_raei)] = MovFactory(InstructionDstSrcAddrX, .full, .inc);
+        table[@intFromEnum(OpCode.mov_haevi)] = MovFactory(InstructionDstAddrXSrc, .half, .inc);
+        table[@intFromEnum(OpCode.mov_hraei)] = MovFactory(InstructionDstSrcAddrX, .half, .inc);
 
-    pub fn deinit(this: *@This()) void {
-        this.mmu.deinit();
-        this.allocator.free(@as([]u8, this.page0BackBuffer[0..PageSize]));
-    }
+        table[@intFromEnum(OpCode.mov_aevd)] = MovFactory(InstructionDstAddrXSrc, .full, .dec);
+        table[@intFromEnum(OpCode.mov_raed)] = MovFactory(InstructionDstSrcAddrX, .full, .dec);
+        table[@intFromEnum(OpCode.mov_haevd)] = MovFactory(InstructionDstAddrXSrc, .half, .dec);
+        table[@intFromEnum(OpCode.mov_hraed)] = MovFactory(InstructionDstSrcAddrX, .half, .dec);
 
-    pub inline fn getPage0(this: *@This()) PageBuffer {
-        if (this.mmu.pages[0].buffer) |buf| {
-            return buf;
-        }
-        unreachable;
-    }
-
-    pub inline fn getPage(this: *@This(), page: u8) ?PageBuffer {
-        return (this.mmu.pages[page].buffer);
-    }
-
-    pub inline fn getPageEntry(this: *@This(), page: u8) PageEntry {
-        return this.mmu.pages[page];
-    }
-
-    pub inline fn getPageMMIO(this: *@This()) PageBuffer {
-        if (this.mmu.pages[MMU.MMIOPage].buffer) |buf| {
-            return buf;
-        }
-        unreachable;
-    }
-
-    //TODO: When user sets table (and stack) address make sure to enforce alignment rules
-
-    inline fn getIVTableSpan(this: *@This()) []u32 {
-        const IVT = this.nonidxRegisters.interruptVectorTable;
-        const page: u8 = @truncate((IVT & 0xFF0000) >> 16);
-        const base: u16 = @truncate(IVT);
-
-        var pageBuffer: PageBuffer = undefined;
-
-        if (!this.mmu.tryGetPage(page, &pageBuffer)) {
-            this.log.fatal("Misconfigured IVTable! Page requested does not exist", .{});
-            @trap();
+        for (@typeInfo(ScalarOp).@"enum".fields) |field| {
+            if (!@hasField(OpCode, field.name)) continue;
+            table[@intFromEnum(@field(OpCode, field.name))] = ScalarFactory(@enumFromInt(field.value));
         }
 
-        const tablePtrAddress = @as(usize, @intFromPtr(pageBuffer)) + base;
-        if (tablePtrAddress % @sizeOf(u32) != 0) {
-            this.log.fatal("IVTable base is not aligned", .{});
-            @trap();
+        for (@typeInfo(VectorOp).@"enum".fields) |field| {
+            if (!@hasField(OpCode, field.name)) continue;
+            table[@intFromEnum(@field(OpCode, field.name))] = VectorFactory(@enumFromInt(field.value));
         }
 
-        const tablePtr: [*]align(@alignOf(u32)) u32 = @as([*]align(@alignOf(u32)) u32, @ptrFromInt(tablePtrAddress));
-        return tablePtr[0..256];
-    }
+        // branching instructions are handled directly in the dispatch (b family, bn family, hlt)
+        table[@intFromEnum(OpCode.b)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+        table[@intFromEnum(OpCode.bt)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+        table[@intFromEnum(OpCode.bf)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+        table[@intFromEnum(OpCode.bn)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+        table[@intFromEnum(OpCode.bnt)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+        table[@intFromEnum(OpCode.bnf)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+        table[@intFromEnum(OpCode.hlt)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+        table[@intFromEnum(OpCode.lea)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+        table[@intFromEnum(OpCode.resume_at)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+        table[@intFromEnum(OpCode.resume_skip)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+        table[@intFromEnum(OpCode.retry)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
 
-    fn initIVTable(this: *@This()) void {
-        this.nonidxRegisters.interruptVectorTable = 0;
+        // stack instructions
+        table[@intFromEnum(OpCode.bump_c)] = StackFactory(.bump_c);
+        table[@intFromEnum(OpCode.bump_r)] = StackFactory(.bump_r);
+        table[@intFromEnum(OpCode.push8)] = StackFactory(.push8);
+        table[@intFromEnum(OpCode.push16)] = StackFactory(.push16);
+        table[@intFromEnum(OpCode.push32)] = StackFactory(.push32);
+        table[@intFromEnum(OpCode.pop8)] = StackFactory(.pop8);
+        table[@intFromEnum(OpCode.pop16)] = StackFactory(.pop16);
+        table[@intFromEnum(OpCode.pop32)] = StackFactory(.pop32);
+        table[@intFromEnum(OpCode.stackset)] = StackFactory(.stackset);
 
-        const pageBuffer = this.getIVTableSpan();
+        table[@intFromEnum(OpCode.select)] = InstructionInfo{ .handler = implSelect, .cycles = 1 };
+        table[@intFromEnum(OpCode.int)] = InstructionInfo{ .handler = implInt, .cycles = 1 };
+        table[@intFromEnum(OpCode.syscall)] = InstructionInfo{ .handler = implSyscall, .cycles = 1 };
+        table[@intFromEnum(OpCode.swap)] = InstructionInfo{ .handler = implSwap, .cycles = 1 };
+        table[@intFromEnum(OpCode.trap)] = InstructionInfo{ .handler = implTrap, .cycles = 1 };
+        table[@intFromEnum(OpCode.ivs)] = InstructionInfo{ .handler = implIVS, .cycles = 1 };
+        table[@intFromEnum(OpCode.bittest)] = InstructionInfo{ .handler = implBittest, .cycles = 1 };
+        table[@intFromEnum(OpCode.mcpy)] = InstructionInfo{ .handler = implMcpy, .cycles = 10 };
+        table[@intFromEnum(OpCode.mset)] = InstructionInfo{ .handler = implMset, .cycles = 10 };
+        table[@intFromEnum(OpCode.mmov)] = InstructionInfo{ .handler = implMmov, .cycles = 12 };
 
-        @memset(pageBuffer[this.nonidxRegisters.interruptVectorTable .. this.nonidxRegisters.interruptVectorTable + IVTableSizeBytes], 0);
-    }
+        //TODO: implement these later
+        table[@intFromEnum(OpCode.yield_frame)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+        table[@intFromEnum(OpCode.sync_mov)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+        table[@intFromEnum(OpCode.sync_read)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+        table[@intFromEnum(OpCode.sync_hread)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+        table[@intFromEnum(OpCode.sync_write)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
+        table[@intFromEnum(OpCode.sync_hwrite)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
 
-    pub inline fn doubleRegIndex(comptime id: RegisterID) u5 {
-        const raw: u5 = @intFromEnum(id);
-        if (raw & 1 != 0) @compileError("Misaligned Register Id points to non-32 bit enabled register being reinterpreted");
-        return raw / 2;
-    }
-
-    inline fn wideRegIndex(id: u5) u5 {
-        if (id & 1 != 0) @panic("Misaligned RegisterID points to non-32 bit register.");
-        return id / 2;
-    }
-
-    pub inline fn tickClock(this: *@This(), cycles: u8) void {
-        this.registers.doubleRegisters()[doubleRegIndex(.FCL)] +%= cycles;
-        this.registers.doubleRegisters()[doubleRegIndex(.GCL)] +%= cycles;
-    }
-
-    pub inline fn mergeRegs(this: *@This(), highReg: u5, lowReg: u5) u32 {
-        const high: u32 = this.registers.registers()[highReg];
-        const low: u32 = this.registers.registers()[lowReg];
-
-        return (high << 16) | low;
-    }
-
-    pub fn runCoProcessor(this: *@This(), comptime hooks: ?Hooks) !void {
-        try this.runImpl(true, hooks);
-    }
-
-    pub fn run(this: *@This(), comptime hooks: ?Hooks) !void {
-        try this.runImpl(false, hooks);
-    }
-
-    fn runImpl(this: *@This(), comptime isCoPro: bool, comptime hooks: ?Hooks) !void {
-        const ClockSpeed = 12_510_000;
-        const FPS = 30;
-        const CyclesPerFrame = ClockSpeed / FPS; // 166,666
-        const NsPerCycle = std.time.ns_per_s / ClockSpeed;
-        const NsPerFrame = std.time.ns_per_s / FPS; // 33.3ms
-
-        var lastTime = std.Io.Timestamp.now(this.io, .awake);
-        var ns_accum: i96 = 0;
-        var cyclesInFrame: u32 = 0;
-
-        const RFCL = doubleRegIndex(.FCL);
-        const RGCL = doubleRegIndex(.GCL);
-
-        var yielded_frame: bool = false;
-
-        while (!this.nonidxRegisters.flags.halted) {
-            const currentTime = std.Io.Timestamp.now(this.io, .awake);
-            const elapsed = lastTime.durationTo(currentTime);
-            lastTime = currentTime;
-
-            ns_accum += elapsed.nanoseconds;
-
-            // Anti-spiral time debt barrier
-            if (ns_accum > NsPerFrame * 2) {
-                ns_accum = NsPerFrame;
-            }
-
-            if (ns_accum >= NsPerCycle) {
-                var cyclesToRun = @as(u32, @intCast(@divFloor(ns_accum, NsPerCycle)));
-                ns_accum = @rem(ns_accum, NsPerCycle);
-
-                const wideRegs = this.registers.doubleRegisters();
-
-                if (cyclesToRun > CyclesPerFrame) {
-                    cyclesToRun = CyclesPerFrame;
-                }
-
-                // --- STRATEGY: ONLY EXECUTE IF GUEST IS NOT WAITING FOR VSYNC ---
-                if (!yielded_frame) {
-                    const preClock = wideRegs[RGCL];
-
-                    const status = this.exec(cyclesToRun, isCoPro, hooks) catch |e| {
-                        if (e == error.AbruptProgramEOF) {
-                            this.log.err("IP {}/{} instructions\n", .{
-                                this.registers.doubleRegisters()[doubleRegIndex(.IP)],
-                                this.instructionBuffer.len,
-                            });
-                        }
-                        return e;
-                    };
-
-                    const postClock = wideRegs[RGCL];
-                    const consumed = postClock -% preClock;
-                    cyclesInFrame += consumed;
-
-                    if (status == .Yield) {
-                        yielded_frame = true;
-
-                        // Pad guest frame cycle limits up to full frame metrics
-                        if (cyclesInFrame < CyclesPerFrame) {
-                            const remaining = CyclesPerFrame - cyclesInFrame;
-                            wideRegs[RFCL] += remaining;
-                            cyclesInFrame = CyclesPerFrame;
-                        }
-                    }
-                } else {
-                    // If the guest has already yielded, it is consuming time slices
-                    // up to the hardware frame boundary limit without running instruction loops
-                    cyclesInFrame += cyclesToRun;
-                }
-
-                // --- MASTER HARDWARE FRAME TRIGGER ---
-                if (cyclesInFrame >= CyclesPerFrame) {
-                    if (yielded_frame) {
-                        // The guest explicitly finished drawing its frame!
-                        // It is now safe to show this complete image to the world.
-                        try this.frameHook(this);
-
-                        yielded_frame = false;
-                        ns_accum = 0; // Sync the real-world clock anchor
-                    }
-
-                    // Always balance the structural metrics
-                    cyclesInFrame -= CyclesPerFrame;
-                    wideRegs[RFCL] = cyclesInFrame;
-                }
-            }
-
-            // Clean OS thread resting
-            if (ns_accum < NsPerCycle) {
-                const duration = std.Io.Duration.fromMilliseconds(1);
-                _ = try this.io.sleep(duration, .awake);
+        // validation
+        var missing: usize = 0;
+        for (@typeInfo(OpCode).@"enum".fields) |field| {
+            if (table[field.value].handler == InvalidHandler) {
+                @compileLog("Instruction " ++ field.name ++ " is missing a handler");
+                missing += 1;
             }
         }
-    }
+        if (missing > 0) {
+            const message = std.fmt.comptimePrint("Missing {}/{} implementations", .{
+                missing,
+                @typeInfo(OpCode).@"enum".fields.len,
+            });
+            @compileLog(message);
+        }
 
-    const Status = enum {
-        Ok,
-        Yield,
+        break :init table;
     };
 
-    pub fn exec(this: *@This(), totalCycles: u32, comptime isCoProcessor: bool, comptime hooks: ?Hooks) !Status {
-        @setRuntimeSafety(false);
-        @setEvalBranchQuota(12000);
-
-        var cycles = totalCycles;
-
-        if (this.registers.registers()[@intFromEnum(RegisterID.IP)] >= this.instructionBuffer.len) {
-            @branchHint(.unlikely);
-            return error.AbruptProgramEOF;
-        }
-
-        var instruction = this.instructionBuffer[this.registers.registers()[@intFromEnum(RegisterID.IP)]];
-        DISPATCH: switch (@as(OpCode, @enumFromInt(instruction.opcode))) {
-            .hlt => {
-                this.nonidxRegisters.flags.halted = true;
-                return .Ok;
-            },
-            .resume_skip => {
-                if (comptime !isCoProcessor) {
-                    const code = InterruptToID(Interrupt.InvalidInstruction);
-                    this.fireInterrupt(code, hooks);
-                }
-                this.nonidxRegisters.flags.policy = .resume_skip;
-                this.nonidxRegisters.flags.halted = true;
-                return .Ok;
-            },
-            .resume_at => {
-                this.nonidxRegisters.flags.policy = .resume_at;
-                this.nonidxRegisters.flags.halted = true;
-                return .Ok;
-            },
-            .retry => {
-                this.nonidxRegisters.flags.policy = .resume_retry;
-                this.nonidxRegisters.flags.halted = true;
-                return .Ok;
-            },
-            .b => {
-                const decoded: InstructionDstSrc = @bitCast(instruction);
-                const doubles = this.registers.doubleRegisters();
-
-                const newIP = this.mergeRegs(decoded.dst, decoded.src);
-                const IP = doubleRegIndex(.IP);
-                const JR = doubleRegIndex(.JR);
-
-                this.nonidxRegisters.previousInstructionLength = 1;
-
-                doubles[IP] += 1;
-                doubles[JR] = doubles[IP];
-                doubles[IP] = newIP;
-
-                this.tickClock(1);
-                cycles -= 1;
-                if (cycles == 0) {
-                    @branchHint(.unlikely);
-                    return .Ok;
-                }
-
-                if (doubles[IP] >= this.instructionBuffer.len) {
-                    @branchHint(.unlikely);
-                    return error.AbruptProgramEOF;
-                }
-
-                instruction = this.instructionBuffer[doubles[IP]];
-                continue :DISPATCH @as(OpCode, @enumFromInt(instruction.opcode));
-            },
-            inline .bt, .bf => |which| {
-                const decoded: InstructionDstSrc2 = @bitCast(instruction);
-                const doubles = this.registers.doubleRegisters();
-
-                const IP = doubleRegIndex(.IP);
-                const JR = doubleRegIndex(.JR);
-
-                this.nonidxRegisters.previousInstructionLength = 1;
-
-                const newIP = this.mergeRegs(decoded.dst, decoded.src0);
-                const condition = if (comptime which == .bt)
-                    this.registers.registers()[decoded.src1] != 0
-                else
-                    this.registers.registers()[decoded.src1] == 0;
-
-                doubles[IP] += 1;
-                if (condition) {
-                    doubles[JR] = doubles[IP];
-                    doubles[IP] = newIP;
-                }
-
-                this.tickClock(1);
-                cycles -= 1;
-                if (cycles == 0) {
-                    @branchHint(.unlikely);
-                    return .Ok;
-                }
-
-                if (doubles[IP] >= this.instructionBuffer.len) {
-                    @branchHint(.unlikely);
-                    return error.AbruptProgramEOF;
-                }
-
-                instruction = this.instructionBuffer[doubles[IP]];
-                continue :DISPATCH @as(OpCode, @enumFromInt(instruction.opcode));
-            },
-            .bn => {
-                const decoded: InstructionDst = @bitCast(instruction);
-                const doubles = this.registers.doubleRegisters();
-
-                const IP = doubleRegIndex(.IP);
-                const JR = doubleRegIndex(.JR);
-
-                this.nonidxRegisters.previousInstructionLength = 1;
-
-                const offset: i14 = @bitCast(@as(u14, @truncate(decoded.payload)));
-
-                const targetIP = @as(i64, @intCast(doubles[IP])) + offset;
-                if (targetIP < 0 or targetIP >= this.instructionBuffer.len) {
-                    @branchHint(.unlikely);
-                    return error.AbruptProgramEOF;
-                }
-
-                doubles[IP] += 1;
-                doubles[JR] = doubles[IP];
-
-                // should be safe since we verified that offset won't push IP out of range
-                // and also that targetIP isn't smaller than zero
-                doubles[IP] = @truncate(@as(u64, @bitCast(targetIP)));
-
-                this.tickClock(1);
-                cycles -= 1;
-                if (cycles == 0) {
-                    @branchHint(.unlikely);
-                    return .Ok;
-                }
-
-                instruction = this.instructionBuffer[doubles[IP]];
-                continue :DISPATCH @as(OpCode, @enumFromInt(instruction.opcode));
-            },
-            inline .bnf, .bnt => |which| {
-                const decoded: InstructionDst = @bitCast(instruction);
-                const doubles = this.registers.doubleRegisters();
-
-                const IP = doubleRegIndex(.IP);
-                const JR = doubleRegIndex(.JR);
-
-                this.nonidxRegisters.previousInstructionLength = 1;
-
-                const offset: i14 = @bitCast(@as(u14, @truncate(decoded.payload)));
-
-                const targetIP = @as(i64, @intCast(doubles[IP])) + offset;
-                if (targetIP < 0 or targetIP >= this.instructionBuffer.len) {
-                    @branchHint(.unlikely);
-                    return error.AbruptProgramEOF;
-                }
-
-                const condition = if (comptime which == .bnt)
-                    this.registers.registers()[decoded.dst] != 0
-                else
-                    this.registers.registers()[decoded.dst] == 0;
-
-                doubles[IP] += 1;
-
-                if (condition) {
-                    doubles[JR] = doubles[IP];
-                    doubles[IP] = @truncate(@as(u64, @bitCast(targetIP)));
-                }
-
-                this.tickClock(1);
-                cycles -= 1;
-                if (cycles == 0) {
-                    @branchHint(.unlikely);
-                    return .Ok;
-                }
-
-                instruction = this.instructionBuffer[doubles[IP]];
-                continue :DISPATCH @as(OpCode, @enumFromInt(instruction.opcode));
-            },
-            .yield_frame => {
-                this.nonidxRegisters.previousInstructionLength = 1;
-                const wideRegisters = this.registers.doubleRegisters();
-                wideRegisters[doubleRegIndex(.IP)] += 1;
-
-                while (cycles > 0) {
-                    const chunk: u8 = if (cycles > 255) 255 else @truncate(cycles);
-                    this.tickClock(chunk);
-                    cycles -= chunk;
-                }
-                return .Yield;
-            },
-            .lea => {
-                // lea [high] [low] | [32bit constant]
-                this.nonidxRegisters.previousInstructionLength = 2;
-
-                const wideRegisters = this.registers.doubleRegisters();
-                const registers = this.registers.registers();
-
-                if (wideRegisters[doubleRegIndex(.IP)] + 1 >= this.instructionBuffer.len) {
-                    @branchHint(.unlikely);
-                    return error.AbruptProgramEOF;
-                }
-
-                const decoded: InstructionDstSrc = @bitCast(instruction);
-                const address: u32 = @bitCast(this.instructionBuffer[wideRegisters[doubleRegIndex(.IP)] + 1]);
-
-                wideRegisters[doubleRegIndex(.IP)] += 2;
-
-                registers[decoded.dst] = @truncate(address >> 16);
-                registers[decoded.src] = @truncate(address);
-
-                const consumed = InstructionTable[@intFromEnum(OpCode.lea)].cycles;
-                this.tickClock(consumed);
-                cycles = if (consumed > cycles) 0 else cycles - consumed;
-
-                if (cycles == 0) {
-                    @branchHint(.unlikely);
-                    return .Ok;
-                }
-                if (wideRegisters[doubleRegIndex(.IP)] >= this.instructionBuffer.len) {
-                    @branchHint(.unlikely);
-                    return error.AbruptProgramEOF;
-                }
-                instruction = this.instructionBuffer[wideRegisters[doubleRegIndex(.IP)]];
-
-                continue :DISPATCH @as(OpCode, @enumFromInt(instruction.opcode));
-            },
-            inline else => |op| {
-                if (comptime !isCoProcessor) {
-                    if (op == .sync_mov or
-                        op == .sync_write or op == .sync_hwrite or op == .sync_read or op == .sync_hread)
-                    {
-                        const code = InterruptToID(Interrupt.InvalidInstruction);
-                        this.fireInterrupt(code, hooks);
-                        return .Ok;
-                    }
-                }
-
-                if (comptime hooks) |h| {
-                    switch (comptime op) {
-                        .mov, .mov_c, .mov_hreg => {
-                            const dstReg = @as(InstructionDst, @bitCast(instruction)).dst;
-                            const srcVal: u16 = switch (comptime op) {
-                                .mov => this.registers.registers()[@as(InstructionDstSrc, @bitCast(instruction)).src],
-                                .mov_c => @truncate(@as(InstructionDst, @bitCast(instruction)).payload),
-                                .mov_hreg => @as(u8, @truncate(this.registers.registers()[@as(InstructionDstSrc, @bitCast(instruction)).src])),
-                                else => unreachable,
-                            };
-                            if (h.onRegisterModify) |onRegisterModify| {
-                                onRegisterModify(this, dstReg, this.registers.registers()[dstReg], srcVal);
-                            }
-                        },
-                        .mov_av, .mov_aev, .mov_hav, .mov_heav, .mov_aevi, .mov_haevi, .mov_aevd, .mov_haevd => {
-                            const psr: u8, const por: u16, const val: u16 = switch (comptime op) {
-                                .mov_av => blk: {
-                                    const decoded: InstructionDstAddrSrc = @bitCast(instruction);
-                                    const psr = 0;
-                                    const por = this.registers.registers()[decoded.dPOR];
-                                    const val = this.registers.registers()[@as(InstructionDstSrc, @bitCast(instruction)).src];
-                                    break :blk .{ psr, por, val };
-                                },
-                                .mov_aev, .mov_aevi, .mov_aevd => blk: {
-                                    const decoded: InstructionDstAddrXSrc = @bitCast(instruction);
-                                    const psr: u8 = @truncate(this.registers.registers()[decoded.dPSR]);
-                                    const por = this.registers.registers()[decoded.dPOR];
-                                    const val = this.registers.registers()[decoded.src];
-                                    break :blk .{ psr, por, val };
-                                },
-                                .mov_hav => blk: {
-                                    const decoded: InstructionDstAddrSrc = @bitCast(instruction);
-                                    const psr: u8 = 0;
-                                    const por = this.registers.registers()[decoded.dPOR];
-                                    const val = @as(u8, @truncate(this.registers.registers()[decoded.src]));
-                                    break :blk .{ psr, por, @as(u16, val) };
-                                },
-                                .mov_heav, .mov_haevi, .mov_haevd => blk: {
-                                    const decoded: InstructionDstAddrXSrc = @bitCast(instruction);
-                                    const psr: u8 = @truncate(this.registers.registers()[decoded.dPSR]);
-                                    const por = this.registers.registers()[decoded.dPOR];
-                                    const val = @as(u8, @truncate(this.registers.registers()[decoded.src]));
-                                    break :blk .{ psr, por, @as(u16, val) };
-                                },
-                                else => unreachable,
-                            };
-                            if (h.onMemoryAccess) |onMemoryAccess| {
-                                onMemoryAccess(this, psr, por, .write, val);
-                            }
-                        },
-                        .mov_ra, .mov_rae, .mov_hra, .mov_hrae, .mov_raei, .mov_hraei, .mov_raed, .mov_hraed => {
-                            switch (comptime op) {
-                                // Simple (page-0) reads — buffer is always non-null
-                                .mov_ra, .mov_hra => {
-                                    const decoded: InstructionDstSrcAddr = @bitCast(instruction);
-                                    const base: isize = @intCast(this.registers.registers()[decoded.sPOR]);
-                                    const offset: isize = @intCast(decoded.offset);
-                                    const addr = base + offset;
-                                    const sz: isize = if (comptime op == .mov_ra) 2 else 1;
-                                    if (addr >= 0 and addr + sz <= PageSize) {
-                                        const val: u16 = if (comptime op == .mov_ra)
-                                            std.mem.readInt(u16, this.mmu.pages[0].buffer.?[@as(usize, @intCast(addr))..][0..2], .little)
-                                        else
-                                            this.mmu.pages[0].buffer.?[@as(usize, @intCast(addr))];
-
-                                        if (h.onMemoryAccess != null and h.onRegisterModify != null) {
-                                            h.onMemoryAccess.?(this, 0, @truncate(@as(u32, @intCast(addr))), .read, val);
-                                            h.onRegisterModify.?(this, decoded.dst, this.registers.registers()[decoded.dst], val);
-                                        }
-                                    }
-                                },
-                                // Extended (full-word) reads
-                                .mov_rae, .mov_raei, .mov_raed => {
-                                    const decoded: InstructionDstSrcAddrX = @bitCast(instruction);
-                                    const pageID: u8 = @truncate(this.registers.registers()[decoded.sPSR]);
-                                    const base: isize = @intCast(this.registers.registers()[decoded.sPOR]);
-                                    const offset: isize = @intCast(decoded.offset);
-                                    const addr = base + offset;
-                                    if (this.mmu.pages[pageID].buffer != null and addr >= 0 and addr + 2 <= PageSize) {
-                                        const val = std.mem.readInt(u16, this.mmu.pages[pageID].buffer.?[@as(usize, @intCast(addr))..][0..2], .little);
-
-                                        if (h.onMemoryAccess != null and h.onRegisterModify != null) {
-                                            h.onMemoryAccess.?(this, pageID, @truncate(@as(u32, @intCast(addr))), .read, val);
-                                            h.onRegisterModify.?(this, decoded.dst, this.registers.registers()[decoded.dst], val);
-                                        }
-                                    }
-                                },
-                                // Extended (byte) reads
-                                .mov_hrae, .mov_hraei, .mov_hraed => {
-                                    const decoded: InstructionDstSrcAddrX = @bitCast(instruction);
-                                    const pageID: u8 = @truncate(this.registers.registers()[decoded.sPSR]);
-                                    const base: isize = @intCast(this.registers.registers()[decoded.sPOR]);
-                                    const offset: isize = @intCast(decoded.offset);
-                                    const addr = base + offset;
-                                    if (this.mmu.pages[pageID].buffer != null and addr >= 0 and addr + 1 <= PageSize) {
-                                        const val: u16 = this.mmu.pages[pageID].buffer.?[@as(usize, @intCast(addr))];
-
-                                        if (h.onMemoryAccess != null and h.onRegisterModify != null) {
-                                            h.onMemoryAccess.?(this, pageID, @truncate(@as(u32, @intCast(addr))), .read, val);
-                                            h.onRegisterModify.?(this, decoded.dst, this.registers.registers()[decoded.dst], val);
-                                        }
-                                    }
-                                },
-                                else => unreachable,
-                            }
-                        },
-                        else => {},
-                    }
-                }
-
-                this.nonidxRegisters.previousInstructionLength = 1;
-
-                const wideRegisters = this.registers.doubleRegisters();
-                const IP = doubleRegIndex(.IP);
-
-                wideRegisters[IP] += 1;
-
-                const consumed = InstructionTable[@intFromEnum(op)].cycles;
-                InstructionTable[@intFromEnum(op)].handler(this, instruction) catch |e| {
-                    const code = if (e == Interrupt.UserInterrupt)
-                        this.nonidxRegisters.flags.interruptCode
-                    else
-                        InterruptToID(e);
-
-                    this.fireInterrupt(code, hooks);
-                    // I'm not sure if this should continue or not...
-                };
-
-                this.tickClock(consumed);
-
-                cycles = if (consumed > cycles) 0 else cycles - consumed;
-                if (cycles == 0) {
-                    @branchHint(.unlikely);
-                    return .Ok;
-                }
-                if (wideRegisters[IP] >= this.instructionBuffer.len) {
-                    @branchHint(.unlikely);
-                    return error.AbruptProgramEOF;
-                }
-                instruction = this.instructionBuffer[wideRegisters[IP]];
-
-                continue :DISPATCH @as(OpCode, @enumFromInt(instruction.opcode));
-            },
-        }
-    }
-
-    fn fireInterrupt(this: *@This(), code: u8, comptime hooks: ?Hooks) void {
-        if (comptime @import("builtin").mode == .Debug) {
-            const _ip = this.registers.doubleRegisters()[doubleRegIndex(.IP)];
-
-            this.log.trace("Interrupt {} fired at:\n IP: {}/{}\n Op: {}\n", .{
-                code,
-                _ip,
-                this.instructionBuffer.len,
-                @as(OpCode, @enumFromInt(this.instructionBuffer[_ip - this.nonidxRegisterBackBuffer.previousInstructionLength].opcode)),
-            });
-        }
-
-        const interruptTable = this.getIVTableSpan();
-        const handlerAddress = interruptTable[code];
-
-        if (handlerAddress == 0) {
-            this.dumpContext();
-            this.log.fatal("Unhandled interrupt/fault has occurred.", .{});
-            @trap();
-        }
-
-        const mainToCoBoundryCross = !this.nonidxRegisters.flags.isCoProcessor;
-
-        const IP = doubleRegIndex(.IP);
-        const JR = doubleRegIndex(.JR);
-
-        const registers = this.registers.registers();
-        const mainCoreRegisters = this.registerBackBuffer.registers();
-        const wideRegisters = this.registers.doubleRegisters();
-        const mainCoreWideRegisters = this.registerBackBuffer.doubleRegisters();
-
-        // swap context to co-processor.
-        // this will swap the registers and page0.
-        // I have decided that pages 1..255 will
-        // remain available as shared resources so that the co-processor is more useful
-        // to the user outside of just error correction.
-        if (mainToCoBoundryCross) {
-            this.swapContext();
-
-            registers[@intFromEnum(RegisterID.GCL)] = mainCoreRegisters[@intFromEnum(RegisterID.GCL)];
-            registers[@intFromEnum(RegisterID.GCH)] = mainCoreRegisters[@intFromEnum(RegisterID.GCH)];
-
-            this.nonidxRegisters.flags.isCoProcessor = true;
-            this.nonidxRegisters.flags.interruptCode = code;
-            this.nonidxRegisters.flags.halted = false;
-
-            // initialize stack
-            const DefaultStackSize = 1024;
-            registers[@intFromEnum(RegisterID.SB)] = DefaultStackSize;
-            registers[@intFromEnum(RegisterID.SP)] = DefaultStackSize;
-            registers[@intFromEnum(RegisterID.SH)] = 0;
-
-            // if we are first crossing the boundry then we want to write IP before JR so that JR points to the same thing as IP
-            // and they can't "return" from the handler to some un-initialized address
-            wideRegisters[IP] = handlerAddress;
-        }
-
-        // call handler, linking JR to the current IP.
-        // this allows for recursive handlers like any other function.
-        wideRegisters[JR] = wideRegisters[IP];
-
-        // this is reduntant if we are crossing the boundry here, but necessary if
-        // we are recursively calling a handler. I honestly think a second write is
-        // cheap enough that it doesn't need a branch + write.
-        // A write here costs what? tens of cycles maybe depending on where the memory
-        // is cached, but given that it's used often in this method it might be in a register at this point
-        // where as a branch might cost roughly the same amount anyway.
-        wideRegisters[IP] = handlerAddress;
-
-        // TODO: fix cycles handling here and have proper timing
-        while (!this.nonidxRegisters.flags.halted) {
-            this.runCoProcessor(hooks) catch {
-                this.dumpContext();
-                this.log.fatal("Unrecoverable fault happened in co-processor", .{});
-                @trap();
+    return extern struct {
+        registers: Registers,
+        nonidxRegisters: NonIndexableRegisters = .{},
+        mmu: MMU,
+        instructionBuffer: []const Instruction,
+        allocator: std.mem.Allocator, // realistically should only ever be the page allocator!!!
+        io: std.Io,
+        log: conn.log.Log,
+
+        registerBackBuffer: Registers = .{},
+        nonidxRegisterBackBuffer: NonIndexableRegisters = .{},
+        page0BackBuffer: PageBuffer,
+        extensions: std.AutoHashMap(PoolID, Extension),
+
+        userData: ?*anyopaque = null,
+
+        /// Creates the default VM using the page allocator. I know this breaks zig api
+        /// slightly, and I'll provide an actual allocator receiving initializer function also
+        /// but the page allocator really is all that's necessary for this.
+        pub fn defaultWithPageAllocator(io: std.Io) !@This() {
+            const allocator = std.heap.page_allocator;
+            var mmu = try MMU.init(allocator);
+            errdefer mmu.deinit();
+
+            const page0BackBuffer = try mmu.allocatePageSlice();
+            errdefer allocator.free(page0BackBuffer);
+
+            return .{
+                .registers = .{},
+                .instructionBuffer = &.{Instruction{ .opcode = @intFromEnum(OpCode.hlt), .payload = 0 }},
+                .mmu = mmu,
+                .io = io,
+                .log = conn.log.init(io, "tes"),
+                .page0BackBuffer = page0BackBuffer[0..PageSize],
+                .allocator = allocator,
+                .extensions = std.AutoHashMap(PoolID, Extension).init(allocator),
             };
         }
 
-        switch (this.nonidxRegisters.flags.policy) {
-            .resume_retry => {
-                // retry the failed instruction, ip has already been incremented before fault occurred so we rewind by 1 instruction.
-                mainCoreWideRegisters[IP] -= this.nonidxRegisterBackBuffer.previousInstructionLength;
-            },
-            .resume_skip => {
-                // skip the failed instruction, no further work needed since IP has already been incremented prior to the fault
-            },
-            .resume_at => {
-                // resume_at method will write the new address to our IP before halting the co-processor. So we need to store our IP to maincore.IP
-                // and store the maincore.IP (instruction after the failed instruction) into the maincore.JR
-
-                mainCoreWideRegisters[JR] = mainCoreWideRegisters[IP];
-                mainCoreWideRegisters[IP] = wideRegisters[IP];
-            },
+        pub fn deinit(this: *@This()) void {
+            this.mmu.deinit();
+            this.allocator.free(@as([]u8, this.page0BackBuffer[0..PageSize]));
         }
 
-        if (mainToCoBoundryCross) {
-            // recore change to global cycle counter
-            mainCoreRegisters[@intFromEnum(RegisterID.GCL)] = registers[@intFromEnum(RegisterID.GCL)];
-            mainCoreRegisters[@intFromEnum(RegisterID.GCH)] = registers[@intFromEnum(RegisterID.GCH)];
-
-            this.nonidxRegisters.flags.isCoProcessor = false;
-
-            this.swapContext();
+        pub inline fn getPage0(this: *@This()) PageBuffer {
+            if (this.mmu.pages[0].buffer) |buf| {
+                return buf;
+            }
+            unreachable;
         }
-    }
 
-    // pub fn dumpContext(this: *@This()) void {
-    //     // 1. Compute MMU details succinctly
-    //     var total_pages: usize = 0;
-    //     for (this.mmu.pages) |page| {
-    //         if (page.buffer != null) total_pages += 1;
-    //     }
+        pub inline fn getPage(this: *@This(), page: u8) ?PageBuffer {
+            return (this.mmu.pages[page].buffer);
+        }
 
-    //     const ip_idx = doubleRegIndex(.IP);
-    //     const ip_val = this.registers.doubleRegisters()[ip_idx];
+        pub inline fn getPageEntry(this: *@This(), page: u8) PageEntry {
+            return this.mmu.pages[page];
+        }
 
-    //     // 2. High-level Context Header
-    //     this.log.info("--- Core Context Dump ---", .{});
-    //     this.log.info("MainCore: [{} Pages, {} Bytes]", .{ total_pages, total_pages * PageSize });
-    //     this.log.info("Instruction Count: {} | IP: 0x{X:0>4}", .{ this.instructionBuffer.len, ip_val });
+        pub inline fn getPageMMIO(this: *@This()) PageBuffer {
+            if (this.mmu.pages[MMU.MMIOPage].buffer) |buf| {
+                return buf;
+            }
+            unreachable;
+        }
 
-    //     // 3. Conditional Core Topography Ordering
-    //     if (this.nonidxRegisters.flags.isCoProcessor) {
-    //         this.log.trace("[Active Core: Back Buffer]", .{});
-    //         dumpCoreRegisters(this.log, &this.registerBackBuffer, &this.nonidxRegisterBackBuffer);
+        //TODO: When user sets table (and stack) address make sure to enforce alignment rules
 
-    //         this.log.trace("[Secondary Core: Main Registers]", .{});
-    //         dumpCoreRegisters(this.log, &this.registers, &this.nonidxRegisters);
-    //     } else {
-    //         this.log.trace("[Active Core: Main Registers]", .{});
-    //         dumpCoreRegisters(this.log, &this.registers, &this.nonidxRegisters);
+        inline fn getIVTableSpan(this: *@This()) []u32 {
+            const IVT = this.nonidxRegisters.interruptVectorTable;
+            const page: u8 = @truncate((IVT & 0xFF0000) >> 16);
+            const base: u16 = @truncate(IVT);
 
-    //         this.log.trace("[Secondary Core: Back Buffer]", .{});
-    //         dumpCoreRegisters(this.log, &this.registerBackBuffer, &this.nonidxRegisterBackBuffer);
-    //     }
+            var pageBuffer: PageBuffer = undefined;
 
-    //     // 4. MMU Page Details
-    //     const mmio = &this.mmu.pages[MMU.MMIOPage];
-    //     const mmio_ptr = if (mmio.buffer) |b| @intFromPtr(b) else 0;
-    //     this.log.info("MMIO Page: 0x{X} | Permissions [R/W/M]: {}/{}/{}", .{
-    //         mmio_ptr,
-    //         mmio.permissions.read,
-    //         mmio.permissions.write,
-    //         mmio.permissions.isMapped,
-    //     });
-
-    //     this.dumpExtensionContext();
-    // }
-
-    // /// Consolidated helper to dump a complete core structural context cleanly
-    // fn dumpCoreRegisters(logger: conn.log.Log, regs: *Registers, nonidx: *NonIndexableRegisters) void {
-    //     const r = regs.registers();
-
-    //     // Print 16 registers cleanly inside balanced groups of 4
-    //     logger.info("  GPR 0-3:  {X:0>4}  {X:0>4}  {X:0>4}  {X:0>4}", .{ r[0], r[1], r[2], r[3] });
-    //     logger.info("  GPR 4-7:  {X:0>4}  {X:0>4}  {X:0>4}  {X:0>4}", .{ r[4], r[5], r[6], r[7] });
-    //     logger.info("  GPR 8-B:  {X:0>4}  {X:0>4}  {X:0>4}  {X:0>4}", .{ r[8], r[9], r[10], r[11] });
-    //     logger.info("  GPR C-F:  {X:0>4}  {X:0>4}  {X:0>4}  {X:0>4}", .{ r[12], r[13], r[14], r[15] });
-
-    //     // Internal timing cycles
-    //     const gcl = regs.doubleRegisters()[doubleRegIndex(.GCL)];
-    //     const fcl = regs.doubleRegisters()[doubleRegIndex(.FCL)];
-    //     logger.info("  Cycles -> Global: {} | Frame: {}", .{ gcl, fcl });
-
-    //     // Stack metrics
-    //     const sh = r[@intFromEnum(RegisterID.SH)];
-    //     const sp = r[@intFromEnum(RegisterID.SP)];
-    //     const sb = r[@intFromEnum(RegisterID.SB)];
-    //     logger.info("  Stack  -> Used/Total: {}/{} bytes [SH: {X:0>4} SP: {X:0>4} SB: {X:0>4}]", .{
-    //         sb - sp, sb - sh, sh, sp, sb,
-    //     });
-
-    //     // Subsystem status flags
-    //     logger.info("  Flags  -> Halt: {} | IRQ: {} | CoProc/Policy: {}, {} | IVT: 0x{X:0>4} | LastSz: {}", .{
-    //         nonidx.flags.halted,
-    //         nonidx.flags.interruptCode,
-    //         nonidx.flags.isCoProcessor,
-    //         nonidx.flags.policy,
-    //         nonidx.interruptVectorTable,
-    //         nonidx.previousInstructionLength,
-    //     });
-    // }
-
-    pub fn dumpContext(this: *@This()) void {
-        const totalPagesAllocated, const totalMemAllocated = blk: {
-            var tpa: usize = 0;
-            var tma: usize = 0;
-
-            for (this.mmu.pages) |page| {
-                if (page.buffer != null) {
-                    tpa += 1;
-                    tma += PageSize;
-                }
+            if (!this.mmu.tryGetPage(page, &pageBuffer)) {
+                this.log.fatal("Misconfigured IVTable! Page requested does not exist", .{});
+                @trap();
             }
 
-            break :blk .{ tpa, tma };
+            const tablePtrAddress = @as(usize, @intFromPtr(pageBuffer)) + base;
+            if (tablePtrAddress % @sizeOf(u32) != 0) {
+                this.log.fatal("IVTable base is not aligned", .{});
+                @trap();
+            }
+
+            const tablePtr: [*]align(@alignOf(u32)) u32 = @as([*]align(@alignOf(u32)) u32, @ptrFromInt(tablePtrAddress));
+            return tablePtr[0..256];
+        }
+
+        fn initIVTable(this: *@This()) void {
+            this.nonidxRegisters.interruptVectorTable = 0;
+
+            const pageBuffer = this.getIVTableSpan();
+
+            @memset(pageBuffer[this.nonidxRegisters.interruptVectorTable .. this.nonidxRegisters.interruptVectorTable + IVTableSizeBytes], 0);
+        }
+
+        pub inline fn doubleRegIndex(comptime id: RegisterID) u5 {
+            const raw: u5 = @intFromEnum(id);
+            if (raw & 1 != 0) @compileError("Misaligned Register Id points to non-32 bit enabled register being reinterpreted");
+            return raw / 2;
+        }
+
+        inline fn wideRegIndex(id: u5) u5 {
+            if (id & 1 != 0) @panic("Misaligned RegisterID points to non-32 bit register.");
+            return id / 2;
+        }
+
+        pub inline fn tickClock(this: *@This(), cycles: u8) void {
+            this.registers.doubleRegisters()[doubleRegIndex(.FCL)] +%= cycles;
+            this.registers.doubleRegisters()[doubleRegIndex(.GCL)] +%= cycles;
+        }
+
+        pub inline fn mergeRegs(this: *@This(), highReg: u5, lowReg: u5) u32 {
+            const high: u32 = this.registers.registers()[highReg];
+            const low: u32 = this.registers.registers()[lowReg];
+
+            return (high << 16) | low;
+        }
+
+        pub fn runCoProcessor(this: *@This()) !void {
+            try this.runImpl(true);
+        }
+
+        pub fn run(this: *@This()) !void {
+            try this.runImpl(false);
+        }
+
+        fn runImpl(this: *@This(), comptime isCoPro: bool) !void {
+            const ClockSpeed = 12_510_000;
+            const FPS = 30;
+            const CyclesPerFrame = ClockSpeed / FPS; // 166,666
+            const NsPerCycle = std.time.ns_per_s / ClockSpeed;
+            const NsPerFrame = std.time.ns_per_s / FPS; // 33.3ms
+
+            var lastTime = std.Io.Timestamp.now(this.io, .awake);
+            var ns_accum: i96 = 0;
+            var cyclesInFrame: u32 = 0;
+
+            const RFCL = doubleRegIndex(.FCL);
+            const RGCL = doubleRegIndex(.GCL);
+
+            var yielded_frame: bool = false;
+
+            while (!this.nonidxRegisters.flags.halted) {
+                const currentTime = std.Io.Timestamp.now(this.io, .awake);
+                const elapsed = lastTime.durationTo(currentTime);
+                lastTime = currentTime;
+
+                ns_accum += elapsed.nanoseconds;
+
+                // Anti-spiral time debt barrier
+                if (ns_accum > NsPerFrame * 2) {
+                    ns_accum = NsPerFrame;
+                }
+
+                if (ns_accum >= NsPerCycle) {
+                    var cyclesToRun = @as(u32, @intCast(@divFloor(ns_accum, NsPerCycle)));
+                    ns_accum = @rem(ns_accum, NsPerCycle);
+
+                    const wideRegs = this.registers.doubleRegisters();
+
+                    if (cyclesToRun > CyclesPerFrame) {
+                        cyclesToRun = CyclesPerFrame;
+                    }
+
+                    // --- STRATEGY: ONLY EXECUTE IF GUEST IS NOT WAITING FOR VSYNC ---
+                    if (!yielded_frame) {
+                        const preClock = wideRegs[RGCL];
+
+                        const status = this.exec(cyclesToRun, isCoPro) catch |e| {
+                            if (e == error.AbruptProgramEOF) {
+                                this.log.err("IP {}/{} instructions\n", .{
+                                    this.registers.doubleRegisters()[doubleRegIndex(.IP)],
+                                    this.instructionBuffer.len,
+                                });
+                            }
+                            return e;
+                        };
+
+                        const postClock = wideRegs[RGCL];
+                        const consumed = postClock -% preClock;
+                        cyclesInFrame += consumed;
+
+                        if (status == .Yield) {
+                            yielded_frame = true;
+
+                            // Pad guest frame cycle limits up to full frame metrics
+                            if (cyclesInFrame < CyclesPerFrame) {
+                                const remaining = CyclesPerFrame - cyclesInFrame;
+                                wideRegs[RFCL] += remaining;
+                                cyclesInFrame = CyclesPerFrame;
+                            }
+                        }
+                    } else {
+                        // If the guest has already yielded, it is consuming time slices
+                        // up to the hardware frame boundary limit without running instruction loops
+                        cyclesInFrame += cyclesToRun;
+                    }
+
+                    // --- MASTER HARDWARE FRAME TRIGGER ---
+                    if (cyclesInFrame >= CyclesPerFrame) {
+                        if (yielded_frame) {
+                            // The guest explicitly finished drawing its frame!
+                            // It is now safe to show this complete image to the world.
+                            if (comptime hooks.frameHook) |fh| {
+                                try fh(this);
+                            }
+
+                            yielded_frame = false;
+                            ns_accum = 0; // Sync the real-world clock anchor
+                        }
+
+                        // Always balance the structural metrics
+                        cyclesInFrame -= CyclesPerFrame;
+                        wideRegs[RFCL] = cyclesInFrame;
+                    }
+                }
+
+                // Clean OS thread resting
+                if (ns_accum < NsPerCycle) {
+                    const duration = std.Io.Duration.fromMilliseconds(1);
+                    _ = try this.io.sleep(duration, .awake);
+                }
+            }
+        }
+
+        const Status = enum {
+            Ok,
+            Yield,
         };
 
-        std.debug.print(
-            \\MainCore: [{} Pages, {} Bytes]
-            \\Instruction Count: {}
-            \\Instruction Pointer: {}
-            \\
-        , .{
-            totalPagesAllocated,        totalMemAllocated,
-            this.instructionBuffer.len,
-            this.registers.doubleRegisters()[
-                doubleRegIndex(.IP)
-            ],
-        });
+        pub fn exec(this: *@This(), totalCycles: u32, comptime isCoProcessor: bool) !Status {
+            @setRuntimeSafety(false);
+            @setEvalBranchQuota(12000);
 
-        if (this.nonidxRegisters.flags.isCoProcessor) {
-            dumpIndexableRegisters(&this.registerBackBuffer);
-            dumpNonIndexableRegisters(&this.nonidxRegisterBackBuffer);
-            std.debug.print("Secondary-Core:\n", .{});
-            dumpIndexableRegisters(&this.registers);
-            dumpNonIndexableRegisters(&this.nonidxRegisters);
-        } else {
-            dumpIndexableRegisters(&this.registers);
-            dumpNonIndexableRegisters(&this.nonidxRegisters);
-            std.debug.print("Secondary-Core:\n", .{});
-            dumpIndexableRegisters(&this.registerBackBuffer);
-            dumpNonIndexableRegisters(&this.nonidxRegisterBackBuffer);
+            var cycles = totalCycles;
+
+            if (this.registers.registers()[@intFromEnum(RegisterID.IP)] >= this.instructionBuffer.len) {
+                @branchHint(.unlikely);
+                return error.AbruptProgramEOF;
+            }
+
+            var instruction = this.instructionBuffer[this.registers.registers()[@intFromEnum(RegisterID.IP)]];
+            DISPATCH: switch (@as(OpCode, @enumFromInt(instruction.opcode))) {
+                .hlt => {
+                    this.nonidxRegisters.flags.halted = true;
+                    return .Ok;
+                },
+                .resume_skip => {
+                    if (comptime !isCoProcessor) {
+                        const code = InterruptToID(Interrupt.InvalidInstruction);
+                        this.fireInterrupt(code, hooks);
+                    }
+                    this.nonidxRegisters.flags.policy = .resume_skip;
+                    this.nonidxRegisters.flags.halted = true;
+                    return .Ok;
+                },
+                .resume_at => {
+                    this.nonidxRegisters.flags.policy = .resume_at;
+                    this.nonidxRegisters.flags.halted = true;
+                    return .Ok;
+                },
+                .retry => {
+                    this.nonidxRegisters.flags.policy = .resume_retry;
+                    this.nonidxRegisters.flags.halted = true;
+                    return .Ok;
+                },
+                .b => {
+                    const decoded: InstructionDstSrc = @bitCast(instruction);
+                    const doubles = this.registers.doubleRegisters();
+
+                    const newIP = this.mergeRegs(decoded.dst, decoded.src);
+                    const IP = doubleRegIndex(.IP);
+                    const JR = doubleRegIndex(.JR);
+
+                    this.nonidxRegisters.previousInstructionLength = 1;
+
+                    doubles[IP] += 1;
+                    doubles[JR] = doubles[IP];
+                    doubles[IP] = newIP;
+
+                    this.tickClock(1);
+                    cycles -= 1;
+                    if (cycles == 0) {
+                        @branchHint(.unlikely);
+                        return .Ok;
+                    }
+
+                    if (doubles[IP] >= this.instructionBuffer.len) {
+                        @branchHint(.unlikely);
+                        return error.AbruptProgramEOF;
+                    }
+
+                    instruction = this.instructionBuffer[doubles[IP]];
+                    continue :DISPATCH @as(OpCode, @enumFromInt(instruction.opcode));
+                },
+                inline .bt, .bf => |which| {
+                    const decoded: InstructionDstSrc2 = @bitCast(instruction);
+                    const doubles = this.registers.doubleRegisters();
+
+                    const IP = doubleRegIndex(.IP);
+                    const JR = doubleRegIndex(.JR);
+
+                    this.nonidxRegisters.previousInstructionLength = 1;
+
+                    const newIP = this.mergeRegs(decoded.dst, decoded.src0);
+                    const condition = if (comptime which == .bt)
+                        this.registers.registers()[decoded.src1] != 0
+                    else
+                        this.registers.registers()[decoded.src1] == 0;
+
+                    doubles[IP] += 1;
+                    if (condition) {
+                        doubles[JR] = doubles[IP];
+                        doubles[IP] = newIP;
+                    }
+
+                    this.tickClock(1);
+                    cycles -= 1;
+                    if (cycles == 0) {
+                        @branchHint(.unlikely);
+                        return .Ok;
+                    }
+
+                    if (doubles[IP] >= this.instructionBuffer.len) {
+                        @branchHint(.unlikely);
+                        return error.AbruptProgramEOF;
+                    }
+
+                    instruction = this.instructionBuffer[doubles[IP]];
+                    continue :DISPATCH @as(OpCode, @enumFromInt(instruction.opcode));
+                },
+                .bn => {
+                    const decoded: InstructionDst = @bitCast(instruction);
+                    const doubles = this.registers.doubleRegisters();
+
+                    const IP = doubleRegIndex(.IP);
+                    const JR = doubleRegIndex(.JR);
+
+                    this.nonidxRegisters.previousInstructionLength = 1;
+
+                    const offset: i14 = @bitCast(@as(u14, @truncate(decoded.payload)));
+
+                    const targetIP = @as(i64, @intCast(doubles[IP])) + offset;
+                    if (targetIP < 0 or targetIP >= this.instructionBuffer.len) {
+                        @branchHint(.unlikely);
+                        return error.AbruptProgramEOF;
+                    }
+
+                    doubles[IP] += 1;
+                    doubles[JR] = doubles[IP];
+
+                    // should be safe since we verified that offset won't push IP out of range
+                    // and also that targetIP isn't smaller than zero
+                    doubles[IP] = @truncate(@as(u64, @bitCast(targetIP)));
+
+                    this.tickClock(1);
+                    cycles -= 1;
+                    if (cycles == 0) {
+                        @branchHint(.unlikely);
+                        return .Ok;
+                    }
+
+                    instruction = this.instructionBuffer[doubles[IP]];
+                    continue :DISPATCH @as(OpCode, @enumFromInt(instruction.opcode));
+                },
+                inline .bnf, .bnt => |which| {
+                    const decoded: InstructionDst = @bitCast(instruction);
+                    const doubles = this.registers.doubleRegisters();
+
+                    const IP = doubleRegIndex(.IP);
+                    const JR = doubleRegIndex(.JR);
+
+                    this.nonidxRegisters.previousInstructionLength = 1;
+
+                    const offset: i14 = @bitCast(@as(u14, @truncate(decoded.payload)));
+
+                    const targetIP = @as(i64, @intCast(doubles[IP])) + offset;
+                    if (targetIP < 0 or targetIP >= this.instructionBuffer.len) {
+                        @branchHint(.unlikely);
+                        return error.AbruptProgramEOF;
+                    }
+
+                    const condition = if (comptime which == .bnt)
+                        this.registers.registers()[decoded.dst] != 0
+                    else
+                        this.registers.registers()[decoded.dst] == 0;
+
+                    doubles[IP] += 1;
+
+                    if (condition) {
+                        doubles[JR] = doubles[IP];
+                        doubles[IP] = @truncate(@as(u64, @bitCast(targetIP)));
+                    }
+
+                    this.tickClock(1);
+                    cycles -= 1;
+                    if (cycles == 0) {
+                        @branchHint(.unlikely);
+                        return .Ok;
+                    }
+
+                    instruction = this.instructionBuffer[doubles[IP]];
+                    continue :DISPATCH @as(OpCode, @enumFromInt(instruction.opcode));
+                },
+                .yield_frame => {
+                    this.nonidxRegisters.previousInstructionLength = 1;
+                    const wideRegisters = this.registers.doubleRegisters();
+                    wideRegisters[doubleRegIndex(.IP)] += 1;
+
+                    while (cycles > 0) {
+                        const chunk: u8 = if (cycles > 255) 255 else @truncate(cycles);
+                        this.tickClock(chunk);
+                        cycles -= chunk;
+                    }
+                    return .Yield;
+                },
+                .lea => {
+                    // lea [high] [low] | [32bit constant]
+                    this.nonidxRegisters.previousInstructionLength = 2;
+
+                    const wideRegisters = this.registers.doubleRegisters();
+                    const registers = this.registers.registers();
+
+                    if (wideRegisters[doubleRegIndex(.IP)] + 1 >= this.instructionBuffer.len) {
+                        @branchHint(.unlikely);
+                        return error.AbruptProgramEOF;
+                    }
+
+                    const decoded: InstructionDstSrc = @bitCast(instruction);
+                    const address: u32 = @bitCast(this.instructionBuffer[wideRegisters[doubleRegIndex(.IP)] + 1]);
+
+                    wideRegisters[doubleRegIndex(.IP)] += 2;
+
+                    registers[decoded.dst] = @truncate(address >> 16);
+                    registers[decoded.src] = @truncate(address);
+
+                    const consumed = InstructionTable[@intFromEnum(OpCode.lea)].cycles;
+                    this.tickClock(consumed);
+                    cycles = if (consumed > cycles) 0 else cycles - consumed;
+
+                    if (cycles == 0) {
+                        @branchHint(.unlikely);
+                        return .Ok;
+                    }
+                    if (wideRegisters[doubleRegIndex(.IP)] >= this.instructionBuffer.len) {
+                        @branchHint(.unlikely);
+                        return error.AbruptProgramEOF;
+                    }
+                    instruction = this.instructionBuffer[wideRegisters[doubleRegIndex(.IP)]];
+
+                    continue :DISPATCH @as(OpCode, @enumFromInt(instruction.opcode));
+                },
+                inline else => |op| {
+                    if (comptime !isCoProcessor) {
+                        if (op == .sync_mov or
+                            op == .sync_write or op == .sync_hwrite or op == .sync_read or op == .sync_hread)
+                        {
+                            const code = InterruptToID(Interrupt.InvalidInstruction);
+                            this.fireInterrupt(code, hooks);
+                            return .Ok;
+                        }
+                    }
+
+                    if (comptime hooks.hasAnyDebug()) {
+                        const h = hooks;
+                        switch (comptime op) {
+                            .mov, .mov_c, .mov_hreg => {
+                                const dstReg = @as(InstructionDst, @bitCast(instruction)).dst;
+                                const srcVal: u16 = switch (comptime op) {
+                                    .mov => this.registers.registers()[@as(InstructionDstSrc, @bitCast(instruction)).src],
+                                    .mov_c => @truncate(@as(InstructionDst, @bitCast(instruction)).payload),
+                                    .mov_hreg => @as(u8, @truncate(this.registers.registers()[@as(InstructionDstSrc, @bitCast(instruction)).src])),
+                                    else => unreachable,
+                                };
+                                if (h.onRegisterModify) |onRegisterModify| {
+                                    onRegisterModify(this, dstReg, this.registers.registers()[dstReg], srcVal);
+                                }
+                            },
+                            .mov_av, .mov_aev, .mov_hav, .mov_heav, .mov_aevi, .mov_haevi, .mov_aevd, .mov_haevd => {
+                                const psr: u8, const por: u16, const val: u16 = switch (comptime op) {
+                                    .mov_av => blk: {
+                                        const decoded: InstructionDstAddrSrc = @bitCast(instruction);
+                                        const psr = 0;
+                                        const por = this.registers.registers()[decoded.dPOR];
+                                        const val = this.registers.registers()[@as(InstructionDstSrc, @bitCast(instruction)).src];
+                                        break :blk .{ psr, por, val };
+                                    },
+                                    .mov_aev, .mov_aevi, .mov_aevd => blk: {
+                                        const decoded: InstructionDstAddrXSrc = @bitCast(instruction);
+                                        const psr: u8 = @truncate(this.registers.registers()[decoded.dPSR]);
+                                        const por = this.registers.registers()[decoded.dPOR];
+                                        const val = this.registers.registers()[decoded.src];
+                                        break :blk .{ psr, por, val };
+                                    },
+                                    .mov_hav => blk: {
+                                        const decoded: InstructionDstAddrSrc = @bitCast(instruction);
+                                        const psr: u8 = 0;
+                                        const por = this.registers.registers()[decoded.dPOR];
+                                        const val = @as(u8, @truncate(this.registers.registers()[decoded.src]));
+                                        break :blk .{ psr, por, @as(u16, val) };
+                                    },
+                                    .mov_heav, .mov_haevi, .mov_haevd => blk: {
+                                        const decoded: InstructionDstAddrXSrc = @bitCast(instruction);
+                                        const psr: u8 = @truncate(this.registers.registers()[decoded.dPSR]);
+                                        const por = this.registers.registers()[decoded.dPOR];
+                                        const val = @as(u8, @truncate(this.registers.registers()[decoded.src]));
+                                        break :blk .{ psr, por, @as(u16, val) };
+                                    },
+                                    else => unreachable,
+                                };
+                                if (h.onMemoryAccess) |onMemoryAccess| {
+                                    onMemoryAccess(this, psr, por, .write, val);
+                                }
+                            },
+                            .mov_ra, .mov_rae, .mov_hra, .mov_hrae, .mov_raei, .mov_hraei, .mov_raed, .mov_hraed => {
+                                switch (comptime op) {
+                                    // Simple (page-0) reads — buffer is always non-null
+                                    .mov_ra, .mov_hra => {
+                                        const decoded: InstructionDstSrcAddr = @bitCast(instruction);
+                                        const base: isize = @intCast(this.registers.registers()[decoded.sPOR]);
+                                        const offset: isize = @intCast(decoded.offset);
+                                        const addr = base + offset;
+                                        const sz: isize = if (comptime op == .mov_ra) 2 else 1;
+                                        if (addr >= 0 and addr + sz <= PageSize) {
+                                            const val: u16 = if (comptime op == .mov_ra)
+                                                std.mem.readInt(u16, this.mmu.pages[0].buffer.?[@as(usize, @intCast(addr))..][0..2], .little)
+                                            else
+                                                this.mmu.pages[0].buffer.?[@as(usize, @intCast(addr))];
+
+                                            if (h.onMemoryAccess != null and h.onRegisterModify != null) {
+                                                h.onMemoryAccess.?(this, 0, @truncate(@as(u32, @intCast(addr))), .read, val);
+                                                h.onRegisterModify.?(this, decoded.dst, this.registers.registers()[decoded.dst], val);
+                                            }
+                                        }
+                                    },
+                                    // Extended (full-word) reads
+                                    .mov_rae, .mov_raei, .mov_raed => {
+                                        const decoded: InstructionDstSrcAddrX = @bitCast(instruction);
+                                        const pageID: u8 = @truncate(this.registers.registers()[decoded.sPSR]);
+                                        const base: isize = @intCast(this.registers.registers()[decoded.sPOR]);
+                                        const offset: isize = @intCast(decoded.offset);
+                                        const addr = base + offset;
+                                        if (this.mmu.pages[pageID].buffer != null and addr >= 0 and addr + 2 <= PageSize) {
+                                            const val = std.mem.readInt(u16, this.mmu.pages[pageID].buffer.?[@as(usize, @intCast(addr))..][0..2], .little);
+
+                                            if (h.onMemoryAccess != null and h.onRegisterModify != null) {
+                                                h.onMemoryAccess.?(this, pageID, @truncate(@as(u32, @intCast(addr))), .read, val);
+                                                h.onRegisterModify.?(this, decoded.dst, this.registers.registers()[decoded.dst], val);
+                                            }
+                                        }
+                                    },
+                                    // Extended (byte) reads
+                                    .mov_hrae, .mov_hraei, .mov_hraed => {
+                                        const decoded: InstructionDstSrcAddrX = @bitCast(instruction);
+                                        const pageID: u8 = @truncate(this.registers.registers()[decoded.sPSR]);
+                                        const base: isize = @intCast(this.registers.registers()[decoded.sPOR]);
+                                        const offset: isize = @intCast(decoded.offset);
+                                        const addr = base + offset;
+                                        if (this.mmu.pages[pageID].buffer != null and addr >= 0 and addr + 1 <= PageSize) {
+                                            const val: u16 = this.mmu.pages[pageID].buffer.?[@as(usize, @intCast(addr))];
+
+                                            if (h.onMemoryAccess != null and h.onRegisterModify != null) {
+                                                h.onMemoryAccess.?(this, pageID, @truncate(@as(u32, @intCast(addr))), .read, val);
+                                                h.onRegisterModify.?(this, decoded.dst, this.registers.registers()[decoded.dst], val);
+                                            }
+                                        }
+                                    },
+                                    else => unreachable,
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+
+                    this.nonidxRegisters.previousInstructionLength = 1;
+
+                    const wideRegisters = this.registers.doubleRegisters();
+                    const IP = doubleRegIndex(.IP);
+
+                    wideRegisters[IP] += 1;
+
+                    const consumed = InstructionTable[@intFromEnum(op)].cycles;
+                    InstructionTable[@intFromEnum(op)].handler(this, instruction) catch |e| {
+                        const code = if (e == Interrupt.UserInterrupt)
+                            this.nonidxRegisters.flags.interruptCode
+                        else
+                            InterruptToID(e);
+
+                        this.fireInterrupt(code, hooks);
+                        // I'm not sure if this should continue or not...
+                    };
+
+                    this.tickClock(consumed);
+
+                    cycles = if (consumed > cycles) 0 else cycles - consumed;
+                    if (cycles == 0) {
+                        @branchHint(.unlikely);
+                        return .Ok;
+                    }
+                    if (wideRegisters[IP] >= this.instructionBuffer.len) {
+                        @branchHint(.unlikely);
+                        return error.AbruptProgramEOF;
+                    }
+                    instruction = this.instructionBuffer[wideRegisters[IP]];
+
+                    continue :DISPATCH @as(OpCode, @enumFromInt(instruction.opcode));
+                },
+            }
         }
 
-        dumpMMIOInfo(&this.mmu.pages[MMU.MMIOPage]);
-        this.dumpExtensionContext();
-    }
+        fn fireInterrupt(this: *@This(), code: u8) void {
+            if (comptime @import("builtin").mode == .Debug) {
+                const _ip = this.registers.doubleRegisters()[doubleRegIndex(.IP)];
 
-    fn dumpIndexableRegisters(regs: *Registers) void {
-        const registers = regs.registers();
-        std.debug.print(
-            \\General Registers:
-            \\ R0: {X:0>4} R1: {X:0>4} R2: {X:0>4} R3: {X:0>4}
-            \\ R4: {X:0>4} R5: {X:0>4} R6: {X:0>4} R7: {X:0>4}
-            \\ R8: {X:0>4} R9: {X:0>4} RA: {X:0>4} RB: {X:0>4}
-            \\ RC: {X:0>4} RD: {X:0>4} RE: {X:0>4} RF: {X:0>4}
-            \\
-            \\Global Cycles Executed: {}
-            \\Frame Cycles Executed: {}
-            \\
-        , .{
-            registers[0],                                 registers[1],                                 registers[2],  registers[3],
-            registers[4],                                 registers[5],                                 registers[6],  registers[7],
-            registers[8],                                 registers[9],                                 registers[10], registers[11],
-            registers[12],                                registers[13],                                registers[14], registers[15],
-            regs.doubleRegisters()[doubleRegIndex(.GCL)], regs.doubleRegisters()[doubleRegIndex(.FCL)],
-        });
+                this.log.trace("Interrupt {} fired at:\n IP: {}/{}\n Op: {}\n", .{
+                    code,
+                    _ip,
+                    this.instructionBuffer.len,
+                    @as(OpCode, @enumFromInt(this.instructionBuffer[_ip - this.nonidxRegisterBackBuffer.previousInstructionLength].opcode)),
+                });
+            }
 
-        const stackUsed = registers[@intFromEnum(RegisterID.SB)] - registers[@intFromEnum(RegisterID.SP)];
-        const stackSize = registers[@intFromEnum(RegisterID.SB)] - registers[@intFromEnum(RegisterID.SH)];
-        std.debug.print(
-            \\ Stack ({} / {} bytes)
-            \\ SH: {X:0>4} SP: {X:0>4} SB: {X:0>4}
-            \\
-        , .{
-            stackUsed,
-            stackSize,
-            registers[@intFromEnum(RegisterID.SH)],
-            registers[@intFromEnum(RegisterID.SP)],
-            registers[@intFromEnum(RegisterID.SB)],
-        });
-    }
+            const interruptTable = this.getIVTableSpan();
+            const handlerAddress = interruptTable[code];
 
-    fn dumpNonIndexableRegisters(registers: *NonIndexableRegisters) void {
-        std.debug.print(
-            \\ Flags:
-            \\   Halt: {}
-            \\   Interrupt-Code: {}
-            \\   CoProcessor, Policy: {}, {}
-            \\ IVT: {x:0>4}
-            \\ Last-Instruction-Size: {}
-            \\
-        , .{
-            registers.flags.halted,
-            registers.flags.interruptCode,
-            registers.flags.isCoProcessor,
-            registers.flags.policy,
-            registers.interruptVectorTable,
-            registers.previousInstructionLength,
-        });
-    }
+            if (handlerAddress == 0) {
+                this.dumpContext();
+                this.log.fatal("Unhandled interrupt/fault has occurred.", .{});
+                @trap();
+            }
 
-    fn dumpMMIOInfo(mmioPage: *PageEntry) void {
-        std.debug.print(
-            \\ MMIO-Page: {any}
-            \\ Permissions[R/W/M]: {}/{}/{}
-            \\
-        , .{
-            if (mmioPage.buffer) |buf| @as(?usize, @intFromPtr(buf)) else null,
-            mmioPage.permissions.read,
-            mmioPage.permissions.write,
-            mmioPage.permissions.isMapped,
-        });
-    }
+            const mainToCoBoundryCross = !this.nonidxRegisters.flags.isCoProcessor;
 
-    fn dumpExtensionContext(this: *@This()) void {
-        var iter = this.extensions.iterator();
+            const IP = doubleRegIndex(.IP);
+            const JR = doubleRegIndex(.JR);
 
-        while (iter.next()) |entry| {
-            entry.value_ptr.crashDump(this);
+            const registers = this.registers.registers();
+            const mainCoreRegisters = this.registerBackBuffer.registers();
+            const wideRegisters = this.registers.doubleRegisters();
+            const mainCoreWideRegisters = this.registerBackBuffer.doubleRegisters();
+
+            // swap context to co-processor.
+            // this will swap the registers and page0.
+            // I have decided that pages 1..255 will
+            // remain available as shared resources so that the co-processor is more useful
+            // to the user outside of just error correction.
+            if (mainToCoBoundryCross) {
+                this.swapContext();
+
+                registers[@intFromEnum(RegisterID.GCL)] = mainCoreRegisters[@intFromEnum(RegisterID.GCL)];
+                registers[@intFromEnum(RegisterID.GCH)] = mainCoreRegisters[@intFromEnum(RegisterID.GCH)];
+
+                this.nonidxRegisters.flags.isCoProcessor = true;
+                this.nonidxRegisters.flags.interruptCode = code;
+                this.nonidxRegisters.flags.halted = false;
+
+                // initialize stack
+                const DefaultStackSize = 1024;
+                registers[@intFromEnum(RegisterID.SB)] = DefaultStackSize;
+                registers[@intFromEnum(RegisterID.SP)] = DefaultStackSize;
+                registers[@intFromEnum(RegisterID.SH)] = 0;
+
+                // if we are first crossing the boundry then we want to write IP before JR so that JR points to the same thing as IP
+                // and they can't "return" from the handler to some un-initialized address
+                wideRegisters[IP] = handlerAddress;
+            }
+
+            // call handler, linking JR to the current IP.
+            // this allows for recursive handlers like any other function.
+            wideRegisters[JR] = wideRegisters[IP];
+
+            // this is reduntant if we are crossing the boundry here, but necessary if
+            // we are recursively calling a handler. I honestly think a second write is
+            // cheap enough that it doesn't need a branch + write.
+            // A write here costs what? tens of cycles maybe depending on where the memory
+            // is cached, but given that it's used often in this method it might be in a register at this point
+            // where as a branch might cost roughly the same amount anyway.
+            wideRegisters[IP] = handlerAddress;
+
+            while (!this.nonidxRegisters.flags.halted) {
+                this.runCoProcessor() catch {
+                    this.dumpContext();
+                    this.log.fatal("Unrecoverable fault happened in co-processor", .{});
+                    @trap();
+                };
+            }
+
+            switch (this.nonidxRegisters.flags.policy) {
+                .resume_retry => {
+                    // retry the failed instruction, ip has already been incremented before fault occurred so we rewind by 1 instruction.
+                    mainCoreWideRegisters[IP] -= this.nonidxRegisterBackBuffer.previousInstructionLength;
+                },
+                .resume_skip => {
+                    // skip the failed instruction, no further work needed since IP has already been incremented prior to the fault
+                },
+                .resume_at => {
+                    // resume_at method will write the new address to our IP before halting the co-processor. So we need to store our IP to maincore.IP
+                    // and store the maincore.IP (instruction after the failed instruction) into the maincore.JR
+
+                    mainCoreWideRegisters[JR] = mainCoreWideRegisters[IP];
+                    mainCoreWideRegisters[IP] = wideRegisters[IP];
+                },
+            }
+
+            if (mainToCoBoundryCross) {
+                // recore change to global cycle counter
+                mainCoreRegisters[@intFromEnum(RegisterID.GCL)] = registers[@intFromEnum(RegisterID.GCL)];
+                mainCoreRegisters[@intFromEnum(RegisterID.GCH)] = registers[@intFromEnum(RegisterID.GCH)];
+
+                this.nonidxRegisters.flags.isCoProcessor = false;
+
+                this.swapContext();
+            }
         }
-    }
 
-    fn swapContext(this: *@This()) void {
-        const bb = this.mmu.pages[0].buffer.?;
-        this.mmu.pages[0].buffer = this.page0BackBuffer;
-        this.page0BackBuffer = bb;
+        pub fn dumpContext(this: *@This()) void {
+            const totalPagesAllocated, const totalMemAllocated = blk: {
+                var tpa: usize = 0;
+                var tma: usize = 0;
 
-        const rr = this.registers;
-        const ri = this.nonidxRegisters;
+                for (this.mmu.pages) |page| {
+                    if (page.buffer != null) {
+                        tpa += 1;
+                        tma += PageSize;
+                    }
+                }
 
-        this.registers = this.registerBackBuffer;
-        this.nonidxRegisters = this.nonidxRegisterBackBuffer;
+                break :blk .{ tpa, tma };
+            };
 
-        this.registerBackBuffer = rr;
-        this.nonidxRegisterBackBuffer = ri;
-    }
-};
+            std.debug.print(
+                \\MainCore: [{} Pages, {} Bytes]
+                \\Instruction Count: {}
+                \\Instruction Pointer: {}
+                \\
+            , .{
+                totalPagesAllocated,        totalMemAllocated,
+                this.instructionBuffer.len,
+                this.registers.doubleRegisters()[
+                    doubleRegIndex(.IP)
+                ],
+            });
+
+            if (this.nonidxRegisters.flags.isCoProcessor) {
+                dumpIndexableRegisters(&this.registerBackBuffer);
+                dumpNonIndexableRegisters(&this.nonidxRegisterBackBuffer);
+                std.debug.print("Secondary-Core:\n", .{});
+                dumpIndexableRegisters(&this.registers);
+                dumpNonIndexableRegisters(&this.nonidxRegisters);
+            } else {
+                dumpIndexableRegisters(&this.registers);
+                dumpNonIndexableRegisters(&this.nonidxRegisters);
+                std.debug.print("Secondary-Core:\n", .{});
+                dumpIndexableRegisters(&this.registerBackBuffer);
+                dumpNonIndexableRegisters(&this.nonidxRegisterBackBuffer);
+            }
+
+            dumpMMIOInfo(&this.mmu.pages[MMU.MMIOPage]);
+            this.dumpExtensionContext();
+        }
+
+        fn dumpIndexableRegisters(regs: *Registers) void {
+            const registers = regs.registers();
+            std.debug.print(
+                \\General Registers:
+                \\ R0: {X:0>4} R1: {X:0>4} R2: {X:0>4} R3: {X:0>4}
+                \\ R4: {X:0>4} R5: {X:0>4} R6: {X:0>4} R7: {X:0>4}
+                \\ R8: {X:0>4} R9: {X:0>4} RA: {X:0>4} RB: {X:0>4}
+                \\ RC: {X:0>4} RD: {X:0>4} RE: {X:0>4} RF: {X:0>4}
+                \\
+                \\Global Cycles Executed: {}
+                \\Frame Cycles Executed: {}
+                \\
+            , .{
+                registers[0],                                 registers[1],                                 registers[2],  registers[3],
+                registers[4],                                 registers[5],                                 registers[6],  registers[7],
+                registers[8],                                 registers[9],                                 registers[10], registers[11],
+                registers[12],                                registers[13],                                registers[14], registers[15],
+                regs.doubleRegisters()[doubleRegIndex(.GCL)], regs.doubleRegisters()[doubleRegIndex(.FCL)],
+            });
+
+            const stackUsed = registers[@intFromEnum(RegisterID.SB)] - registers[@intFromEnum(RegisterID.SP)];
+            const stackSize = registers[@intFromEnum(RegisterID.SB)] - registers[@intFromEnum(RegisterID.SH)];
+            std.debug.print(
+                \\ Stack ({} / {} bytes)
+                \\ SH: {X:0>4} SP: {X:0>4} SB: {X:0>4}
+                \\
+            , .{
+                stackUsed,
+                stackSize,
+                registers[@intFromEnum(RegisterID.SH)],
+                registers[@intFromEnum(RegisterID.SP)],
+                registers[@intFromEnum(RegisterID.SB)],
+            });
+        }
+
+        fn dumpNonIndexableRegisters(registers: *NonIndexableRegisters) void {
+            std.debug.print(
+                \\ Flags:
+                \\   Halt: {}
+                \\   Interrupt-Code: {}
+                \\   CoProcessor, Policy: {}, {}
+                \\ IVT: {x:0>4}
+                \\ Last-Instruction-Size: {}
+                \\
+            , .{
+                registers.flags.halted,
+                registers.flags.interruptCode,
+                registers.flags.isCoProcessor,
+                registers.flags.policy,
+                registers.interruptVectorTable,
+                registers.previousInstructionLength,
+            });
+        }
+
+        fn dumpMMIOInfo(mmioPage: *PageEntry) void {
+            std.debug.print(
+                \\ MMIO-Page: {any}
+                \\ Permissions[R/W/M]: {}/{}/{}
+                \\
+            , .{
+                if (mmioPage.buffer) |buf| @as(?usize, @intFromPtr(buf)) else null,
+                mmioPage.permissions.read,
+                mmioPage.permissions.write,
+                mmioPage.permissions.isMapped,
+            });
+        }
+
+        fn dumpExtensionContext(this: *@This()) void {
+            var iter = this.extensions.iterator();
+
+            while (iter.next()) |entry| {
+                entry.value_ptr.crashDump(this);
+            }
+        }
+
+        fn swapContext(this: *@This()) void {
+            const bb = this.mmu.pages[0].buffer.?;
+            this.mmu.pages[0].buffer = this.page0BackBuffer;
+            this.page0BackBuffer = bb;
+
+            const rr = this.registers;
+            const ri = this.nonidxRegisters;
+
+            this.registers = this.registerBackBuffer;
+            this.nonidxRegisters = this.nonidxRegisterBackBuffer;
+
+            this.registerBackBuffer = rr;
+            this.nonidxRegisterBackBuffer = ri;
+        }
+    };
+}
 
 pub const PagePermissions = packed struct(u8) {
     read: bool,
@@ -1140,7 +1194,7 @@ pub const PagePermissions = packed struct(u8) {
     pub const WriteOnly = @This(){ .read = false, .write = true };
     pub const Unavailable = @This(){ .read = false, .write = false };
 };
-
+// TODO: Finish refactor with hooks
 pub const PageAlign = std.mem.Alignment.fromByteUnits(PageSize);
 pub const PageBuffer = *align(PageAlign.toByteUnits()) [PageSize]u8;
 pub const AlignedPageSlice = []align(PageAlign.toByteUnits()) u8;
@@ -2313,113 +2367,6 @@ fn StackFactory(comptime op: StackOp) InstructionInfo {
         };
     }
 }
-
-const InstructionTable = init: {
-    var table = [_]InstructionInfo{.{ .handler = InvalidHandler, .cycles = 0 }} ** 256;
-
-    table[@intFromEnum(OpCode.nop)] = .{ .handler = struct {
-        pub inline fn do(_: *TESVM, _: Instruction) Interrupt!void {}
-    }.do, .cycles = 1 };
-
-    // basic mov
-    table[@intFromEnum(OpCode.mov)] = MovFactory(InstructionDstSrc, .full, .none);
-    table[@intFromEnum(OpCode.mov_hreg)] = MovFactory(InstructionDstSrc, .half, .none);
-    table[@intFromEnum(OpCode.mov_c)] = MovFactory(InstructionDst, .full, .none);
-
-    // mov to memory (simple addr)
-    table[@intFromEnum(OpCode.mov_av)] = MovFactory(InstructionDstAddrSrc, .full, .none);
-    table[@intFromEnum(OpCode.mov_ra)] = MovFactory(InstructionDstSrcAddr, .full, .none);
-    table[@intFromEnum(OpCode.mov_aev)] = MovFactory(InstructionDstAddrXSrc, .full, .none);
-    table[@intFromEnum(OpCode.mov_rae)] = MovFactory(InstructionDstSrcAddrX, .full, .none);
-
-    // mov to memory (full addr)
-    table[@intFromEnum(OpCode.mov_hav)] = MovFactory(InstructionDstAddrSrc, .half, .none);
-    table[@intFromEnum(OpCode.mov_hra)] = MovFactory(InstructionDstSrcAddr, .half, .none);
-    table[@intFromEnum(OpCode.mov_heav)] = MovFactory(InstructionDstAddrXSrc, .half, .none);
-    table[@intFromEnum(OpCode.mov_hrae)] = MovFactory(InstructionDstSrcAddrX, .half, .none);
-
-    // streaming mov
-    table[@intFromEnum(OpCode.mov_aevi)] = MovFactory(InstructionDstAddrXSrc, .full, .inc);
-    table[@intFromEnum(OpCode.mov_raei)] = MovFactory(InstructionDstSrcAddrX, .full, .inc);
-    table[@intFromEnum(OpCode.mov_haevi)] = MovFactory(InstructionDstAddrXSrc, .half, .inc);
-    table[@intFromEnum(OpCode.mov_hraei)] = MovFactory(InstructionDstSrcAddrX, .half, .inc);
-
-    table[@intFromEnum(OpCode.mov_aevd)] = MovFactory(InstructionDstAddrXSrc, .full, .dec);
-    table[@intFromEnum(OpCode.mov_raed)] = MovFactory(InstructionDstSrcAddrX, .full, .dec);
-    table[@intFromEnum(OpCode.mov_haevd)] = MovFactory(InstructionDstAddrXSrc, .half, .dec);
-    table[@intFromEnum(OpCode.mov_hraed)] = MovFactory(InstructionDstSrcAddrX, .half, .dec);
-
-    for (@typeInfo(ScalarOp).@"enum".fields) |field| {
-        if (!@hasField(OpCode, field.name)) continue;
-        table[@intFromEnum(@field(OpCode, field.name))] = ScalarFactory(@enumFromInt(field.value));
-    }
-
-    for (@typeInfo(VectorOp).@"enum".fields) |field| {
-        if (!@hasField(OpCode, field.name)) continue;
-        table[@intFromEnum(@field(OpCode, field.name))] = VectorFactory(@enumFromInt(field.value));
-    }
-
-    // branching instructions are handled directly in the dispatch (b family, bn family, hlt)
-    table[@intFromEnum(OpCode.b)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
-    table[@intFromEnum(OpCode.bt)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
-    table[@intFromEnum(OpCode.bf)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
-    table[@intFromEnum(OpCode.bn)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
-    table[@intFromEnum(OpCode.bnt)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
-    table[@intFromEnum(OpCode.bnf)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
-    table[@intFromEnum(OpCode.hlt)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
-    table[@intFromEnum(OpCode.lea)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
-    table[@intFromEnum(OpCode.resume_at)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
-    table[@intFromEnum(OpCode.resume_skip)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
-    table[@intFromEnum(OpCode.retry)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
-
-    // stack instructions
-    table[@intFromEnum(OpCode.bump_c)] = StackFactory(.bump_c);
-    table[@intFromEnum(OpCode.bump_r)] = StackFactory(.bump_r);
-    table[@intFromEnum(OpCode.push8)] = StackFactory(.push8);
-    table[@intFromEnum(OpCode.push16)] = StackFactory(.push16);
-    table[@intFromEnum(OpCode.push32)] = StackFactory(.push32);
-    table[@intFromEnum(OpCode.pop8)] = StackFactory(.pop8);
-    table[@intFromEnum(OpCode.pop16)] = StackFactory(.pop16);
-    table[@intFromEnum(OpCode.pop32)] = StackFactory(.pop32);
-    table[@intFromEnum(OpCode.stackset)] = StackFactory(.stackset);
-
-    table[@intFromEnum(OpCode.select)] = InstructionInfo{ .handler = implSelect, .cycles = 1 };
-    table[@intFromEnum(OpCode.int)] = InstructionInfo{ .handler = implInt, .cycles = 1 };
-    table[@intFromEnum(OpCode.syscall)] = InstructionInfo{ .handler = implSyscall, .cycles = 1 };
-    table[@intFromEnum(OpCode.swap)] = InstructionInfo{ .handler = implSwap, .cycles = 1 };
-    table[@intFromEnum(OpCode.trap)] = InstructionInfo{ .handler = implTrap, .cycles = 1 };
-    table[@intFromEnum(OpCode.ivs)] = InstructionInfo{ .handler = implIVS, .cycles = 1 };
-    table[@intFromEnum(OpCode.bittest)] = InstructionInfo{ .handler = implBittest, .cycles = 1 };
-    table[@intFromEnum(OpCode.mcpy)] = InstructionInfo{ .handler = implMcpy, .cycles = 10 };
-    table[@intFromEnum(OpCode.mset)] = InstructionInfo{ .handler = implMset, .cycles = 10 };
-    table[@intFromEnum(OpCode.mmov)] = InstructionInfo{ .handler = implMmov, .cycles = 12 };
-
-    //TODO: implement these later
-    table[@intFromEnum(OpCode.yield_frame)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
-    table[@intFromEnum(OpCode.sync_mov)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
-    table[@intFromEnum(OpCode.sync_read)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
-    table[@intFromEnum(OpCode.sync_hread)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
-    table[@intFromEnum(OpCode.sync_write)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
-    table[@intFromEnum(OpCode.sync_hwrite)] = InstructionInfo{ .handler = NotInvalidButUnreachable, .cycles = 1 };
-
-    // validation
-    var missing: usize = 0;
-    for (@typeInfo(OpCode).@"enum".fields) |field| {
-        if (table[field.value].handler == InvalidHandler) {
-            @compileLog("Instruction " ++ field.name ++ " is missing a handler");
-            missing += 1;
-        }
-    }
-    if (missing > 0) {
-        const message = std.fmt.comptimePrint("Missing {}/{} implementations", .{
-            missing,
-            @typeInfo(OpCode).@"enum".fields.len,
-        });
-        @compileLog(message);
-    }
-
-    break :init table;
-};
 
 // msc codes
 
